@@ -84,11 +84,18 @@ if st.button("🚀 Optimize Design & Calculate Safety OCs"):
             c3.metric("False Positive (Alpha)", f"{best['Alpha']:.1%}")
             c4.metric("Safety Stop Prob.", f"{best['Safety_Power']:.1%}")
 
-            # --- DETAILED ANALYSIS ---
+           # --- DETAILED ANALYSIS ---
             st.markdown("---")
             col_a, col_b = st.columns(2)
             
             with col_a:
                 st.subheader("📊 Efficacy Profile")
                 st.write(f"**Hurdle:** {best['Hurdle']:.0%} | **Confidence Req:** {best['Conf']:.0%}")
-                st.info(f"If
+                # FIXED: Added the missing double quote at the end of the string
+                st.info(f"If the drug is truly {p1:.0%} effective, you have an **{best['Power']:.1%}** chance of proving it.")
+            
+            with col_b:
+                st.subheader("🛡️ Safety Profile")
+                st.write(f"**SAE Limit:** {safe_limit:.0%} | **Stop Confidence:** 90%")
+                # FIXED: Added the missing double quote at the end of the string
+                st.warning(f"If the true SAE rate is {true_toxic_rate:.0%}, the trial has a **{best['Safety_Power']:.1%}** chance of stopping for safety.")
