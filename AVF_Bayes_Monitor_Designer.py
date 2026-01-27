@@ -81,3 +81,23 @@ if st.button("🚀 Run Grid Search & Optimize Design"):
             st.warning("No design met your Power requirements in this N range. Try increasing the search range or lowering the Power requirement.")
     else:
         st.error("No designs stayed below the Max Alpha. Try a stricter Confidence Requirement or a higher Hurdle.")
+
+# --- ADDED TO SIDEBAR ---
+st.sidebar.header("🛡️ Safety Benchmarks")
+true_safe_rate = st.sidebar.slider("Assumed 'Safe' SAE Rate", 0.01, 0.10, 0.05)
+true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.15, 0.40, 0.25)
+
+# --- UPDATED SIMULATION ENGINE ---
+def run_safety_sim(n, true_sae_rate, safe_hurdle, safe_conf_req, sims=5000):
+    # Simulate SAE occurrences across 'sims' virtual trials
+    sae_counts = np.random.binomial(n, true_sae_rate, sims)
+    # Bayesian check: P(SAE rate > limit | data) > safe_conf_req
+    # Using the same prior logic as the monitor
+    p_toxic = 1 - beta.cdf(safe_hurdle, 1 + sae_counts, 1 + (n - sae_counts))
+    return np.mean(p_toxic > safe_conf_req)
+
+# --- IN THE OPTIMIZATION LOOP ---
+# Calculate the 'Safety Power' (Probability of stopping if the drug is toxic)
+safety_power = run_safety_sim(n, true_toxic_rate, safe_limit, safe_conf_req)
+# Calculate the 'Safety Alpha' (Risk of stopping a safe drug)
+safety_false_alarm = run_safety_sim(n, true_safe_rate, safe_limit, safe_conf_req)
