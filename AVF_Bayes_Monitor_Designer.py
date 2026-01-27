@@ -133,4 +133,3 @@ if st.button("🚀 Run Adaptive Design & Stress-Test"):
         st.warning(f"💡 **Observation:** Notice how the **Avg N at Stop** drops significantly in Toxic scenarios (11-13). This is the 'Adaptive Benefit' of checking every {cohort_size} patients.")
     else:
         st.error("No design found meeting these strict criteria. Try increasing the N range or slightly relaxing the Alpha/Power targets.")
-    
