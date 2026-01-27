@@ -73,4 +73,76 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, sa
         prob_eff_final = 1 - beta.cdf(hurdle, 1 + final_succ, 1 + (max_n - final_succ))
         is_success[remaining] = prob_eff_final > conf
 
-    return np.mean(is_success), np.mean(is
+    return np.mean(is_success), np.mean(is_safety_stop), np.mean(stops_n), np.mean(is_futility_stop)
+
+# Helper functions for clean boolean mapping
+def newly_mapped_tox(active, tox_trig):
+    m = np.zeros(len(active), dtype=bool)
+    m[active] = tox_trig
+    return m
+
+def newly_mapped_eff(active, eff_trig, tox_trig):
+    m = np.zeros(len(active), dtype=bool)
+    m[active] = (eff_trig & ~tox_trig)
+    return m
+
+def newly_mapped_fut(active, fut_trig, tox_trig, eff_trig):
+    m = np.zeros(len(active), dtype=bool)
+    m[active] = (fut_trig & ~tox_trig & ~eff_trig)
+    return m
+
+# --- EXECUTION ---
+if st.button("🚀 Run Optimized Adaptive Designer"):
+    results = []
+    prog_bar = st.progress(0)
+    n_list = list(range(n_range[0], n_range[1] + 1, 2))
+    
+    for i, n in enumerate(n_list):
+        prog_bar.progress(i / len(n_list))
+        for hurdle in [0.55, 0.60, 0.65]:
+            for conf in [0.74, 0.80, 0.85]:
+                alpha, _, _, _ = run_fast_batch(300, n, p0, 0.05, hurdle, conf, safe_limit, n)
+                
+                if alpha <= max_alpha:
+                    power, _, _, _ = run_fast_batch(300, n, p1, 0.05, hurdle, conf, safe_limit, n)
+                    _, tox_stop, _, _ = run_fast_batch(300, n, p1, true_toxic_rate, hurdle, conf, safe_limit, n)
+                    
+                    if power >= min_power and tox_stop >= min_safety_power:
+                        results.append({"N": n, "Hurdle": hurdle, "Conf": conf, "Alpha": alpha, "Power": power, "Safety": tox_stop})
+
+    if results:
+        df = pd.DataFrame(results)
+        best = df.sort_values("N").iloc[0]
+        st.success(f"### ✅ Optimal Adaptive Design: Max N = {int(best['N'])}")
+        
+        # Display Metrics
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Max Enrollment", int(best['N']))
+        c2.metric("Efficacy Power", f"{best['Power']:.1%}")
+        c3.metric("Safety Stop Prob.", f"{best['Safety']:.1%}")
+        c4.metric("Risk (Alpha)", f"{best['Alpha']:.2%}")
+
+        st.markdown("---")
+        st.subheader("📋 Adaptive Operational Stress Test (OC Table)")
+        
+        scenarios = [
+            ("1. High Eff / Safe", p1 + 0.1, 0.05),
+            ("2. On-Target / Safe", p1, 0.05),
+            ("10. Futile (Null)", p0, 0.05),
+            ("11. High Eff / Toxic", p1 + 0.1, true_toxic_rate),
+            ("12. Target Eff / Toxic", p1, true_toxic_rate),
+        ]
+        
+        stress_data = []
+        for name, pe, ps in scenarios:
+            pow_val, stop_val, asn_val, fut_val = run_fast_batch(1000, int(best['N']), pe, ps, best['Hurdle'], best['Conf'], safe_limit, cohort_size)
+            stress_data.append({
+                "Scenario Name": name,
+                "Success %": f"{pow_val*100:.1f}%",
+                "Safety Stop %": f"{stop_val*100:.1f}%",
+                "Futility Stop %": f"{fut_val*100:.1f}%",
+                "Avg N (ASN)": f"{asn_val:.1f}"
+            })
+        st.table(pd.DataFrame(stress_data))
+    else:
+        st.error("No design found. Try relaxing Risk Standards or widening N range.")
