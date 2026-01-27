@@ -4,100 +4,91 @@ from scipy.stats import beta
 import pandas as pd
 import plotly.express as px
 
-st.set_page_config(page_title="Trial Designer & OC Calculator", layout="wide")
+st.set_page_config(page_title="AVF Trial Designer & OC Tool", layout="wide")
 
-st.title("🧬 Clinical Trial Designer (OC & Sample Size Calculator)")
+st.title("🧬 Antivenom Trial Designer: OC & Sample Size Calculator")
+st.markdown("""
+This tool uses Monte Carlo simulations to calculate the **Operating Characteristics (OC)** of your trial. 
+It optimizes for the smallest N that meets your Power and Safety requirements.
+""")
 
 # --- SIDEBAR: DESIGN GOALS ---
-st.sidebar.header("🎯 Design Objectives")
+st.sidebar.header("🎯 Efficacy Objectives")
 p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5, help="Efficacy of a 'failure' drug.")
 p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7, help="Efficacy of your 'dream' drug.")
 
 st.sidebar.markdown("---")
-st.sidebar.header("🛡️ Risk Tolerance")
-max_alpha = st.sidebar.slider("Max False Positive Rate (Alpha)", 0.01, 0.20, 0.10)
-min_power = st.sidebar.slider("Min Statistical Power", 0.70, 0.95, 0.80)
+st.sidebar.header("🛡️ Safety Objectives")
+safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15)
+true_safe_rate = st.sidebar.slider("Assumed 'Safe' SAE Rate", 0.01, 0.15, 0.05)
+true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.25)
 
 st.sidebar.markdown("---")
-st.sidebar.header("📐 Constraints")
-n_range = st.sidebar.slider("Sample Size Search Range", 20, 200, (40, 100))
+st.sidebar.header("📐 Constraints & Risks")
+max_alpha = st.sidebar.slider("Max False Positive Rate (Alpha)", 0.01, 0.20, 0.10)
+min_power = st.sidebar.slider("Min Statistical Power", 0.70, 0.95, 0.85)
+n_range = st.sidebar.slider("Sample Size Search Range", 20, 150, (40, 100))
 
 # --- SIMULATION ENGINE ---
-def run_simulation(n, p_true, hurdle, conf_req, sims=5000):
-    # Simulate 'sims' number of trials
-    successes = np.random.binomial(n, p_true, sims)
-    # Bayesian posterior check: P(rate > hurdle | data) > conf_req
-    # Using flat prior (1,1)
-    p_success = 1 - beta.cdf(hurdle, 1 + successes, 1 + (n - successes))
-    return np.mean(p_success > conf_req)
+def run_trial_sims(n, p_eff, p_sae, eff_hurdle, eff_conf, safe_limit, safe_conf, sims=5000):
+    """Simulates 'sims' number of trials to check for success or safety stops."""
+    # Simulate Successes and SAEs
+    successes = np.random.binomial(n, p_eff, sims)
+    sae_counts = np.random.binomial(n, p_sae, sims)
+    
+    # Bayesian Efficacy Check
+    prob_eff = 1 - beta.cdf(eff_hurdle, 1 + successes, 1 + (n - successes))
+    is_success = prob_eff > eff_conf
+    
+    # Bayesian Safety Check
+    prob_safe = 1 - beta.cdf(safe_limit, 1 + sae_counts, 1 + (n - sae_counts))
+    is_safety_stop = prob_safe > safe_conf
+    
+    return np.mean(is_success), np.mean(is_safety_stop)
 
-if st.button("🚀 Run Grid Search & Optimize Design"):
+if st.button("🚀 Optimize Design & Calculate Safety OCs"):
     results = []
     
-    with st.spinner("Simulating thousands of trials..."):
-        # We test different Hurdles and N values
+    with st.spinner("Simulating 10,000+ trial iterations..."):
+        # Grid Search across N, Hurdles, and Confidence levels
         for n in range(n_range[0], n_range[1] + 1, 5):
             for hurdle in [0.55, 0.60, 0.65]:
-                for conf in [0.70, 0.74, 0.80, 0.85]:
-                    # Calculate Alpha (Risk with bad drug)
-                    alpha = run_simulation(n, p0, hurdle, conf)
+                for conf in [0.70, 0.74, 0.80]:
+                    # 1. SCENARIO: DRUG IS A FAILURE (p0) BUT SAFE
+                    alpha, _ = run_trial_sims(n, p0, true_safe_rate, hurdle, conf, safe_limit, 0.90)
+                    
                     if alpha <= max_alpha:
-                        # Calculate Power (Success with good drug)
-                        power = run_simulation(n, p1, hurdle, conf)
+                        # 2. SCENARIO: DRUG IS A SUCCESS (p1) AND SAFE
+                        power, _ = run_trial_sims(n, p1, true_safe_rate, hurdle, conf, safe_limit, 0.90)
+                        
+                        # 3. SCENARIO: DRUG IS TOXIC
+                        _, tox_stop_prob = run_trial_sims(n, p1, true_toxic_rate, hurdle, conf, safe_limit, 0.90)
+                        
                         results.append({
-                            "N": n,
-                            "Hurdle": hurdle,
-                            "Conf_Req": conf,
-                            "Alpha": alpha,
-                            "Power": power
+                            "N": n, "Hurdle": hurdle, "Conf": conf,
+                            "Alpha": alpha, "Power": power, "Safety_Power": tox_stop_prob
                         })
 
     if results:
         df = pd.DataFrame(results)
-        # Find the smallest N that meets power requirements
-        valid_designs = df[df['Power'] >= min_power].sort_values("N")
+        valid = df[df['Power'] >= min_power].sort_values("N")
         
-        if not valid_designs.empty:
-            best = valid_designs.iloc[0]
+        if not valid.empty:
+            best = valid.iloc[0]
+            st.success(f"### Optimal Design Found: N = {int(best['N'])}")
             
-            st.success(f"### ✅ Optimal Design Found: N = {int(best['N'])}")
+            # --- TOP METRICS ---
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Recommended N", int(best['N']))
+            c2.metric("Efficacy Power", f"{best['Power']:.1%}")
+            c3.metric("False Positive (Alpha)", f"{best['Alpha']:.1%}")
+            c4.metric("Safety Stop Prob.", f"{best['Safety_Power']:.1%}")
+
+            # --- DETAILED ANALYSIS ---
+            st.markdown("---")
+            col_a, col_b = st.columns(2)
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Required N", int(best['N']))
-            c2.metric("Success Hurdle", f"{best['Hurdle']:.0%}")
-            c3.metric("Min. Confidence", f"{best['Conf_Req']:.0%}")
-
-            st.write(f"**Operating Characteristics:** Under this design, if your drug is {p1:.0%} effective, you have a **{best['Power']:.1%} chance** of success. If it is only {p0:.0%} effective, the risk of a false positive is only **{best['Alpha']:.1%}**.")
-            
-            # --- VISUALIZATION ---
-            st.subheader("Design Landscape")
-            fig = px.scatter(df, x="Alpha", y="Power", color="N", size="N", 
-                             hover_data=['Hurdle', 'Conf_Req'],
-                             title="Power vs. Risk for Different Designs")
-            fig.add_vline(x=max_alpha, line_dash="dash", line_color="red")
-            fig.add_hline(y=min_power, line_dash="dash", line_color="green")
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("No design met your Power requirements in this N range. Try increasing the search range or lowering the Power requirement.")
-    else:
-        st.error("No designs stayed below the Max Alpha. Try a stricter Confidence Requirement or a higher Hurdle.")
-
-# --- ADDED TO SIDEBAR ---
-st.sidebar.header("🛡️ Safety Benchmarks")
-true_safe_rate = st.sidebar.slider("Assumed 'Safe' SAE Rate", 0.01, 0.10, 0.05)
-true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.15, 0.40, 0.25)
-
-# --- UPDATED SIMULATION ENGINE ---
-def run_safety_sim(n, true_sae_rate, safe_hurdle, safe_conf_req, sims=5000):
-    # Simulate SAE occurrences across 'sims' virtual trials
-    sae_counts = np.random.binomial(n, true_sae_rate, sims)
-    # Bayesian check: P(SAE rate > limit | data) > safe_conf_req
-    # Using the same prior logic as the monitor
-    p_toxic = 1 - beta.cdf(safe_hurdle, 1 + sae_counts, 1 + (n - sae_counts))
-    return np.mean(p_toxic > safe_conf_req)
-
-# --- IN THE OPTIMIZATION LOOP ---
-# Calculate the 'Safety Power' (Probability of stopping if the drug is toxic)
-safety_power = run_safety_sim(n, true_toxic_rate, safe_limit, safe_conf_req)
-# Calculate the 'Safety Alpha' (Risk of stopping a safe drug)
-safety_false_alarm = run_safety_sim(n, true_safe_rate, safe_limit, safe_conf_req)
+            with col_a:
+                st.subheader("📊 Efficacy Profile")
+                st.write(f"**Hurdle:** {best['Hurdle']:.0%} | **Confidence Req:** {best['Conf']:.0%}")
+                st.info(f"If
