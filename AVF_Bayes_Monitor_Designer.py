@@ -2,61 +2,50 @@ import streamlit as st
 import numpy as np
 from scipy.stats import beta
 import pandas as pd
+import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Restored Power sliders and added comprehensive tooltips to all controls.")
+st.markdown("Updated: Stable version with independent priors and Beta distribution visualizations.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
 p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5, 
-    help="The success rate of the current standard of care. If the new drug performs at or below this level, it is considered a failure.")
+    help="The success rate of the current standard of care.")
 p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7, 
-    help="The 'Goal' success rate you hope the drug achieves to justify further development.")
+    help="The 'Goal' success rate you hope the drug achieves.")
 safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, 
-    help="The maximum allowable rate of Serious Adverse Events (SAEs). If the drug is likely above this limit, the trial will stop for safety.")
+    help="The maximum allowable rate of Serious Adverse Events (SAEs).")
 true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, 
-    help="For testing purposes: If the drug were actually this dangerous, how well does the trial detect it?")
+    help="For testing purposes: If the drug were actually this dangerous, how well does the trial stop?")
 
 st.sidebar.markdown("---")
 # SECTION: Efficacy Priors
 st.sidebar.header("⚖️ Efficacy Prior Strength")
-prior_alpha = st.sidebar.slider("Eff Prior 'Successes' (α_eff)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Initial successes assumed for efficacy. Default 1.0 is a Flat/Non-informative Prior.")
-prior_beta = st.sidebar.slider("Eff Prior 'Failures' (β_eff)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Initial failures assumed for efficacy. Increase this to create a 'Skeptical' prior regarding efficacy.")
+prior_alpha = st.sidebar.slider("Eff Prior 'Successes' (α_eff)", 1.0, 10.0, 1.0, step=0.5)
+prior_beta = st.sidebar.slider("Eff Prior 'Failures' (β_eff)", 1.0, 10.0, 1.0, step=0.5)
 
 # SECTION: Safety Priors
 st.sidebar.header("🛡️ Safety Prior Strength")
-s_prior_alpha = st.sidebar.slider("Saf Prior 'Events' (α_saf)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Initial SAEs assumed. Increasing this makes the safety monitor more 'Precautionary'.")
-s_prior_beta = st.sidebar.slider("Saf Prior 'Non-Events' (β_saf)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Initial non-SAEs assumed. Increase to assume the drug is likely safe (Skeptical Safety Prior).")
+s_prior_alpha = st.sidebar.slider("Saf Prior 'Events' (α_saf)", 1.0, 10.0, 1.0, step=0.5)
+s_prior_beta = st.sidebar.slider("Saf Prior 'Non-Events' (β_saf)", 1.0, 10.0, 1.0, step=0.5)
 
 st.sidebar.markdown("---")
-# RESTORED POWER SLIDERS
 st.sidebar.header("📐 Risk Standards")
-max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005, 
-    help="The maximum allowed probability of declaring a drug successful when its true rate is actually p0.")
-min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90, 
-    help="The minimum probability required to correctly detect a drug that hits the Target Efficacy (p1).")
-min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95, 
-    help="The minimum probability required to stop the trial for a drug with the 'Toxic' SAE rate.")
+max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005)
+min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90)
+min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Thresholds")
-eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85, 
-    help="The Bayesian posterior probability required to declare the drug a success at any interim or final analysis.")
-safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90, 
-    help="The Bayesian posterior probability required to stop the trial early for toxicity.")
-fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05, 
-    help="If the probability of success drops below this value, the trial stops early for futility.")
+eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
+safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
+# Futility Slider
+fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05)
 
-cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5, 
-    help="How many patients are enrolled between each interim look.")
-n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100), 
-    help="The range of maximum sample sizes to search for the optimal design.")
+cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
+n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
 # --- STABLE VECTORIZED ENGINE ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b):
@@ -92,7 +81,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
 def newly_mapped(active, trig):
     m = np.zeros(len(active), dtype=bool); m[active] = trig; return m
 
-# --- PHASE 1: SEARCH ---
+# --- SEARCH ---
 if st.button("🚀 Find Optimal Sample Size"):
     results = []
     n_list = list(range(n_range[0], n_range[1] + 1, 2))
@@ -103,7 +92,6 @@ if st.button("🚀 Find Optimal Sample Size"):
                 if alpha <= max_alpha:
                     pwr, _, _, _ = run_fast_batch(2000, n, p1, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                     _, tox_p, _, _ = run_fast_batch(2000, n, p1, true_toxic_rate, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
-                    # Applying power constraints in search
                     if pwr >= min_power and tox_p >= min_safety_power:
                         results.append({"N": n, "Hurdle": hurdle, "Alpha": alpha, "Power": pwr, "Safety": tox_p})
     
@@ -113,13 +101,10 @@ if st.button("🚀 Find Optimal Sample Size"):
             "eff_conf": eff_conf, "saf_conf": safety_conf, "fut_conf": fut_conf,
             "p_a": prior_alpha, "p_b": prior_beta, "s_a": s_prior_alpha, "s_b": s_prior_beta
         }
-    else:
-        st.error("No design found. Try relaxing Risk Standards.")
 
 # --- PERSISTENT DISPLAY ---
 if 'best_design' in st.session_state:
-    best = st.session_state['best_design']
-    up = st.session_state['used_params']
+    best, up = st.session_state['best_design'], st.session_state['used_params']
     
     st.success(f"### ✅ Optimal Design Parameters (Max N = {int(best['N'])})")
     c1, c2, c3, c4 = st.columns(4)
@@ -158,7 +143,7 @@ if 'best_design' in st.session_state:
             "Avg N (ASN)": df_oc["ASN"].apply(lambda x: f"{x:.1f}")
         }).drop(columns="ASN"))
 
-        # --- DYNAMIC INTERPRETATION ---
+        # DYNAMIC INTERPRETATION
         st.info("### 🧐 Summary Interpretation")
         tox_capture = stress_data[6]["Safety Stop %"]
         tox_asn = stress_data[6]["ASN"]
@@ -168,7 +153,32 @@ if 'best_design' in st.session_state:
         st.markdown(f"""
         * **Safety Guardrail**: The monitor identifies toxic drugs with **{tox_capture:.1%} accuracy**, stopping the trial at an average of **{tox_asn:.1f}** patients in the Target Eff / Toxic scenario.
         * **Ethical Efficiency**: For a highly effective drug, the design saves **{savings:.1f}%** of enrollment through early 'graduation'.
-        * **Prior Analysis**: 
-            * Efficacy Prior weight: **{up['p_a'] + up['p_b']:.1f}** virtual patients.
-            * Safety Prior weight: **{up['s_a'] + up['s_b']:.1f}** virtual patients.
+        * **Prior Impact**: Your Efficacy prior adds **{up['p_a'] + up['p_b']:.1f} virtual patients**, while the Safety prior adds **{up['s_a'] + up['s_b']:.1f} patients** of weight to decisions.
         """)
+
+    # --- NEW: BETA PLOTS SECTION ---
+    st.markdown("---")
+    st.subheader("📈 Bayesian Prior Probability Densities")
+    x = np.linspace(0, 1, 100)
+    
+    col_plot1, col_plot2 = st.columns(2)
+    
+    with col_plot1:
+        y_eff = beta.pdf(x, up['p_a'], up['p_b'])
+        fig_eff, ax_eff = plt.subplots(figsize=(6, 3))
+        ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior: Beta({up["p_a"]}, {up["p_b"]})')
+        ax_eff.fill_between(x, 0, y_eff, color='blue', alpha=0.1)
+        ax_eff.axvline(p0, color='red', linestyle='--', label=f'Null Hurdle ({p0})')
+        ax_eff.set_title("Efficacy Prior Distribution")
+        ax_eff.legend(fontsize='small')
+        st.pyplot(fig_eff)
+
+    with col_plot2:
+        y_saf = beta.pdf(x, up['s_a'], up['s_b'])
+        fig_saf, ax_saf = plt.subplots(figsize=(6, 3))
+        ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior: Beta({up["s_a"]}, {up["s_b"]})')
+        ax_saf.fill_between(x, 0, y_saf, color='orange', alpha=0.1)
+        ax_saf.axvline(safe_limit, color='red', linestyle='--', label=f'Safety Limit ({safe_limit})')
+        ax_saf.set_title("Safety Prior Distribution")
+        ax_saf.legend(fontsize='small')
+        st.pyplot(fig_saf)
