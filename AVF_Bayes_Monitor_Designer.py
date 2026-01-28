@@ -6,7 +6,7 @@ import pandas as pd
 st.set_page_config(page_title="AVF Master Designer: Optimized", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Stress-Tester")
-st.markdown("Reverted to high-flexibility engine with relative hurdle logic.")
+st.markdown("Fixed indexing error for safety/efficacy priority logic.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -26,7 +26,7 @@ min_n_lead_in = st.sidebar.number_input("Minimum N before check", 1, 100, 15)
 cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
 n_range = st.sidebar.slider("N Search Range", 20, 250, (40, 120))
 
-# --- STABLE VECTORIZED ENGINE ---
+# --- STABLE VECTORIZED ENGINE (FIXED INDEXING) ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, lead_in, safe_conf=0.90):
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
@@ -36,7 +36,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, le
     is_safety_stop = np.zeros(sims, dtype=bool)
     already_stopped = np.zeros(sims, dtype=bool)
 
-    # Define check points respecting lead-in
+    # Check points starting from lead-in
     check_points = [n for n in range(lead_in, max_n + 1) if (n == lead_in) or ((n - lead_in) % cohort_sz == 0)]
     
     for n in check_points:
@@ -49,18 +49,30 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, le
         p_eff_val = 1 - beta.cdf(hurdle, 1 + c_s, 1 + (n - c_s))
         p_tox_val = 1 - beta.cdf(limit, 1 + c_tox, 1 + (n - c_tox))
         
+        # Decision masks for ACTIVE sims
         tox_trig = p_tox_val > safe_conf
         eff_trig = p_eff_val > conf
         
-        new_stops = np.zeros(sims, dtype=bool)
-        new_stops[active] = (tox_trig | eff_trig)
+        # Priority Logic: Safety first, then Efficacy
+        stop_for_tox = tox_trig
+        stop_for_eff = eff_trig & ~tox_trig
         
-        is_safety_stop[active & (np.where(active, False, False) | (new_stops & ~eff_trig))] = True # Priority to safety
-        is_success[active & (np.where(active, False, False) | (eff_trig & ~tox_trig))] = True
+        # Map back to global sims array
+        global_tox = np.zeros(sims, dtype=bool)
+        global_tox[active] = stop_for_tox
         
-        stops_n[new_stops & ~already_stopped] = n
-        already_stopped[new_stops] = True
+        global_eff = np.zeros(sims, dtype=bool)
+        global_eff[active] = stop_for_eff
+        
+        # Update results
+        is_safety_stop[global_tox] = True
+        is_success[global_eff] = True
+        
+        any_stop = global_tox | global_eff
+        stops_n[any_stop & ~already_stopped] = n
+        already_stopped[any_stop] = True
 
+    # Final Check
     remaining = ~already_stopped
     if np.any(remaining):
         f_s = np.sum(outcomes[remaining, :max_n], axis=1)
@@ -71,7 +83,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, le
 # --- SEARCH EXECUTION ---
 if st.button("🚀 Find Optimal Design"):
     results = []
-    # Dynamic hurdles based on user input to guarantee results
+    # Relative hurdles to ensure valid search space
     hurdle_list = [p0, (p0 + p1)/2, p1 - 0.05]
     conf_list = [0.75, 0.80, 0.85, 0.90]
     n_list = range(n_range[0], n_range[1] + 1, 5)
@@ -81,9 +93,11 @@ if st.button("🚀 Find Optimal Design"):
             if n < min_n_lead_in: continue
             for h in hurdle_list:
                 for c in conf_list:
-                    alpha, _, _ = run_fast_batch(1000, n, p0, 0.05, h, c, safe_limit, cohort_size, min_n_lead_in)
+                    # Alpha Check (Null scenario)
+                    alpha, _, _ = run_fast_batch(1200, n, p0, 0.05, h, c, safe_limit, cohort_size, min_n_lead_in)
                     if alpha <= max_alpha:
-                        pwr, safe_p, _ = run_fast_batch(1000, n, p1, 0.05, h, c, safe_limit, cohort_size, min_n_lead_in)
+                        # Power Check (Target scenario)
+                        pwr, _, _ = run_fast_batch(1200, n, p1, 0.05, h, c, safe_limit, cohort_size, min_n_lead_in)
                         if pwr >= min_power:
                             results.append({"N": n, "Hurdle": h, "Conf": c, "Alpha": alpha, "Power": pwr})
 
@@ -96,21 +110,27 @@ if st.button("🚀 Find Optimal Design"):
         c2.metric("Power", f"{best['Power']:.1%}")
         c3.metric("Alpha", f"{best['Alpha']:.2%}")
     else:
-        st.error("No design found. Try increasing N Range or Alpha.")
+        st.error("No design found. Try increasing N Range or relaxing Alpha.")
 
 # --- SEPARATE OC TESTER ---
 st.markdown("---")
 st.subheader("📊 Operational Stress-Tester")
 if 'best_design' in st.session_state:
-    if st.button("📈 Run OC Simulations"):
+    if st.button("📈 Run Multi-Scenario Stress Test"):
         b = st.session_state['best_design']
         scenarios = [
             ("Target Met (Efficacy)", p1, 0.05),
             ("Null (Failing)", p0, 0.05),
-            ("Toxic (Danger)", p1, true_toxic_rate)
+            ("Toxic (Dangerous Drug)", p1, true_toxic_rate)
         ]
         stress_results = []
         for name, pe, ps in scenarios:
             pwr, tox, asn = run_fast_batch(2000, int(b['N']), pe, ps, b['Hurdle'], b['Conf'], safe_limit, cohort_size, min_n_lead_in)
-            stress_results.append({"Scenario": name, "Success %": f"{pwr:.1%}", "Safety Stop %": f"{tox:.1%}", "Avg Patients": f"{asn:.1f}"})
+            stress_results.append({
+                "Scenario": name, 
+                "Success %": f"{pwr:.1%}", 
+                "Safety Stop %": f"{tox:.1%}", 
+                "Avg Patients (ASN)": f"{asn:.1f}"
+            })
         st.table(pd.DataFrame(stress_results))
+        st.caption(f"Fixed Design Parameters: Hurdle={b['Hurdle']:.2f}, Confidence={b['Conf']}")
