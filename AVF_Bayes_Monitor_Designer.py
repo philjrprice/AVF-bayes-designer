@@ -29,19 +29,9 @@ with st.sidebar:
 
 # --- Core Functions ---
 def get_boundaries(p0, max_n, start_at, step, eff_t, fut_t):
-    # ... previous code ...
-    for n in interims:
-        fut_limit = -1
-        eff_limit = n + 1
-        for x in range(n + 1):
-            post_prob = 1 - stats.beta.cdf(p0, a_prior + x, b_prior + n - x)
-            if post_prob < fut_t:
-                fut_limit = x
-            # For the final patient, we can be slightly less strict (e.g., 0.95) 
-            # to maintain power, while interims stay at 0.99.
-            current_thresh = eff_t if n < max_n else 0.95 
-            if post_prob > current_thresh and eff_limit == n + 1:
-                eff_limit = x
+    interims = list(range(start_at, max_n, step))
+    if max_n not in interims:
+        interims.append(max_n)
     
     boundaries = []
     # Use Jeffreys Prior (0.5, 0.5)
