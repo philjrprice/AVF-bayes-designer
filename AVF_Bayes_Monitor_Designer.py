@@ -10,39 +10,25 @@ st.markdown("Optimized for speed and clinical legitimacy using vectorized Bayesi
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
-p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5, 
-    help="The success rate of the current standard of care. If the new drug performs at or below this level, it is considered a failure.")
-
-p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7, 
-    help="The 'Goal' success rate. This is the level of efficacy you hope the drug achieves to justify further development.")
-
-safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, 
-    help="The maximum allowable rate of Serious Adverse Events (SAEs). If the drug is likely above this limit, the trial will stop for safety.")
-
-true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, 
-    help="For testing purposes: If the drug were actually this dangerous, how well does the trial detect it and shut down?")
+p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.50)
+p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.70)
+safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15)
+true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30)
 
 st.sidebar.markdown("---")
 st.sidebar.header("📐 Risk Standards")
-max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005, 
-    help="The risk of a 'False Win.' A 0.01 alpha means you only accept a 1% chance of calling a failing drug a success.")
-
-min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90, 
-    help="The probability of correctly identifying a successful drug. High power (90%+) means you are very unlikely to miss a 'True Win'.")
-
-min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95, 
-    help="The probability that the trial will successfully trigger a 'Safety Stop' if the drug hits the toxic SAE rate.")
+max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.05)
+min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.80)
+min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.90)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Settings")
-cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5, 
-    help="How often the Bayesian monitor checks the data. Smaller cohorts stop faster (lower ASN) but are logistically harder to manage.")
+min_n_lead_in = st.sidebar.number_input("Minimum N before first check", 1, 100, 15)
+cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 1)
+n_range = st.sidebar.slider("N Search Range", 20, 200, (40, 120))
 
-n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100), 
-    help="The range of patients the tool will test to find the smallest 'N' that meets all your risk standards.")
-
-# --- STABLE VECTORIZED ENGINE ---
-def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, safe_conf=0.90):
+# --- VECTORIZED ENGINE ---
+def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, lead_in, safe_conf=0.90):
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
     
@@ -52,125 +38,105 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, sa
     is_futility_stop = np.zeros(sims, dtype=bool)
     already_stopped = np.zeros(sims, dtype=bool)
 
-    for n in range(cohort_sz, max_n + 1, cohort_sz):
+    # Generate checkpoints respecting lead-in
+    check_points = [n for n in range(lead_in, max_n + 1) if (n == lead_in) or ((n - lead_in) % cohort_sz == 0)]
+    
+    for n in check_points:
         active = ~already_stopped
         if not np.any(active): break
         
         curr_succ = np.sum(outcomes[active, :n], axis=1)
         curr_saes = np.sum(saes[active, :n], axis=1)
         
-        # Bayesian Calculations
         prob_eff = 1 - beta.cdf(hurdle, 1 + curr_succ, 1 + (n - curr_succ))
         prob_tox = 1 - beta.cdf(limit, 1 + curr_saes, 1 + (n - curr_saes))
         
-        # Decision Masks
         tox_trigger = prob_tox > safe_conf
         eff_trigger = prob_eff > conf
-        fut_trigger = (n >= max_n/2) & (prob_eff < 0.05) # Futility Rule
+        fut_trigger = (n >= max_n/2) & (prob_eff < 0.05)
         
-        # Mapping specific triggers back to global indices
-        # This prevents the shape mismatch error
-        new_stops = active.copy()
-        new_stops[active] = (tox_trigger | eff_trigger | fut_trigger)
+        # Determine global indices for stopping
+        batch_stopped = (tox_trigger | eff_trigger | fut_trigger)
+        new_stops = np.zeros(sims, dtype=bool)
+        new_stops[active] = batch_stopped
         
-        # Assign Outcomes
-        is_safety_stop[active & newly_mapped_tox(active, tox_trigger)] = True
-        is_success[active & newly_mapped_eff(active, eff_trigger, tox_trigger)] = True
-        is_futility_stop[active & newly_mapped_fut(active, fut_trigger, tox_trigger, eff_trigger)] = True
+        # Track reasons for stopping
+        m_tox = np.zeros(sims, dtype=bool); m_tox[active] = tox_trigger
+        m_eff = np.zeros(sims, dtype=bool); m_eff[active] = (eff_trigger & ~tox_trigger)
+        m_fut = np.zeros(sims, dtype=bool); m_fut[active] = (fut_trigger & ~tox_trigger & ~eff_trigger)
+        
+        is_safety_stop[active & m_tox] = True
+        is_success[active & m_eff] = True
+        is_futility_stop[active & m_fut] = True
         
         stops_n[new_stops & ~already_stopped] = n
         already_stopped[new_stops] = True
 
-    # Final Efficacy Check for those that finished
+    # Final check for those who reached max_n without stopping
     remaining = ~already_stopped
     if np.any(remaining):
         final_succ = np.sum(outcomes[remaining, :max_n], axis=1)
-        prob_eff_final = 1 - beta.cdf(hurdle, 1 + final_succ, 1 + (max_n - final_succ))
-        is_success[remaining] = prob_eff_final > conf
+        is_success[remaining] = (1 - beta.cdf(hurdle, 1 + final_succ, 1 + (max_n - final_succ))) > conf
 
     return np.mean(is_success), np.mean(is_safety_stop), np.mean(stops_n), np.mean(is_futility_stop)
 
-# Helper functions for clean boolean mapping
-def newly_mapped_tox(active, tox_trig):
-    m = np.zeros(len(active), dtype=bool)
-    m[active] = tox_trig
-    return m
-
-def newly_mapped_eff(active, eff_trig, tox_trig):
-    m = np.zeros(len(active), dtype=bool)
-    m[active] = (eff_trig & ~tox_trig)
-    return m
-
-def newly_mapped_fut(active, fut_trig, tox_trig, eff_trig):
-    m = np.zeros(len(active), dtype=bool)
-    m[active] = (fut_trig & ~tox_trig & ~eff_trig)
-    return m
-
-# --- EXECUTION BLOCK (STABILIZED) ---
-if st.button("🚀 Run High-Precision Adaptive Designer"):
+# --- PHASE 1: SEARCH ---
+if st.button("🚀 Find Optimal Sample Size"):
     results = []
-    prog_bar = st.progress(0)
-    n_list = list(range(n_range[0], n_range[1] + 1, 2))
+    n_list = list(range(n_range[0], n_range[1] + 1, 5)) # Step by 5 for speed
     
-    # INCREASED SIMS FOR STABILITY
-    STABILITY_SIMS = 2000 # Increased from 300-500
-    
-    with st.spinner(f"Running {STABILITY_SIMS} simulations per design point..."):
-        for i, n in enumerate(n_list):
-            prog_bar.progress(i / len(n_list))
-            for hurdle in [0.55, 0.60, 0.65]:
-                for conf in [0.74, 0.80, 0.85, 0.90]:
-                    # 1. High-Precision Alpha Check
-                    alpha, _, _, _ = run_fast_batch(STABILITY_SIMS, n, p0, 0.05, hurdle, conf, safe_limit, n)
-                    
+    # EXPANDED SEARCH SPACE for Hurdles and Confidence
+    hurdle_space = [p0, (p0 + p1)/2, p1 - 0.05]
+    conf_space = [0.70, 0.80, 0.90, 0.95]
+
+    with st.spinner("Searching wide parameter space..."):
+        for n in n_list:
+            if n < min_n_lead_in: continue
+            for hurdle in hurdle_space:
+                for conf in conf_space:
+                    alpha, _, _, _ = run_fast_batch(1000, n, p0, 0.05, hurdle, conf, safe_limit, cohort_size, min_n_lead_in)
                     if alpha <= max_alpha:
-                        # 2. High-Precision Power and Safety Check
-                        power, _, _, _ = run_fast_batch(STABILITY_SIMS, n, p1, 0.05, hurdle, conf, safe_limit, n)
-                        _, tox_stop, _, _ = run_fast_batch(STABILITY_SIMS, n, p1, true_toxic_rate, hurdle, conf, safe_limit, n)
+                        power, _, _, _ = run_fast_batch(1000, n, p1, 0.05, hurdle, conf, safe_limit, cohort_size, min_n_lead_in)
+                        _, tox_stop, _, _ = run_fast_batch(1000, n, p1, true_toxic_rate, hurdle, conf, safe_limit, cohort_size, min_n_lead_in)
                         
                         if power >= min_power and tox_stop >= min_safety_power:
-                            results.append({
-                                "N": n, "Hurdle": hurdle, "Conf": conf, 
-                                "Alpha": alpha, "Power": power, "Safety": tox_stop
-                            })
+                            results.append({"N": n, "Hurdle": hurdle, "Conf": conf, "Alpha": alpha, "Power": power, "Safety": tox_stop})
 
     if results:
-        df = pd.DataFrame(results)
-        # We pick the design that hits the targets with the smallest N
-        best = df.sort_values("N").iloc[0]
-        
-        st.success(f"### ✅ Stabilized Design Found: Max N = {int(best['N'])}")
-        
-        # Display Metrics
+        best = pd.DataFrame(results).sort_values("N").iloc[0]
+        st.session_state['best_design'] = best
+        st.success(f"### Optimal Design Found: Max N = {int(best['N'])}")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Max Enrollment", int(best['N']))
         c2.metric("Efficacy Power", f"{best['Power']:.1%}")
-        c3.metric("Safety Stop Prob.", f"{best['Safety']:.1%}")
+        c3.metric("Safety Detection", f"{best['Safety']:.1%}")
         c4.metric("Risk (Alpha)", f"{best['Alpha']:.2%}")
-
-        st.markdown("---")
-        st.subheader("📋 Adaptive Operational Stress Test (OC Table)")
-        
-        scenarios = [
-            ("1. High Eff / Safe", p1 + 0.1, 0.05),
-            ("2. On-Target / Safe", p1, 0.05),
-            ("10. Futile (Null)", p0, 0.05),
-            ("11. High Eff / Toxic", p1 + 0.1, true_toxic_rate),
-            ("12. Target Eff / Toxic", p1, true_toxic_rate),
-        ]
-        
-        stress_data = []
-        for name, pe, ps in scenarios:
-            pow_val, stop_val, asn_val, fut_val = run_fast_batch(1000, int(best['N']), pe, ps, best['Hurdle'], best['Conf'], safe_limit, cohort_size)
-            stress_data.append({
-                "Scenario Name": name,
-                "Success %": f"{pow_val*100:.1f}%",
-                "Safety Stop %": f"{stop_val*100:.1f}%",
-                "Futility Stop %": f"{fut_val*100:.1f}%",
-                "Avg N (ASN)": f"{asn_val:.1f}"
-            })
-        st.table(pd.DataFrame(stress_data))
     else:
-        st.error("No design found. Try relaxing Risk Standards or widening N range.")
+        st.error("No design found. To fix this, try:")
+        st.write("1. **Increase N Search Range** (Try up to 150-200).")
+        st.write(f"2. **Lower Lead-in N** (Currently {min_n_lead_in}).")
+        st.write(f"3. **Widen Delta** (Current p0={p0} vs p1={p1} is a tight margin).")
 
-
+# --- PHASE 2: STRESS TEST ---
+st.markdown("---")
+st.subheader("📋 Operational Stress-Tester")
+if 'best_design' not in st.session_state:
+    st.info("Run search above first.")
+else:
+    if st.button("📊 Run Multi-Scenario OC Simulations"):
+        best = st.session_state['best_design']
+        scenarios = [
+            ("Super-Effective (Target + 10%)", p1 + 0.10, 0.05),
+            ("On-Target (Goal Met)", p1, 0.05),
+            ("Marginal (Mid-point)", (p0+p1)/2, 0.05),
+            ("Null (Standard Care)", p0, 0.05),
+            ("Futile (Below Null)", p0 - 0.10, 0.05),
+            ("Toxic / High Efficacy", p1, true_toxic_rate),
+            ("Toxic / Low Efficacy", p0, true_toxic_rate),
+        ]
+        stress_results = []
+        for name, pe, ps in scenarios:
+            pe = np.clip(pe, 0.01, 0.99)
+            pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], best['Conf'], safe_limit, cohort_size, min_n_lead_in)
+            stress_results.append({"Scenario": name, "Success %": f"{pow_v:.1%}", "Safety Stop %": f"{stop_v:.1%}", "Futility Stop %": f"{fut_v:.1%}", "Avg Patients (ASN)": f"{asn_v:.1f}"})
+        st.table(pd.DataFrame(stress_results))
