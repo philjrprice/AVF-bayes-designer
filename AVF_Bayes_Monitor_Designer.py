@@ -8,7 +8,7 @@ import io
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Bayesian Visualization")
-st.markdown("Updated: Added Futility controls, Prior Curve Visualization, and Data Exporting.")
+st.markdown("Updated: Added Dynamic Futility, Prior Curve Visualization, and Unified CSV Export.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -32,32 +32,33 @@ st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Thresholds")
 eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
 safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
-# NEW: Futility Slider
+# NEW FEATURE: Futility Confidence Slider
 fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05, 
-    help="Stop if Prob(Efficacy > Hurdle) falls below this level. Default is 5%.")
+    help="Stop if Prob(Efficacy > Hurdle) falls below this level (e.g., 0.05 for 5%).")
+
 cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
 n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
-# --- NEW: PRIOR VISUALIZATION DASHBOARD ---
+# --- NEW: PRIOR VISUALIZATION ---
 st.subheader("📊 Bayesian Prior Visualization")
-col_p1, col_p2 = st.columns(2)
+c_plot1, c_plot2 = st.columns(2)
 
-def plot_prior(a, b, title, color, hurdle):
+def plot_prior(a, b, title, color, target):
     x = np.linspace(0, 1, 100)
     y = beta.pdf(x, a, b)
-    fig, ax = plt.subplots(figsize=(5, 2.5))
-    ax.plot(x, y, color=color, lw=2)
+    fig, ax = plt.subplots(figsize=(6, 3))
+    ax.plot(x, y, color=color, lw=2, label='Prior Distribution')
     ax.fill_between(x, 0, y, color=color, alpha=0.2)
-    ax.axvline(hurdle, color='red', linestyle='--', label=f'Hurdle ({hurdle})')
+    ax.axvline(target, color='red', linestyle='--', label=f'Threshold ({target})')
     ax.set_title(title)
     ax.set_xlabel("Probability")
-    ax.set_ylabel("Density")
+    ax.legend()
     return fig
 
-with col_p1:
-    st.pyplot(plot_prior(prior_alpha, prior_beta, "Efficacy Prior Distribution", "blue", p0))
-with col_p2:
-    st.pyplot(plot_prior(s_prior_alpha, s_prior_beta, "Safety Prior Distribution", "orange", safe_limit))
+with c_plot1:
+    st.pyplot(plot_prior(prior_alpha, prior_beta, "Efficacy Prior Profile", "blue", p0))
+with c_plot2:
+    st.pyplot(plot_prior(s_prior_alpha, s_prior_beta, "Safety Prior Profile", "orange", safe_limit))
 
 # --- STABLE VECTORIZED ENGINE ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b):
@@ -75,7 +76,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
         prob_tox = 1 - beta.cdf(limit, s_a + c_tox, s_b + (n - c_tox))
         
         tox_trig, eff_trig = prob_tox > s_conf, prob_eff > e_conf
-        # Updated with dynamic Futility Confidence
+        # Engine now uses Dynamic Futility Threshold
         fut_trig = (n >= max_n/2) & (prob_eff < f_conf)
         
         new_stops = active.copy(); new_stops[active] = (tox_trig | eff_trig | fut_trig)
@@ -94,7 +95,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
 def newly_mapped(active, trig):
     m = np.zeros(len(active), dtype=bool); m[active] = trig; return m
 
-# --- PHASE 1: SEARCH ---
+# --- SEARCH & RESULTS ---
 if st.button("🚀 Find Optimal Sample Size"):
     results = []
     n_list = list(range(n_range[0], n_range[1] + 1, 2))
@@ -102,7 +103,7 @@ if st.button("🚀 Find Optimal Sample Size"):
         for n in n_list:
             for hurdle in [0.55, 0.60, 0.65]:
                 alpha, _, _, _ = run_fast_batch(2000, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
-                if alpha <= 0.05: # Placeholder check
+                if alpha <= 0.05: # Risk standard check
                     pwr, _, _, _ = run_fast_batch(2000, n, p1, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                     _, tox_p, _, _ = run_fast_batch(2000, n, p1, true_toxic_rate, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                     results.append({"N": n, "Hurdle": hurdle, "Alpha": alpha, "Power": pwr, "Safety": tox_p})
@@ -114,35 +115,31 @@ if st.button("🚀 Find Optimal Sample Size"):
             "p_a": prior_alpha, "p_b": prior_beta, "s_a": s_prior_alpha, "s_b": s_prior_beta
         }
 
-# --- PERSISTENT DISPLAY & EXPORT ---
 if 'best_design' in st.session_state:
-    best = st.session_state['best_design']
-    up = st.session_state['used_params']
+    best, up = st.session_state['best_design'], st.session_state['used_params']
     
     st.success(f"### ✅ Optimal Design Parameters (Max N = {int(best['N'])})")
-    # EXPORT BUTTONS
-    csv_data = best.to_csv().encode('utf-8')
-    st.download_button("📥 Download Optimal Design Parameters (CSV)", data=csv_data, file_name="optimal_design.csv", mime="text/csv")
     
+    # OC STRESS TESTER
     st.markdown("---")
-    st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
-    if st.button("📈 Run Multi-Scenario Stress Test"):
+    if st.button("📈 Run OC Stress Test & Prepare Export"):
         scenarios = [
-            ("1. Super-Effective (Target + 10%)", p1 + 0.1, 0.05),
-            ("2. On-Target (Goal Met)", p1, 0.05),
-            ("3. Marginal (Midpoint)", (p0 + p1)/2, 0.05),
-            ("4. Null (Standard Care)", p0, 0.05),
-            ("5. Futile (Below Null)", p0 - 0.1, 0.05),
-            ("6. High Eff / Toxic", p1 + 0.1, true_toxic_rate),
-            ("7. Target Eff / Toxic", p1, true_toxic_rate),
-            ("8. Null / Toxic", p0, true_toxic_rate),
+            ("1. Super-Effective", p1+0.1, 0.05), ("2. On-Target", p1, 0.05), ("3. Marginal", (p0+p1)/2, 0.05),
+            ("4. Null", p0, 0.05), ("5. Futile", p0-0.1, 0.05), ("6. High Eff/Toxic", p1+0.1, true_toxic_rate),
+            ("7. Target Eff/Toxic", p1, true_toxic_rate), ("8. Null/Toxic", p0, true_toxic_rate)
         ]
         stress_data = []
         for name, pe, ps in scenarios:
             pe = np.clip(pe, 0.01, 0.99)
-            pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
-            stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
+            pw, stp, asn, fut = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
+            stress_data.append({"Scenario": name, "Success %": pw, "Safety Stop %": stp, "Futility Stop %": fut, "ASN": asn})
         
         df_oc = pd.DataFrame(stress_data)
         st.table(df_oc)
-        st.download_button("📥 Download Full OC Report (CSV)", data=df_oc.to_csv(index=False).encode('utf-8'), file_name="oc_report.csv", mime="text/csv")
+        
+        # UNIFIED EXPORT
+        export_df = pd.concat([pd.DataFrame([best]).assign(Type="Design"), df_oc.assign(Type="Scenario")], ignore_index=True)
+        st.download_button("📥 Download Unified Report (CSV)", data=export_df.to_csv(index=False).encode('utf-8'), file_name="full_trial_report.csv", mime="text/csv")
+
+        # DYNAMIC INTERPRETATION
+        st.info(f"**Interpretation:** This design identifies toxic drugs with **{stress_data[6]['Safety Stop %']:.1%} accuracy**. The prior configuration adds **{up['p_a']+up['p_b']:.1f}** virtual patients to efficacy decisions and **{up['s_a']+up['s_b']:.1f}** to safety.")
