@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Enhanced Beta Plot Labeling and Trend Analysis.")
+st.markdown("Updated: Restored Protocol Summary and OC Interpretation logic.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -18,15 +18,13 @@ p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7,
 safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, 
     help="The maximum allowable rate of Serious Adverse Events (SAEs).")
 true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, 
-    help="If the drug were actually this dangerous, how well does the trial stop?")
+    help="For testing purposes: If the drug were actually this dangerous, how well does the trial stop?")
 
 st.sidebar.markdown("---")
-# SECTION: Efficacy Priors
 st.sidebar.header("⚖️ Efficacy Prior Strength")
 prior_alpha = st.sidebar.slider("Eff Prior 'Successes' (α_eff)", 1.0, 10.0, 1.0, step=0.5)
 prior_beta = st.sidebar.slider("Eff Prior 'Failures' (β_eff)", 1.0, 10.0, 1.0, step=0.5)
 
-# SECTION: Safety Priors
 st.sidebar.header("🛡️ Safety Prior Strength")
 s_prior_alpha = st.sidebar.slider("Saf Prior 'Events' (α_saf)", 1.0, 10.0, 1.0, step=0.5)
 s_prior_beta = st.sidebar.slider("Saf Prior 'Non-Events' (β_saf)", 1.0, 10.0, 1.0, step=0.5)
@@ -111,7 +109,12 @@ if 'best_design' in st.session_state:
     c3.metric("Safety Detection", f"{best['Safety']:.1%}")
     c4.metric("Risk (Alpha)", f"{best['Alpha']:.2%}")
     
-    st.info(f"**Decision Rules:** Success if $P(Eff > {best['Hurdle']}) > {up['eff_conf']}$ | Stop for Safety if $P(SAE > {safe_limit}) > {up['saf_conf']}$")
+    # RESTORED: MAIN TRIAL VARIABLES SUMMARY
+    with st.expander("📝 Protocol Summary: Bayesian Monitoring Rules", expanded=True):
+        st.write(f"1. **Analysis Schedule**: Data monitored in cohorts of {cohort_size} patients.")
+        st.write(f"2. **Success Rule**: Declare success if $P(Response Rate > {best['Hurdle']}) > {up['eff_conf']}$.")
+        st.write(f"3. **Safety Stop**: Terminate if $P(SAE Rate > {safe_limit}) > {up['saf_conf']}$.")
+        st.write(f"4. **Futility Rule**: From patient {int(best['N']/2)} onwards, stop if $P(Success) < {up['fut_conf']}$.")
 
     st.markdown("---")
     st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
@@ -136,46 +139,47 @@ if 'best_design' in st.session_state:
             "Avg N (ASN)": df_oc["ASN"].apply(lambda x: f"{x:.1f}")
         }).drop(columns="ASN"))
 
-    # --- UPDATED: BETA PLOTS WITH FULL LABELS ---
+        # RESTORED: DYNAMIC INTERPRETATION ANALYSIS
+        st.info("### 🧐 OC Summary Interpretation")
+        tox_capture = stress_data[6]["Safety Stop %"]
+        tox_asn = stress_data[6]["ASN"]
+        grad_asn = stress_data[0]["ASN"]
+        savings = (1 - (grad_asn / best['N'])) * 100
+
+        st.markdown(f"""
+        * **Safety Guardrail**: The monitor identifies toxic drugs with **{tox_capture:.1%} accuracy**, stopping at an average of **{tox_asn:.1f}** patients in toxic scenarios.
+        * **Early Graduation**: For highly effective drugs, the trial graduatess early, saving **{savings:.1f}%** of total enrollment.
+        * **Futility Efficiency**: The futility threshold of **{up['fut_conf']:.0%}** allows the trial to stop early when success is unlikely, protecting resources and patients.
+        """)
+
+    # --- BETA PLOTS ---
     st.markdown("---")
     st.subheader("📈 Bayesian Prior Probability Densities")
     x = np.linspace(0, 1, 100)
     col_plot1, col_plot2 = st.columns(2)
-    
     with col_plot1:
         y_eff = beta.pdf(x, up['p_a'], up['p_b'])
         fig_eff, ax_eff = plt.subplots(figsize=(6, 3.5))
         ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior: Beta({up["p_a"]}, {up["p_b"]})')
         ax_eff.fill_between(x, 0, y_eff, color='blue', alpha=0.1)
         ax_eff.axvline(p0, color='red', linestyle='--', label=f'Null Hurdle ({p0})')
-        ax_eff.set_title("Efficacy Prior Distribution", fontweight='bold')
-        ax_eff.set_xlabel("True Response Rate")
-        ax_eff.set_ylabel("Probability Density")
-        ax_eff.legend(fontsize='small')
+        ax_eff.set_title("Efficacy Prior Distribution", fontweight='bold'); ax_eff.set_xlabel("True Response Rate"); ax_eff.set_ylabel("Density"); ax_eff.legend(fontsize='small')
         st.pyplot(fig_eff)
-
     with col_plot2:
         y_saf = beta.pdf(x, up['s_a'], up['s_b'])
         fig_saf, ax_saf = plt.subplots(figsize=(6, 3.5))
         ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior: Beta({up["s_a"]}, {up["s_b"]})')
         ax_saf.fill_between(x, 0, y_saf, color='orange', alpha=0.1)
         ax_saf.axvline(safe_limit, color='red', linestyle='--', label=f'Safety Limit ({safe_limit})')
-        ax_saf.set_title("Safety Prior Distribution", fontweight='bold')
-        ax_saf.set_xlabel("True SAE Rate")
-        ax_saf.set_ylabel("Probability Density")
-        ax_saf.legend(fontsize='small')
+        ax_saf.set_title("Safety Prior Distribution", fontweight='bold'); ax_saf.set_xlabel("True SAE Rate"); ax_saf.set_ylabel("Density"); ax_saf.legend(fontsize='small')
         st.pyplot(fig_saf)
 
-    # --- NEW: TREND EXPLANATION ---
+    # --- TREND EXPLANATION ---
     st.info("### 🧐 Prior Trend Analysis")
     eff_mode = (up['p_a'] - 1) / (up['p_a'] + up['p_b'] - 2) if (up['p_a'] + up['p_b']) > 2 else 0.5
     saf_mode = (up['s_a'] - 1) / (up['s_a'] + up['s_b'] - 2) if (up['s_a'] + up['s_b']) > 2 else 0.5
-    
-    eff_trend = "Optimistic" if eff_mode > p0 else "Skeptical" if eff_mode < p0 else "Neutral"
-    saf_trend = "Cautious" if saf_mode > safe_limit/2 else "Confident"
-    
     st.markdown(f"""
-    * **Efficacy Trend**: The prior is currently **{eff_trend}**. A peak to the right of the red line (Null Hurdle) assumes the drug works before trial data arrives; a peak to the left requires more evidence to overcome initial skepticism.
-    * **Safety Trend**: The prior is **{saf_trend}**. Higher α_saf values shift the density toward the red Safety Limit, making the monitor 'trigger-happy' to protect patients.
-    * **Visualizing 'Weight'**: The 'tightness' of the curves represents confidence. Flatter curves mean the trial will be driven almost entirely by new data; tall, narrow curves mean the trial will be harder to sway from the starting assumption.
+    * **Efficacy Trend**: Prior is currently **{"Optimistic" if eff_mode > p0 else "Skeptical" if eff_mode < p0 else "Neutral"}**.
+    * **Safety Trend**: Prior is **{"Cautious" if saf_mode > safe_limit/2 else "Confident"}**.
+    * **Prior Strength**: Efficacy weight = **{up['p_a'] + up['p_b']:.1f}** patients | Safety weight = **{up['s_a'] + up['s_b']:.1f}** patients.
     """)
