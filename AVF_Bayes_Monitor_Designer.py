@@ -1,84 +1,98 @@
 import streamlit as st
 import numpy as np
-from scipy.stats import beta
+import scipy.stats as stats
 import pandas as pd
-import matplotlib.pyplot as plt
 
-# --- STABLE VERSION 15 RESTORATION WITH COHORT FIX ---
-st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
+# Page Config
+st.set_page_config(page_title="Bayesian Trial Designer", layout="wide")
 
-st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated v22: Fixed Cohort-Induced Search Instability.")
+st.title("🔬 Bayesian Single-Arm Monitor Designer")
+st.markdown("""
+This tool designs a Bayesian single-arm trial with continuous monitoring for efficacy and futility.
+It uses a Beta-Binomial conjugate prior model.
+""")
 
-# --- SIDEBAR: DESIGN GOALS (RESTORED V15) ---
+# --- Sidebar Inputs ---
 with st.sidebar:
-    st.header("🎯 Efficacy & Safety")
-    p0 = st.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5)
-    p1 = st.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7)
-    safe_limit = st.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15)
-    true_toxic_rate = st.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30)
+    st.header("Trial Parameters")
+    p0 = st.number_input("Null Response Rate (p0)", value=0.50, step=0.05)
+    p1 = st.number_input("Expected Efficacy (p1)", value=0.70, step=0.05)
     
-    st.header("⚖️ Priors")
-    p_a = st.slider("Eff Prior α", 1.0, 10.0, 1.0)
-    p_b = st.slider("Eff Prior β", 1.0, 10.0, 1.0)
+    st.divider()
+    max_n = st.slider("Max Sample Size (N)", 20, 150, 80)
+    look_every = st.slider("Monitor Every 'X' Patients", 1, 10, 5)
+    start_at = st.slider("Start Monitoring at Patient #", 5, 30, 20)
     
-    st.header("📐 Risk Standards")
-    max_alpha = st.slider("Max Alpha", 0.01, 0.30, 0.05)
-    min_power = st.slider("Min Power", 0.50, 0.99, 0.80)
-    
-    st.header("⏱️ Adaptive Thresholds")
-    eff_conf = st.slider("Success Confidence", 0.70, 0.99, 0.85)
-    cohort_size = st.slider("Interim Cohort Size", 5, 25, 10)
-    n_range = st.slider("N Search Range", 40, 200, (60, 120))
+    st.divider()
+    eff_thresh = st.slider("Success Threshold (Prob > p0)", 0.90, 0.999, 0.99, format="%.3f")
+    fut_thresh = st.slider("Futility Threshold (Prob > p0)", 0.01, 0.20, 0.10)
 
-# --- STABILIZED SEARCH ENGINE ---
-def run_simulation(sims, max_n, p_eff, hurdle, e_conf, cohort_sz, pa, pb):
-    np.random.seed(42)
-    outcomes = np.random.binomial(1, p_eff, (sims, max_n))
-    is_success = np.zeros(sims, dtype=bool)
-    stopped = np.zeros(sims, dtype=bool)
+# --- Core Functions ---
+def get_boundaries(p0, max_n, start_at, step, eff_t, fut_t):
+    interims = list(range(start_at, max_n, step))
+    if max_n not in interims:
+        interims.append(max_n)
     
-    # Define a 'Floor' for looks to prevent N=20 jumps
-    look_points = [n for n in range(cohort_sz, max_n + 1, cohort_sz)]
-    if not look_points or look_points[-1] < max_n:
-        look_points.append(max_n)
+    boundaries = []
+    # Use Jeffreys Prior (0.5, 0.5)
+    a_prior, b_prior = 0.5, 0.5
+    
+    for n in interims:
+        fut_limit = -1
+        eff_limit = n + 1
+        for x in range(n + 1):
+            # Posterior Probability: P(theta > p0 | x, n)
+            post_prob = 1 - stats.beta.cdf(p0, a_prior + x, b_prior + n - x)
+            if post_prob < fut_t:
+                fut_limit = x
+            if post_prob > eff_t and eff_limit == n + 1:
+                eff_limit = x
+        boundaries.append({'n': n, 'Futility_If_Responders_<=': fut_limit, 'Success_If_Responders_>=': eff_limit})
+    return pd.DataFrame(boundaries)
 
-    for n in look_points:
-        active = ~stopped
-        if not np.any(active): break
+def simulate_trials(p_true, b_df, p0, n_sims=5000):
+    success_count = 0
+    total_n = 0
+    a_p, b_p = 0.5, 0.5
+    
+    for _ in range(n_sims):
+        curr_n = 0
+        hits = 0
+        stopped = False
+        for _, row in b_df.iterrows():
+            n_new = row['n'] - curr_n
+            hits += np.random.binomial(n_new, p_true)
+            curr_n = row['n']
+            
+            if hits <= row['Futility_If_Responders_<=']:
+                stopped = True; break
+            if hits >= row['Success_If_Responders_>=']:
+                success_count += 1
+                stopped = True; break
         
-        c_s = np.sum(outcomes[active, :n], axis=1)
-        # Bayesian Success Check
-        prob_eff = 1 - beta.cdf(hurdle, pa + c_s, pb + (n - c_s))
+        if not stopped: # Final look check
+            prob = 1 - stats.beta.cdf(p0, a_p + hits, b_p + curr_n - hits)
+            if prob >= 0.99: # Match the eff_thresh logic
+                success_count += 1
+        total_n += curr_n
         
-        eff_trig = prob_eff > e_conf
-        idx = np.where(active)[0]
-        is_success[idx[eff_trig]] = True
-        stopped[idx[eff_trig]] = True
+    return (success_count / n_sims), (total_n / n_sims)
 
-    return np.mean(is_success)
+# --- Logic Execution ---
+df_bounds = get_boundaries(p0, max_n, start_at, look_every, eff_thresh, fut_thresh)
 
-# --- SEARCH ---
-if st.button("🚀 Find Optimal Sample Size"):
-    results = []
-    # Broaden Hurdle Search to prevent 'No Results' at low cohort sizes
-    hurdle_opts = np.linspace(p0, (p0+p1)/2, 10)
-    n_list = range(n_range[0], n_range[1] + 1, 5)
-    
-    with st.spinner("Stabilizing design search..."):
-        for n in n_list:
-            for h in hurdle_opts:
-                # Use simulation-accurate Alpha check
-                alpha = run_simulation(2000, n, p0, h, eff_conf, cohort_size, p_a, p_b)
-                if alpha <= max_alpha:
-                    pwr = run_simulation(2000, n, p1, h, eff_conf, cohort_size, p_a, p_b)
-                    if pwr >= min_power:
-                        results.append({"N": n, "Hurdle": round(h, 3), "Alpha": alpha, "Power": pwr})
-                        break
-    
-    if results:
-        st.session_state['best'] = pd.DataFrame(results).sort_values("N").iloc[0]
-        st.success(f"### ✅ Stable Design Found: Max N={int(st.session_state['best']['N'])}")
-        st.write(st.session_state['best'])
-    else:
-        st.error("❌ No design found. Try lowering 'Success Confidence' or increasing 'Max Alpha'.")
+# Simulation
+with st.spinner("Running Simulations..."):
+    alpha, asn_null = simulate_trials(p0, df_bounds, p0)
+    power, asn_alt = simulate_trials(p1, df_bounds, p0)
+
+# --- UI Layout ---
+col1, col2, col3 = st.columns(3)
+col1.metric("Alpha (Type I Error)", f"{alpha:.2%}")
+col2.metric("Power (at {0:.0%})".format(p1), f"{power:.2%}")
+col3.metric("Avg Sample Size (if effective)", f"{asn_alt:.1f}")
+
+st.subheader("Operational Decision Table")
+st.dataframe(df_bounds, use_container_width=True)
+
+st.info(f"**Final Analysis Rule:** At N={max_n}, you need {df_bounds.iloc[-1]['Success_If_Responders_>=']} or more responders to declare success.")
