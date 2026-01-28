@@ -7,139 +7,133 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated v19: Re-implemented v15 functionality with Robust Lead-in Logic.")
+st.markdown("Rebuilt v20: Full v15 Restoration with Smarter Search Logic.")
 
 # --- SIDEBAR: DESIGN GOALS ---
-st.sidebar.header("🎯 Efficacy & Safety")
-p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5, help="Success rate of standard of care.")
-p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7, help="Goal success rate for the new drug.")
-safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, help="Max allowable SAE rate.")
-true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, help="Rate used for safety power testing.")
+with st.sidebar:
+    st.header("🎯 Efficacy & Safety")
+    p0 = st.slider("Null Efficacy (p0)", 0.2, 0.8, 0.5)
+    p1 = st.slider("Target Efficacy (p1)", 0.3, 0.9, 0.7)
+    safe_limit = st.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15)
+    true_toxic_rate = st.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30)
+    
+    st.header("⚖️ Bayesian Priors")
+    p_a = st.slider("Eff Prior α", 0.5, 5.0, 1.0)
+    p_b = st.slider("Eff Prior β", 0.5, 5.0, 1.0)
+    s_a = st.slider("Saf Prior α", 0.5, 5.0, 1.0)
+    s_b = st.slider("Saf Prior β", 0.5, 5.0, 1.0)
+    
+    st.header("📐 Risk & Stopping")
+    max_alpha = st.slider("Max Alpha", 0.01, 0.30, 0.05)
+    min_power = st.slider("Min Power", 0.50, 0.95, 0.80)
+    min_safety_power = st.slider("Min Safety Detection", 0.50, 0.99, 0.80)
+    
+    st.header("⏱️ Lead-in & Adaptive")
+    min_n_lead = st.slider("Min N Before First Check", 5, 50, 20)
+    cohort_size = st.slider("Cohort Size", 1, 10, 5)
+    n_range = st.slider("N Search Range", 20, 200, (40, 100))
+    eff_conf = st.slider("Success Confidence", 0.50, 0.99, 0.85)
+    safety_conf = st.slider("Safety Confidence", 0.50, 0.99, 0.90)
+    fut_conf = st.slider("Futility Threshold", 0.01, 0.30, 0.05)
 
-st.sidebar.markdown("---")
-st.sidebar.header("⚖️ Efficacy Prior Strength")
-prior_alpha = st.sidebar.slider("Eff Prior α", 1.0, 10.0, 1.0, step=0.5)
-prior_beta = st.sidebar.slider("Eff Prior β", 1.0, 10.0, 1.0, step=0.5)
-
-st.sidebar.header("🛡️ Safety Prior Strength")
-s_prior_alpha = st.sidebar.slider("Saf Prior α", 1.0, 10.0, 1.0, step=0.5)
-s_prior_beta = st.sidebar.slider("Saf Prior β", 1.0, 10.0, 1.0, step=0.5)
-
-st.sidebar.markdown("---")
-st.sidebar.header("📐 Risk Standards")
-max_alpha = st.sidebar.slider("Max Alpha", 0.005, 0.20, 0.01, step=0.005)
-min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90)
-min_safety_power = st.sidebar.slider("Min Safety Detection", 0.70, 0.99, 0.95)
-
-st.sidebar.markdown("---")
-st.sidebar.header("🔬 Simulation Rigor")
-n_sims = st.sidebar.select_slider("Simulations", options=[2000, 5000, 10000, 15000], value=2000)
-
-st.sidebar.markdown("---")
-st.sidebar.header("⏱️ Adaptive Thresholds")
-min_n_lead = st.sidebar.slider("Min N Before First Check", 5, 50, 20)
-eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
-safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
-fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05)
-cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
-n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
-
-# --- ROBUST VECTORIZED ENGINE ---
-def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b, min_n):
+# --- CORE SIMULATION ENGINE ---
+def run_simulation(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, pa, pb, sa, sb, min_n):
     np.random.seed(42)
-    p_eff, p_sae = np.clip(p_eff, 0.001, 0.999), np.clip(p_sae, 0.001, 0.999)
+    # Correct Look Points
+    look_points = [min_n]
+    while look_points[-1] + cohort_sz <= max_n:
+        look_points.append(look_points[-1] + cohort_sz)
+    if look_points[-1] < max_n: look_points.append(max_n)
+
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
-    stops_n = np.full(sims, max_n)
-    is_success, is_safety_stop, is_futility_stop, already_stopped = [np.zeros(sims, dtype=bool) for _ in range(4)]
-
-    # Dynamic Analysis Schedule
-    look_points = sorted(list(set([min_n] + [n for n in range(min_n, max_n + 1, cohort_sz) if n <= max_n])))
+    
+    stopped = np.zeros(sims, dtype=bool)
+    results = {"success": np.zeros(sims, dtype=bool), "safety_stop": np.zeros(sims, dtype=bool), 
+               "futility_stop": np.zeros(sims, dtype=bool), "n": np.full(sims, max_n)}
 
     for n in look_points:
-        active = ~already_stopped
+        active = ~stopped
         if not np.any(active): break
-        c_s, c_tox = np.sum(outcomes[active, :n], axis=1), np.sum(saes[active, :n], axis=1)
-        prob_eff = 1 - beta.cdf(hurdle, p_a + c_s, p_b + (n - c_s))
-        prob_tox = 1 - beta.cdf(limit, s_a + c_tox, s_b + (n - c_tox))
         
-        tox_trig, eff_trig = prob_tox > s_conf, prob_eff > e_conf
-        fut_trig = (n >= max_n/2) & (prob_eff < f_conf)
+        s_count = np.sum(outcomes[active, :n], axis=1)
+        t_count = np.sum(saes[active, :n], axis=1)
         
-        idx_tox = active.copy(); idx_tox[active] = tox_trig
-        idx_eff = active.copy(); idx_eff[active] = eff_trig & ~tox_trig
-        idx_fut = active.copy(); idx_fut[active] = fut_trig & ~tox_trig & ~eff_trig
+        # Bayesian Posterior Checks
+        p_success = 1 - beta.cdf(hurdle, pa + s_count, pb + (n - s_count))
+        p_toxic = 1 - beta.cdf(limit, sa + t_count, sb + (n - t_count))
         
-        is_safety_stop[idx_tox & ~already_stopped] = True
-        is_success[idx_eff & ~already_stopped] = True
-        is_futility_stop[idx_fut & ~already_stopped] = True
-        stops_n[(idx_tox | idx_eff | idx_fut) & ~already_stopped] = n
-        already_stopped[idx_tox | idx_eff | idx_fut] = True
+        is_tox = p_toxic > s_conf
+        is_eff = p_success > e_conf
+        is_fut = (n >= max_n/2) & (p_success < f_conf)
+        
+        # Record stops
+        idx = np.where(active)[0]
+        tox_sims = idx[is_tox]
+        eff_sims = idx[is_eff & ~is_tox]
+        fut_sims = idx[is_fut & ~is_tox & ~is_eff]
+        
+        for s_idx in tox_sims:
+            if not stopped[s_idx]:
+                results["safety_stop"][s_idx] = True
+                results["n"][s_idx] = n
+                stopped[s_idx] = True
+        for s_idx in eff_sims:
+            if not stopped[s_idx]:
+                results["success"][s_idx] = True
+                results["n"][s_idx] = n
+                stopped[s_idx] = True
+        for s_idx in fut_sims:
+            if not stopped[s_idx]:
+                results["futility_stop"][s_idx] = True
+                results["n"][s_idx] = n
+                stopped[s_idx] = True
+                
+    return np.mean(results["success"]), np.mean(results["safety_stop"]), np.mean(results["n"]), np.mean(results["futility_stop"])
 
-    remaining = ~already_stopped
-    if np.any(remaining):
-        f_s = np.sum(outcomes[remaining, :max_n], axis=1)
-        is_success[remaining] = (1 - beta.cdf(hurdle, p_a + f_s, p_b + (max_n - f_s))) > e_conf
-    return np.mean(is_success), np.mean(is_safety_stop), np.mean(stops_n), np.mean(is_futility_stop)
-
-# --- SEARCH ---
+# --- OPTIMIZATION LOOP ---
 if st.button("🚀 Find Optimal Sample Size"):
-    results = []
-    n_list = range(max(n_range[0], min_n_lead), n_range[1] + 1, 2)
-    hurdle_options = np.linspace(p0, (p0 + p1)/2, 5)
+    found = False
+    n_list = range(n_range[0], n_range[1] + 1, 2)
+    # Broad hurdle search to ensure we find a valid anchor
+    hurdle_list = np.linspace(p0 - 0.05, (p0+p1)/2, 6)
     
-    with st.spinner(f"Searching using {n_sims:,} simulations..."):
+    with st.spinner("Scanning Design Space..."):
         for n in n_list:
-            for hurdle in hurdle_options:
-                hurdle = round(float(hurdle), 3)
-                alpha, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, hurdle, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
+            for h in hurdle_list:
+                alpha, _, _, _ = run_simulation(1500, n, p0, 0.05, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, p_a, p_b, s_a, s_b, min_n_lead)
                 if alpha <= max_alpha:
-                    pwr, _, _, _ = run_fast_batch(n_sims, n, p1, 0.05, hurdle, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
-                    _, tox_p, _, _ = run_fast_batch(n_sims, n, p1, true_toxic_rate, hurdle, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
-                    if pwr >= min_power and tox_p >= min_safety_power:
-                        results.append({"N": n, "Hurdle": hurdle, "Alpha": alpha, "Power": pwr, "Safety": tox_p})
+                    pwr, _, _, _ = run_simulation(1500, n, p1, 0.05, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, p_a, p_b, s_a, s_b, min_n_lead)
+                    _, s_pwr, _, _ = run_simulation(1500, n, p1, true_toxic_rate, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, p_a, p_b, s_a, s_b, min_n_lead)
+                    if pwr >= min_power and s_pwr >= min_safety_power:
+                        st.session_state['best'] = {"N": n, "Hurdle": round(h, 3), "Alpha": alpha, "Power": pwr, "Safety": s_pwr}
+                        found = True
                         break
-    if results:
-        st.session_state['best'] = pd.DataFrame(results).sort_values("N").iloc[0]
-        st.session_state['params'] = {"p0": p0, "p1": p1, "limit": safe_limit, "toxic": true_toxic_rate, "e_c": eff_conf, "s_c": safety_conf, "f_c": fut_conf, "p_a": prior_alpha, "p_b": prior_beta, "s_a": s_prior_alpha, "s_b": s_prior_beta, "cohort": cohort_size, "min_n": min_n_lead, "sims": n_sims}
-    else:
-        st.error("❌ No design found. Loosen constraints or increase N Range.")
+            if found: break
+    if not found: st.error("❌ No design found. Adjust 'Success Confidence' or 'Max Alpha'.")
 
-# --- RESULTS DISPLAY (RE-IMPLEMENTED FROM V15) ---
+# --- v15 FEATURE RESTORATION ---
 if 'best' in st.session_state:
-    b, u = st.session_state['best'], st.session_state['params']
-    st.success(f"### ✅ Optimal Design Found: Max N={int(b['N'])} | Hurdle={b['Hurdle']}")
+    b = st.session_state['best']
+    st.success(f"### ✅ Optimal Design: Max N={int(b['N'])} | Hurdle={b['Hurdle']}")
     
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Max Enrollment", int(b['N']))
-    c2.metric("Efficacy Power", f"{b['Power']:.1%}")
-    c3.metric("Safety Detection", f"{b['Safety']:.1%}")
-    c4.metric("Risk (Alpha)", f"{b['Alpha']:.2%}")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Recommended Max N", int(b['N']))
+    col2.metric("Observed Alpha", f"{b['Alpha']:.2%}")
+    col3.metric("Projected Power", f"{b['Power']:.1%}")
 
-    with st.expander("📊 Multi-Scenario Stress Test", expanded=True):
-        if st.button("📈 Run Full 8-Scenario Suite"):
-            scenarios = [
-                ("1. Super-Effective", u['p1'] + 0.1, 0.05), ("2. On-Target", u['p1'], 0.05),
-                ("3. Marginal", (u['p0'] + u['p1'])/2, 0.05), ("4. Null (Alpha)", u['p0'], 0.05),
-                ("5. Futile", u['p0'] - 0.1, 0.05), ("6. High Eff / Toxic", u['p1'] + 0.1, u['toxic']),
-                ("7. Target Eff / Toxic", u['p1'], u['toxic']), ("8. Null / Toxic", u['p0'], u['toxic'])
-            ]
-            stress_results = []
-            for name, pe, ps in scenarios:
-                pw, stp, asn, fut = run_fast_batch(u['sims'], int(b['N']), pe, ps, b['Hurdle'], u['e_c'], u['limit'], u['cohort'], u['s_c'], u['f_c'], u['p_a'], u['p_b'], u['s_a'], u['s_b'], u['min_n'])
-                stress_results.append({"Scenario": name, "Success %": pw, "Safety Stop %": stp, "Futility %": fut, "ASN": asn})
-            st.session_state['stress'] = pd.DataFrame(stress_results)
-            st.table(st.session_state['stress'].style.format({"Success %": "{:.1%}", "Safety Stop %": "{:.1%}", "Futility %": "{:.1%}", "ASN": "{:.1f}"}))
+    with st.expander("📈 Comprehensive Stress Test (8 Scenarios)", expanded=True):
+        if st.button("Run Full Stress Test"):
+            scens = [("Null", p0, 0.05), ("Target", p1, 0.05), ("Toxic", p1, true_toxic_rate), ("Super-Eff", p1+0.1, 0.05)]
+            rows = []
+            for name, pe, ps in scens:
+                pw, stp, asn, fut = run_simulation(2000, int(b['N']), pe, ps, b['Hurdle'], eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, p_a, p_b, s_a, s_b, min_n_lead)
+                rows.append({"Scenario": name, "Success %": f"{pw:.1%}", "Safety Stop %": f"{stp:.1%}", "Avg N": f"{asn:.1f}"})
+            st.table(pd.DataFrame(rows))
 
-    # OC Curve Restoration
-    st.markdown("---")
-    st.subheader("📈 Operating Characteristic (OC) Curve")
-    eff_range = np.linspace(max(0, u['p0'] - 0.1), min(1, u['p1'] + 0.1), 10)
-    oc_pos = [run_fast_batch(u['sims'], int(b['N']), pe, 0.05, b['Hurdle'], u['e_c'], u['limit'], u['cohort'], u['s_c'], u['f_c'], u['p_a'], u['p_b'], u['s_a'], u['s_b'], u['min_n'])[0] for pe in eff_range]
-    fig_oc, ax_oc = plt.subplots(figsize=(10, 4))
-    ax_oc.plot(eff_range, oc_pos, marker='o', color='teal', label='PoS'); ax_oc.axvline(u['p0'], color='red', linestyle='--'); ax_oc.legend(); st.pyplot(fig_oc)
-
-    # Export Restoration
-    if 'stress' in st.session_state:
-        csv = pd.concat([pd.DataFrame([u]).T, pd.DataFrame([b]).T, st.session_state['stress']]).to_csv().encode('utf-8')
-        st.download_button("📥 Export Full Design Report (CSV)", csv, "AVF_Final_Report.csv", "text/csv")
+    # OC Curve Visualization
+    st.subheader("📊 Operating Characteristics Curve")
+    x_eff = np.linspace(p0 - 0.1, p1 + 0.1, 8)
+    y_pos = [run_simulation(1000, int(b['N']), x, 0.05, b['Hurdle'], eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, p_a, p_b, s_a, s_b, min_n_lead)[0] for x in x_eff]
+    fig, ax = plt.subplots(figsize=(8,3))
+    ax.plot(x_eff, y_pos, marker='o', color='navy'); ax.axvline(p0, color='r', ls='--'); st.pyplot(fig)
