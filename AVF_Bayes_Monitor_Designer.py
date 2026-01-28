@@ -91,29 +91,40 @@ def newly_mapped_fut(active, fut_trig, tox_trig, eff_trig):
     m[active] = (fut_trig & ~tox_trig & ~eff_trig)
     return m
 
-# --- EXECUTION ---
-if st.button("🚀 Run Optimized Adaptive Designer"):
+# --- EXECUTION BLOCK (STABILIZED) ---
+if st.button("🚀 Run High-Precision Adaptive Designer"):
     results = []
     prog_bar = st.progress(0)
     n_list = list(range(n_range[0], n_range[1] + 1, 2))
     
-    for i, n in enumerate(n_list):
-        prog_bar.progress(i / len(n_list))
-        for hurdle in [0.55, 0.60, 0.65]:
-            for conf in [0.74, 0.80, 0.85]:
-                alpha, _, _, _ = run_fast_batch(300, n, p0, 0.05, hurdle, conf, safe_limit, n)
-                
-                if alpha <= max_alpha:
-                    power, _, _, _ = run_fast_batch(300, n, p1, 0.05, hurdle, conf, safe_limit, n)
-                    _, tox_stop, _, _ = run_fast_batch(300, n, p1, true_toxic_rate, hurdle, conf, safe_limit, n)
+    # INCREASED SIMS FOR STABILITY
+    STABILITY_SIMS = 2000 # Increased from 300-500
+    
+    with st.spinner(f"Running {STABILITY_SIMS} simulations per design point..."):
+        for i, n in enumerate(n_list):
+            prog_bar.progress(i / len(n_list))
+            for hurdle in [0.55, 0.60, 0.65]:
+                for conf in [0.74, 0.80, 0.85, 0.90]:
+                    # 1. High-Precision Alpha Check
+                    alpha, _, _, _ = run_fast_batch(STABILITY_SIMS, n, p0, 0.05, hurdle, conf, safe_limit, n)
                     
-                    if power >= min_power and tox_stop >= min_safety_power:
-                        results.append({"N": n, "Hurdle": hurdle, "Conf": conf, "Alpha": alpha, "Power": power, "Safety": tox_stop})
+                    if alpha <= max_alpha:
+                        # 2. High-Precision Power and Safety Check
+                        power, _, _, _ = run_fast_batch(STABILITY_SIMS, n, p1, 0.05, hurdle, conf, safe_limit, n)
+                        _, tox_stop, _, _ = run_fast_batch(STABILITY_SIMS, n, p1, true_toxic_rate, hurdle, conf, safe_limit, n)
+                        
+                        if power >= min_power and tox_stop >= min_safety_power:
+                            results.append({
+                                "N": n, "Hurdle": hurdle, "Conf": conf, 
+                                "Alpha": alpha, "Power": power, "Safety": tox_stop
+                            })
 
     if results:
         df = pd.DataFrame(results)
+        # We pick the design that hits the targets with the smallest N
         best = df.sort_values("N").iloc[0]
-        st.success(f"### ✅ Optimal Adaptive Design: Max N = {int(best['N'])}")
+        
+        st.success(f"### ✅ Stabilized Design Found: Max N = {int(best['N'])}")
         
         # Display Metrics
         c1, c2, c3, c4 = st.columns(4)
@@ -146,3 +157,4 @@ if st.button("🚀 Run Optimized Adaptive Designer"):
         st.table(pd.DataFrame(stress_data))
     else:
         st.error("No design found. Try relaxing Risk Standards or widening N range.")
+
