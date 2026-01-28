@@ -3,4 +3,4 @@ numpy
 scipy
 pandas
 plotly
-matplotlib.pyplot
+matplotlib
