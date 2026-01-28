@@ -1,0 +1,53 @@
+# 🧬 AVF Master Designer: Adaptive OC & Stress-Tester
+
+The AVF Master Designer is a high-precision clinical trial simulation platform designed to optimize Bayesian adaptive designs for Phase I/II trials. It allows researchers to find the optimal sample size (N) and decision boundaries that satisfy specific Alpha (false positive) and Power (true positive) requirements while providing rigorous safety monitoring.
+
+## 🧠 System Architecture & Inner Workings
+
+The system is built on a vectorized Bayesian simulation engine, which allows it to simulate thousands of complete clinical trials in seconds to determine "Operating Characteristics" (OC).
+
+### 1. The Vectorized Simulation Engine
+Unlike traditional simulations that iterate through patients one by one, this system uses numpy to generate large-scale binomial outcome matrices (Simulations x Max N).
+* Outcome Generation: The engine pre-calculates all possible patient outcomes (Efficacy and SAEs) for every simulation.
+* Interim Analysis Logic: The system iterates through "Cohorts." At each interim step, it calculates the Bayesian posterior probability for every active simulation simultaneously.
+* Global Mapping: To maintain high performance, the system uses boolean masks to track which trials have stopped for Efficacy, Safety, or Futility, ensuring that once a trial "stops," its data is locked and no further patients are added.
+
+### 2. Bayesian Decision Logic
+The system utilizes a Beta-Binomial Conjugate Prior model to update beliefs as data accumulates.
+* Success Rule: A trial is declared a success if P(True Efficacy > Hurdle) > Efficacy Confidence.
+* Safety Rule: A trial is stopped for toxicity if P(True SAE Rate > Safety Limit) > Safety Confidence.
+* Futility Rule: The trial includes a "non-binding" futility gate. If P(Success) < 5% at the halfway point of enrollment, the trial terminates early to save resources.
+
+### 3. The Search & Optimization Algorithm
+The "Find Optimal Sample Size" feature performs a multi-dimensional grid search across:
+1. Sample Size (N): Iterating through the user-defined range.
+2. Success Hurdles: Testing values (e.g., 0.55, 0.60, 0.65) to see which best controls the False Positive rate (Alpha).
+3. Confidence Thresholds: Calibrating the "burden of proof" to meet the user's Power requirements.
+
+---
+
+## 🛠 Features & User Controls
+
+### 🎯 Sidebar: Statistical Parameters
+* Null (p0) vs. Target (p1) Efficacy: Defines the "failure" and "success" benchmarks for the drug.
+* Independent Confidence Sliders: Users can set different certainty requirements for Efficacy (Success) and Safety (Stopping), allowing for a precautionary safety approach.
+* SAE Upper Limit: Defines the maximum tolerable toxicity rate for the trial.
+
+### 📊 Operational Characteristics (OC) Stress-Tester
+Once an optimal design is found, the system provides a Multi-Scenario Stress Test to show how the trial performs in the real world:
+* Scenario Analysis: Simulates the trial under "Super-Effective," "Null," "Toxic," and "Futile" conditions.
+* ASN (Average Sample Size): Reports the average number of patients expected. A robust design shows a low ASN in both highly successful and highly toxic scenarios.
+* Safety Detection: Reports the percentage of trials that correctly shut down when exposed to the "Toxic SAE Rate".
+
+### 📝 Protocol Rules Generation
+The system automatically generates a Protocol Summary box. This translates the mathematical findings into clear, actionable rules for clinical trial protocols, including:
+* The specific patient numbers for interim checks.
+* The exact probability thresholds for the Bayesian Monitor.
+* The patient-specific trigger for the futility gate.
+
+---
+
+## 🚀 How to Run
+1. Ensure you have streamlit, numpy, scipy, and pandas installed.
+2. Run the application via terminal:
+   streamlit run AVF_Bayes_Monitor_Designer.py
