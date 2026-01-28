@@ -5,8 +5,8 @@ import pandas as pd
 
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
-st.title("🧬 Master Designer: Adaptive OC & Prior Sensitivity")
-st.markdown("Updated: Prior Strength controls and Dynamic OC Interpretation added.")
+st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
+st.markdown("Updated: Independent Efficacy and Safety Priors for precise Bayesian modeling.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -20,34 +20,35 @@ true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30
     help="For testing purposes: If the drug were actually this dangerous, how well does the trial stop?")
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚖️ Prior Strength (Bayesian Initial State)")
-# NEW: Prior Strength Sliders
-prior_alpha = st.sidebar.slider("Prior 'Successes' (α)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Default is 1.0 (Flat Prior). Increasing this assumes evidence of efficacy before the trial starts.")
-prior_beta = st.sidebar.slider("Prior 'Failures' (β)", 1.0, 10.0, 1.0, step=0.5, 
-    help="Default is 1.0 (Flat Prior). Increasing this creates a 'Skeptical Prior', requiring more evidence to prove success.")
+# SECTION: Efficacy Priors
+st.sidebar.header("⚖️ Efficacy Prior Strength")
+prior_alpha = st.sidebar.slider("Eff Prior 'Successes' (α_eff)", 1.0, 10.0, 1.0, step=0.5, 
+    help="Initial successes assumed for efficacy. Default 1.0 is a Flat Prior.")
+prior_beta = st.sidebar.slider("Eff Prior 'Failures' (β_eff)", 1.0, 10.0, 1.0, step=0.5, 
+    help="Initial failures assumed for efficacy. Increase for a 'Skeptical' efficacy prior.")
+
+# NEW SECTION: Safety Priors
+st.sidebar.header("🛡️ Safety Prior Strength")
+s_prior_alpha = st.sidebar.slider("Saf Prior 'Events' (α_saf)", 1.0, 10.0, 1.0, step=0.5, 
+    help="Initial SAEs assumed. Increasing this makes the monitor more 'Precautionary'.")
+s_prior_beta = st.sidebar.slider("Saf Prior 'Non-Events' (β_saf)", 1.0, 10.0, 1.0, step=0.5, 
+    help="Initial non-SAEs assumed. Increase to assume the drug is likely safe (Skeptical Safety Prior).")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📐 Risk Standards")
-max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005, 
-    help="The risk of a 'False Win.'")
-min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90, 
-    help="The probability of correctly identifying a successful drug.")
-min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95, 
-    help="The probability of successfully triggering a 'Safety Stop'.")
+max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005)
+min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90)
+min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95)
 
 st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Thresholds")
-eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85, 
-    help="Probability threshold to declare efficacy success.")
-safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90, 
-    help="Probability threshold to trigger a safety stop.")
-cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5, 
-    help="How often the monitor checks the data.")
+eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
+safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
+cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
 n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
-# --- STABLE VECTORIZED ENGINE (Updated for Priors) ---
-def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, p_a, p_b):
+# --- STABLE VECTORIZED ENGINE (Updated for Independent Priors) ---
+def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, p_a, p_b, s_a, s_b):
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
     stops_n = np.full(sims, max_n)
@@ -58,9 +59,9 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
         if not np.any(active): break
         c_s, c_tox = np.sum(outcomes[active, :n], axis=1), np.sum(saes[active, :n], axis=1)
         
-        # Engine now incorporates Prior Alpha and Prior Beta
+        # Separated Prior Logic for Efficacy and Safety
         prob_eff = 1 - beta.cdf(hurdle, p_a + c_s, p_b + (n - c_s))
-        prob_tox = 1 - beta.cdf(limit, p_a + c_tox, p_b + (n - c_tox))
+        prob_tox = 1 - beta.cdf(limit, s_a + c_tox, s_b + (n - c_tox))
         
         tox_trig, eff_trig = prob_tox > s_conf, prob_eff > e_conf
         fut_trig = (n >= max_n/2) & (prob_eff < 0.05)
@@ -88,16 +89,21 @@ if st.button("🚀 Find Optimal Sample Size"):
     with st.spinner("Searching for optimal design..."):
         for n in n_list:
             for hurdle in [0.55, 0.60, 0.65]:
-                alpha, _, _, _ = run_fast_batch(2000, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta)
+                # Optimized search using both prior sets
+                alpha, _, _, _ = run_fast_batch(2000, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                 if alpha <= max_alpha:
-                    pwr, _, _, _ = run_fast_batch(2000, n, p1, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta)
-                    _, tox_p, _, _ = run_fast_batch(2000, n, p1, true_toxic_rate, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta)
+                    pwr, _, _, _ = run_fast_batch(2000, n, p1, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
+                    _, tox_p, _, _ = run_fast_batch(2000, n, p1, true_toxic_rate, hurdle, eff_conf, safe_limit, n, safety_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                     if pwr >= min_power and tox_p >= min_safety_power:
                         results.append({"N": n, "Hurdle": hurdle, "Alpha": alpha, "Power": pwr, "Safety": tox_p})
     
     if results:
         st.session_state['best_design'] = pd.DataFrame(results).sort_values("N").iloc[0]
-        st.session_state['used_params'] = {"eff_conf": eff_conf, "saf_conf": safety_conf, "p_a": prior_alpha, "p_b": prior_beta}
+        st.session_state['used_params'] = {
+            "eff_conf": eff_conf, "saf_conf": safety_conf, 
+            "p_a": prior_alpha, "p_b": prior_beta,
+            "s_a": s_prior_alpha, "s_b": s_prior_beta
+        }
     else:
         st.error("No design found. Try relaxing Risk Standards.")
 
@@ -113,7 +119,7 @@ if 'best_design' in st.session_state:
     c3.metric("Safety Detection", f"{best['Safety']:.1%}")
     c4.metric("Risk (Alpha)", f"{best['Alpha']:.2%}")
     
-    st.info(f"**Decision Rules:** Success if Prob(Eff > {best['Hurdle']}) > {up['eff_conf']} | Stop for Safety if Prob(SAE > {safe_limit}) > {up['saf_conf']}")
+    st.info(f"**Decision Rules:** Success if $P(Eff > {best['Hurdle']}) > {up['eff_conf']}$ | Stop for Safety if $P(SAE > {safe_limit}) > {up['saf_conf']}$")
 
     st.markdown("---")
     st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
@@ -132,7 +138,7 @@ if 'best_design' in st.session_state:
         with st.spinner("Running stress simulations..."):
             for name, pe, ps in scenarios:
                 pe = np.clip(pe, 0.01, 0.99)
-                pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['p_a'], up['p_b'])
+                pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
                 stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
         
         df_oc = pd.DataFrame(stress_data)
@@ -143,18 +149,17 @@ if 'best_design' in st.session_state:
             "Avg N (ASN)": df_oc["ASN"].apply(lambda x: f"{x:.1f}")
         }).drop(columns="ASN"))
 
-        # --- NEW: DYNAMIC INTERPRETATION ---
+        # --- DYNAMIC INTERPRETATION ---
         st.info("### 🧐 Summary Interpretation")
-        # Check Toxicity Detection (Scenario 7)
         tox_capture = stress_data[6]["Safety Stop %"]
         tox_asn = stress_data[6]["ASN"]
-        
-        # Check Early Graduation (Scenario 1)
         grad_asn = stress_data[0]["ASN"]
         savings = (1 - (grad_asn / best['N'])) * 100
 
         st.markdown(f"""
         * **Safety Guardrail**: The monitor identifies toxic drugs with **{tox_capture:.1%} accuracy**, stopping the trial at an average of **{tox_asn:.1f}** patients in the Target Eff / Toxic scenario.
         * **Ethical Efficiency**: For a highly effective drug, the design saves **{savings:.1f}%** of enrollment through early 'graduation'.
-        * **Prior Impact**: Your current $Beta({up['p_a']}, {up['p_b']})$ prior adds **{up['p_a'] + up['p_b']:.1f} virtual patients** of weight to every decision.
+        * **Prior Analysis**: 
+            * Efficacy Prior weight: **{up['p_a'] + up['p_b']:.1f}** virtual patients.
+            * Safety Prior weight: **{up['s_a'] + up['s_b']:.1f}** virtual patients.
         """)
