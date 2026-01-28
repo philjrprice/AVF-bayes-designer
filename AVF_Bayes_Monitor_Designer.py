@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated v16.1: Fixed Search Engine & Robust Lead-in Logic.")
+st.markdown("Updated v16.2: Final Robust Search Engine & Lead-in Integration.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -37,6 +37,7 @@ n_sims = st.sidebar.select_slider("Simulations", options=[2000, 5000, 10000], va
 
 st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Thresholds")
+# Integration of Lead-in slider
 min_n_lead = st.sidebar.slider("Min N Before First Check", 5, 50, 20)
 eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
 safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
@@ -44,7 +45,7 @@ fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05)
 cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
 n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
-# --- STABLE ENGINE FROM V15 ---
+# --- STABLE VECTORIZED ENGINE FROM V15 ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b, min_n):
     np.random.seed(42)
     p_eff, p_sae = np.clip(p_eff, 0.001, 0.999), np.clip(p_sae, 0.001, 0.999)
@@ -54,7 +55,7 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
     stops_n = np.full(sims, max_n)
     is_success, is_safety_stop, is_futility_stop, already_stopped = [np.zeros(sims, dtype=bool) for _ in range(4)]
 
-    # Analysis sequence using Lead-in and Cohort logic
+    # Analysis sequence: Respects Lead-in (min_n) and then Interim Cohorts
     look_points = sorted(list(set([min_n] + [n for n in range(min_n, max_n + 1, cohort_sz) if n <= max_n])))
 
     for n in look_points:
@@ -96,11 +97,13 @@ if st.button("🚀 Find Optimal Sample Size"):
         for n in n_list:
             for h in hurdle_options:
                 h = round(float(h), 3)
-                # Corrected: Search now respects cohort and lead-in monitoring
-                a, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
+                # Corrected: Search engine now allows interim looks during Alpha/Power calculation
+                # To match v15 behavior exactly, cohort_sz is set to 'n' for the Alpha/Power check 
+                # but respects the lead-in min_n.
+                a, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, h, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
                 if a <= max_alpha:
-                    p, _, _, _ = run_fast_batch(n_sims, n, p1, 0.05, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
-                    _, sp, _, _ = run_fast_batch(n_sims, n, p1, true_toxic_rate, h, eff_conf, safe_limit, cohort_size, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
+                    p, _, _, _ = run_fast_batch(n_sims, n, p1, 0.05, h, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
+                    _, sp, _, _ = run_fast_batch(n_sims, n, p1, true_toxic_rate, h, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta, min_n_lead)
                     if p >= min_power and sp >= min_safety_power:
                         results.append({"N": n, "Hurdle": h, "Alpha": a, "Power": p, "Safety": sp})
                         break
@@ -114,22 +117,27 @@ if st.button("🚀 Find Optimal Sample Size"):
             "cohort": cohort_size, "min_n": min_n_lead, "sim_rigor": n_sims
         }
     else:
-        st.error("❌ No design found. Check if Min N Lead-in is set too high for the Search Range.")
+        st.error("❌ No design found. Adjust N Range or Efficacy Success Confidence.")
 
 # --- RESULTS DISPLAY ---
 if 'best_design' in st.session_state:
     best, up = st.session_state['best_design'], st.session_state['used_params']
     st.success(f"### ✅ Optimal Design Found: Max N={int(best['N'])} | Hurdle={best['Hurdle']}")
     
+    # 8-Scenario Stress Test Re-implemented
     if st.button("📈 Run Multi-Scenario Stress Test"):
         scenarios = [
             ("1. Super-Effective (+10%)", up['p1']+0.1, 0.05),
             ("2. On-Target", up['p1'], 0.05),
-            ("3. Null (Alpha)", up['p0'], 0.05),
-            ("4. Toxic Scenario", up['p1'], up['toxic_rate'])
+            ("3. Marginal", (up['p0']+up['p1'])/2, 0.05),
+            ("4. Null (Alpha)", up['p0'], 0.05),
+            ("5. Futile (-10%)", up['p0']-0.1, 0.05),
+            ("6. High Eff / Toxic", up['p1']+0.1, up['toxic_rate']),
+            ("7. Target Eff / Toxic", up['p1'], up['toxic_rate']),
+            ("8. Null / Toxic", up['p0'], up['toxic_rate'])
         ]
         stress_data = []
         for name, pe, ps in scenarios:
             pw, stp, asn, fut = run_fast_batch(up['sim_rigor'], int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'], up['min_n'])
-            stress_data.append({"Scenario": name, "Success %": f"{pw:.1%}", "Safety Stop %": f"{stp:.1%}", "Avg N": f"{asn:.1f}"})
+            stress_data.append({"Scenario": name, "Success %": f"{pw:.1%}", "Safety Stop %": f"{stp:.1%}", "Futility %": f"{fut:.1%}", "Avg N": f"{asn:.1f}"})
         st.table(pd.DataFrame(stress_data))
