@@ -10,21 +10,36 @@ st.markdown("Optimized for speed and clinical legitimacy using vectorized Bayesi
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
-p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5)
-p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7)
-safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15)
-true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30)
+p0 = st.sidebar.slider("Null Efficacy (p0)", 0.3, 0.7, 0.5, 
+    help="The success rate of the current standard of care. If the new drug performs at or below this level, it is considered a failure.")
+
+p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7, 
+    help="The 'Goal' success rate. This is the level of efficacy you hope the drug achieves to justify further development.")
+
+safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, 
+    help="The maximum allowable rate of Serious Adverse Events (SAEs). If the drug is likely above this limit, the trial will stop for safety.")
+
+true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, 
+    help="For testing purposes: If the drug were actually this dangerous, how well does the trial detect it and shut down?")
 
 st.sidebar.markdown("---")
 st.sidebar.header("📐 Risk Standards")
-max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005)
-min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90)
-min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95)
+max_alpha = st.sidebar.slider("Max False Positive (Alpha)", 0.005, 0.20, 0.01, step=0.005, 
+    help="The risk of a 'False Win.' A 0.01 alpha means you only accept a 1% chance of calling a failing drug a success.")
+
+min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90, 
+    help="The probability of correctly identifying a successful drug. High power (90%+) means you are very unlikely to miss a 'True Win'.")
+
+min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95, 
+    help="The probability that the trial will successfully trigger a 'Safety Stop' if the drug hits the toxic SAE rate.")
 
 st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Settings")
-cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
-n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
+cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5, 
+    help="How often the Bayesian monitor checks the data. Smaller cohorts stop faster (lower ASN) but are logistically harder to manage.")
+
+n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100), 
+    help="The range of patients the tool will test to find the smallest 'N' that meets all your risk standards.")
 
 # --- STABLE VECTORIZED ENGINE ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, conf, limit, cohort_sz, safe_conf=0.90):
@@ -157,4 +172,5 @@ if st.button("🚀 Run High-Precision Adaptive Designer"):
         st.table(pd.DataFrame(stress_data))
     else:
         st.error("No design found. Try relaxing Risk Standards or widening N range.")
+
 
