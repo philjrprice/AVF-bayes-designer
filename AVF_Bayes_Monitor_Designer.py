@@ -105,7 +105,15 @@ if st.button("🚀 Find Optimal Sample Size"):
     
     with st.spinner(f"Searching for optimal design using {n_sims:,} simulations..."):
         for n in n_list:
-            for hurdle in hurdle_options:
+            #added stuff here
+                # Create 5 potential hurdles between Null and the Midpoint
+            hurdle_options = np.linspace(p0, (p0 + p1)/2, 5)
+
+            for n in n_list:
+                for hurdle in hurdle_options:
+                    # Round hurdle for cleaner protocol text
+                    hurdle = round(float(hurdle), 3)
+ 
                 # Using n_sims for the search
                 alpha, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                 if alpha <= max_alpha:
@@ -273,3 +281,4 @@ if 'best_design' in st.session_state:
     * **Safety Trend**: Prior is **{"Cautious" if saf_mode > up['safe_limit']/2 else "Confident"}**.
     * **Prior Strength**: Efficacy weight = **{up['p_a'] + up['p_b']:.1f}** patients | Safety weight = **{up['s_a'] + up['s_b']:.1f}** patients.
     """)
+
