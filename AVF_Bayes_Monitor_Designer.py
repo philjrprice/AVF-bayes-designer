@@ -46,6 +46,8 @@ n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
 # --- STABLE VECTORIZED ENGINE ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b):
+    # REGULATORY REQUIREMENT: Fixed seed for reproducibility
+    np.random.seed(42)
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
     stops_n = np.full(sims, max_n)
@@ -243,3 +245,4 @@ if 'best_design' in st.session_state:
     * **Safety Trend**: Prior is **{"Cautious" if saf_mode > up['safe_limit']/2 else "Confident"}**.
     * **Prior Strength**: Efficacy weight = **{up['p_a'] + up['p_b']:.1f}** patients | Safety weight = **{up['s_a'] + up['s_b']:.1f}** patients.
     """)
+
