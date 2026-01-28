@@ -43,9 +43,7 @@ def get_boundaries(p0, max_n, start_at, step, eff_t, fut_t):
             if post_prob > current_thresh and eff_limit == n + 1:
                 eff_limit = x
     
-    boundaries = []
-    # Use Jeffreys Prior (0.5, 0.5)
-    a_prior, b_prior = 0.5, 0.5
+   
     
     for n in interims:
         fut_limit = -1
@@ -106,4 +104,5 @@ st.subheader("Operational Decision Table")
 st.dataframe(df_bounds, use_container_width=True)
 
 st.info(f"**Final Analysis Rule:** At N={max_n}, you need {df_bounds.iloc[-1]['Success_If_Responders_>=']} or more responders to declare success.")
+
 
