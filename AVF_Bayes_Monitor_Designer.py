@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Stable version with independent priors and Beta distribution visualizations.")
+st.markdown("Updated: Enhanced Beta Plot Labeling and Trend Analysis.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -18,7 +18,7 @@ p1 = st.sidebar.slider("Target Efficacy (p1)", 0.5, 0.9, 0.7,
 safe_limit = st.sidebar.slider("SAE Upper Limit (%)", 0.05, 0.30, 0.15, 
     help="The maximum allowable rate of Serious Adverse Events (SAEs).")
 true_toxic_rate = st.sidebar.slider("Assumed 'Toxic' SAE Rate", 0.10, 0.50, 0.30, 
-    help="For testing purposes: If the drug were actually this dangerous, how well does the trial stop?")
+    help="If the drug were actually this dangerous, how well does the trial stop?")
 
 st.sidebar.markdown("---")
 # SECTION: Efficacy Priors
@@ -41,7 +41,6 @@ st.sidebar.markdown("---")
 st.sidebar.header("⏱️ Adaptive Thresholds")
 eff_conf = st.sidebar.slider("Efficacy Success Confidence", 0.70, 0.99, 0.85)
 safety_conf = st.sidebar.slider("Safety Stop Confidence", 0.50, 0.99, 0.90)
-# Futility Slider
 fut_conf = st.sidebar.slider("Futility Stop Threshold", 0.01, 0.20, 0.05)
 
 cohort_size = st.sidebar.slider("Interim Cohort Size", 1, 20, 5)
@@ -58,7 +57,6 @@ def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, 
         active = ~already_stopped
         if not np.any(active): break
         c_s, c_tox = np.sum(outcomes[active, :n], axis=1), np.sum(saes[active, :n], axis=1)
-        
         prob_eff = 1 - beta.cdf(hurdle, p_a + c_s, p_b + (n - c_s))
         prob_tox = 1 - beta.cdf(limit, s_a + c_tox, s_b + (n - c_tox))
         
@@ -119,21 +117,16 @@ if 'best_design' in st.session_state:
     st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
     if st.button("📈 Run Multi-Scenario Stress Test"):
         scenarios = [
-            ("1. Super-Effective (Target + 10%)", p1 + 0.1, 0.05),
-            ("2. On-Target (Goal Met)", p1, 0.05),
-            ("3. Marginal (Midpoint)", (p0 + p1)/2, 0.05),
-            ("4. Null (Standard Care)", p0, 0.05),
-            ("5. Futile (Below Null)", p0 - 0.1, 0.05),
-            ("6. High Eff / Toxic", p1 + 0.1, true_toxic_rate),
-            ("7. Target Eff / Toxic", p1, true_toxic_rate),
-            ("8. Null / Toxic", p0, true_toxic_rate),
+            ("1. Super-Effective", p1 + 0.1, 0.05), ("2. On-Target", p1, 0.05),
+            ("3. Marginal", (p0 + p1)/2, 0.05), ("4. Null", p0, 0.05),
+            ("5. Futile", p0 - 0.1, 0.05), ("6. High Eff / Toxic", p1 + 0.1, true_toxic_rate),
+            ("7. Target Eff / Toxic", p1, true_toxic_rate), ("8. Null / Toxic", p0, true_toxic_rate),
         ]
         stress_data = []
-        with st.spinner("Running stress simulations..."):
-            for name, pe, ps in scenarios:
-                pe = np.clip(pe, 0.01, 0.99)
-                pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
-                stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
+        for name, pe, ps in scenarios:
+            pe = np.clip(pe, 0.01, 0.99)
+            pow_v, stop_v, asn_v, fut_v = run_fast_batch(2000, int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], safe_limit, cohort_size, up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
+            stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
         
         df_oc = pd.DataFrame(stress_data)
         st.table(df_oc.assign(**{
@@ -143,42 +136,46 @@ if 'best_design' in st.session_state:
             "Avg N (ASN)": df_oc["ASN"].apply(lambda x: f"{x:.1f}")
         }).drop(columns="ASN"))
 
-        # DYNAMIC INTERPRETATION
-        st.info("### 🧐 Summary Interpretation")
-        tox_capture = stress_data[6]["Safety Stop %"]
-        tox_asn = stress_data[6]["ASN"]
-        grad_asn = stress_data[0]["ASN"]
-        savings = (1 - (grad_asn / best['N'])) * 100
-
-        st.markdown(f"""
-        * **Safety Guardrail**: The monitor identifies toxic drugs with **{tox_capture:.1%} accuracy**, stopping the trial at an average of **{tox_asn:.1f}** patients in the Target Eff / Toxic scenario.
-        * **Ethical Efficiency**: For a highly effective drug, the design saves **{savings:.1f}%** of enrollment through early 'graduation'.
-        * **Prior Impact**: Your Efficacy prior adds **{up['p_a'] + up['p_b']:.1f} virtual patients**, while the Safety prior adds **{up['s_a'] + up['s_b']:.1f} patients** of weight to decisions.
-        """)
-
-    # --- NEW: BETA PLOTS SECTION ---
+    # --- UPDATED: BETA PLOTS WITH FULL LABELS ---
     st.markdown("---")
     st.subheader("📈 Bayesian Prior Probability Densities")
     x = np.linspace(0, 1, 100)
-    
     col_plot1, col_plot2 = st.columns(2)
     
     with col_plot1:
         y_eff = beta.pdf(x, up['p_a'], up['p_b'])
-        fig_eff, ax_eff = plt.subplots(figsize=(6, 3))
+        fig_eff, ax_eff = plt.subplots(figsize=(6, 3.5))
         ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior: Beta({up["p_a"]}, {up["p_b"]})')
         ax_eff.fill_between(x, 0, y_eff, color='blue', alpha=0.1)
         ax_eff.axvline(p0, color='red', linestyle='--', label=f'Null Hurdle ({p0})')
-        ax_eff.set_title("Efficacy Prior Distribution")
+        ax_eff.set_title("Efficacy Prior Distribution", fontweight='bold')
+        ax_eff.set_xlabel("True Response Rate")
+        ax_eff.set_ylabel("Probability Density")
         ax_eff.legend(fontsize='small')
         st.pyplot(fig_eff)
 
     with col_plot2:
         y_saf = beta.pdf(x, up['s_a'], up['s_b'])
-        fig_saf, ax_saf = plt.subplots(figsize=(6, 3))
+        fig_saf, ax_saf = plt.subplots(figsize=(6, 3.5))
         ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior: Beta({up["s_a"]}, {up["s_b"]})')
         ax_saf.fill_between(x, 0, y_saf, color='orange', alpha=0.1)
         ax_saf.axvline(safe_limit, color='red', linestyle='--', label=f'Safety Limit ({safe_limit})')
-        ax_saf.set_title("Safety Prior Distribution")
+        ax_saf.set_title("Safety Prior Distribution", fontweight='bold')
+        ax_saf.set_xlabel("True SAE Rate")
+        ax_saf.set_ylabel("Probability Density")
         ax_saf.legend(fontsize='small')
         st.pyplot(fig_saf)
+
+    # --- NEW: TREND EXPLANATION ---
+    st.info("### 🧐 Prior Trend Analysis")
+    eff_mode = (up['p_a'] - 1) / (up['p_a'] + up['p_b'] - 2) if (up['p_a'] + up['p_b']) > 2 else 0.5
+    saf_mode = (up['s_a'] - 1) / (up['s_a'] + up['s_b'] - 2) if (up['s_a'] + up['s_b']) > 2 else 0.5
+    
+    eff_trend = "Optimistic" if eff_mode > p0 else "Skeptical" if eff_mode < p0 else "Neutral"
+    saf_trend = "Cautious" if saf_mode > safe_limit/2 else "Confident"
+    
+    st.markdown(f"""
+    * **Efficacy Trend**: The prior is currently **{eff_trend}**. A peak to the right of the red line (Null Hurdle) assumes the drug works before trial data arrives; a peak to the left requires more evidence to overcome initial skepticism.
+    * **Safety Trend**: The prior is **{saf_trend}**. Higher α_saf values shift the density toward the red Safety Limit, making the monitor 'trigger-happy' to protect patients.
+    * **Visualizing 'Weight'**: The 'tightness' of the curves represents confidence. Flatter curves mean the trial will be driven almost entirely by new data; tall, narrow curves mean the trial will be harder to sway from the starting assumption.
+    """)
