@@ -30,8 +30,8 @@ with st.sidebar:
     # New slider to control simulation speed vs. accuracy
     n_sims = st.select_slider(
         "Simulation Iterations",
-        options=[1000, 2500, 5000, 7500, 10000],
-        value=1000,
+        options=[100,250, 500, 1000, 2000, 2500, 5000, 7500, 10000],
+        value=100,
         help="Lower values are faster for searching; higher values provide more precise Alpha/Power stats."
     )
 
@@ -127,3 +127,4 @@ with col_right:
     st.progress(results['asn'] / max_n)
     
     st.download_button("Export Table to CSV", results['table'].to_csv(index=False), "master_trial_design.csv")
+
