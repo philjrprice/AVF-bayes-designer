@@ -6,7 +6,7 @@ import pandas as pd
 st.set_page_config(page_title="Master Bayesian Trial Lab", layout="wide")
 
 st.title("🔬 Master Bayesian Trial Lab: Efficacy & Safety")
-st.markdown("Adjust parameters to design your trial. Simulation results update automatically.")
+st.markdown("Set your parameters in the sidebar. Click **'Run Analysis'** to generate the design and simulations.")
 
 # --- SIDEBAR INPUTS ---
 with st.sidebar:
@@ -26,14 +26,16 @@ with st.sidebar:
     fut_thresh = st.slider("Futility Threshold", 0.01, 0.20, 0.10)
     tox_thresh = st.slider("Safety Threshold (Prob > Max Tox)", 0.80, 0.99, 0.95)
 
-    st.header("4. Performance Tuning")
-    # New slider to control simulation speed vs. accuracy
+    st.header("4. Simulation Control")
     n_sims = st.select_slider(
         "Simulation Iterations",
-        options=[100,250, 500, 1000, 2000, 2500, 5000, 7500, 10000],
-        value=100,
-        help="Lower values are faster for searching; higher values provide more precise Alpha/Power stats."
+        options=[100, 250, 500, 1000, 2000, 2500, 5000, 10000, 15000],
+        value=100
     )
+    
+    st.divider()
+    # The Submit Button
+    run_button = st.button("🚀 Run Analysis", use_container_width=True, type="primary")
 
 # --- SIMULATION ENGINE ---
 @st.cache_data
@@ -41,7 +43,6 @@ def run_master_simulation(p0, p1, tox_limit, max_n, start_at, step, e_int, e_fin
     interims = list(range(start_at, max_n, step))
     if max_n not in interims: interims.append(max_n)
     
-    # 1. Pre-calculate Master Table Boundaries
     table_data = []
     for n in range(1, max_n + 1):
         tox_bound = -1
@@ -67,27 +68,20 @@ def run_master_simulation(p0, p1, tox_limit, max_n, start_at, step, e_int, e_fin
                 "Success (Resp ≥)": e_lim if e_lim is not None else "—"
             })
 
-    # 2. Monte Carlo Simulation Logic
     def sim(p_eff, p_tox):
         resp, tox = 0, 0
         for n_step in range(1, max_n + 1):
             resp += np.random.binomial(1, p_eff)
             tox += np.random.binomial(1, p_tox)
-            
-            # Continuous Safety Check
             if (1 - stats.beta.cdf(tox_limit, 0.5 + tox, 0.5 + n_step - tox)) >= t_t:
                 return "Safety Stop", n_step
-            
-            # Periodic Efficacy Check
             if n_step in interims:
                 prob_eff = 1 - stats.beta.cdf(p0, 0.5 + resp, 0.5 + n_step - resp)
                 thresh = e_fin if n_step == max_n else e_int
                 if prob_eff < f_t: return "Futility Stop", n_step
                 if prob_eff >= thresh: return "Success Stop", n_step
-        
         return "Futility Stop", max_n
 
-    # Run simulations
     res_null = [sim(p0, 0.20) for _ in range(n_iters)]
     res_alt = [sim(p1, 0.20) for _ in range(n_iters)]
     
@@ -99,32 +93,31 @@ def run_master_simulation(p0, p1, tox_limit, max_n, start_at, step, e_int, e_fin
         "table": pd.DataFrame(table_data)
     }
 
-# --- UI DISPLAY ---
-# Added n_sims to the function call
-results = run_master_simulation(p0, p1, tox_limit, max_n, start_at, look_every, eff_interim, eff_final, fut_thresh, tox_thresh, n_sims)
+# --- OUTPUT LOGIC ---
+if run_button:
+    with st.spinner(f"Simulating {n_sims} trials..."):
+        results = run_master_simulation(p0, p1, tox_limit, max_n, start_at, look_every, eff_interim, eff_final, fut_thresh, tox_thresh, n_sims)
 
-st.subheader(f"📊 Integrated Performance Readout ({n_sims} iterations)")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Overall Alpha", f"{results['alpha']:.2%}")
-c2.metric("Total Power", f"{results['power']:.2%}")
-c3.metric("Prob of Safety Stop", f"{results['safety_stops']:.2%}")
-c4.metric("Avg Sample Size", f"{results['asn']:.1f}")
+        st.subheader(f"📊 Integrated Performance Readout ({n_sims} iterations)")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Overall Alpha", f"{results['alpha']:.2%}")
+        c2.metric("Total Power", f"{results['power']:.2%}")
+        c3.metric("Prob of Safety Stop", f"{results['safety_stops']:.2%}")
+        c4.metric("Avg Sample Size", f"{results['asn']:.1f}")
 
-st.divider()
-col_left, col_right = st.columns([3, 2])
+        st.divider()
+        col_left, col_right = st.columns([3, 2])
 
-with col_left:
-    st.subheader("Master Operational Table")
-    st.dataframe(results['table'], use_container_width=True, hide_index=True)
+        with col_left:
+            st.subheader("Master Operational Table")
+            st.dataframe(results['table'], use_container_width=True, hide_index=True)
 
-with col_right:
-    st.subheader("Final Protocol Specs")
-    st.write(f"**Efficacy:** Pass if ≥ {results['table'].iloc[-1]['Success (Resp ≥)']} responders.")
-    st.write(f"**Safety:** Suspend trial if Toxicity count hits the safety limit at any point.")
-    
-    # Progress bar visualization for ASN
-    st.write(f"**Efficiency:** Avg N is {results['asn']:.1f} out of {max_n} max.")
-    st.progress(results['asn'] / max_n)
-    
-    st.download_button("Export Table to CSV", results['table'].to_csv(index=False), "master_trial_design.csv")
-
+        with col_right:
+            st.subheader("Final Protocol Specs")
+            st.write(f"**Success Target:** Pass if ≥ {results['table'].iloc[-1]['Success (Resp ≥)']} responders out of {max_n}.")
+            st.write(f"**Safety:** Real-time stopping boundaries calculated using {tox_thresh} probability threshold.")
+            st.progress(results['asn'] / max_n)
+            st.write(f"Avg N: {results['asn']:.1f}")
+            st.download_button("Export to CSV", results['table'].to_csv(index=False), "trial_design.csv")
+else:
+    st.info("👈 Adjust the parameters in the sidebar and click 'Run Analysis' to see the results.")
