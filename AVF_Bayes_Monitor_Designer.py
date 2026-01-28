@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Added Regulatory OC Curves, PoS, and Final Analysis Rules.")
+st.markdown("Updated: Enhanced Scenario Descriptions and Chart Data included in Export.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -119,7 +119,7 @@ if 'best_design' in st.session_state:
         st.write(f"4. **Futility Rule**: From patient {int(best['N']/2)} onwards, stop if $P(Success) < {up['fut_conf']}$.")
         st.markdown(f"5. **Final Analysis**: If the trial reaches {int(best['N'])} patients, the drug is successful if the posterior probability $P(Rate > {best['Hurdle']})$ exceeds **{up['eff_conf']}**.")
 
-    # --- NEW: REGULATORY OC CURVE & PoS ---
+    # --- REGULATORY OC CURVE ---
     st.markdown("---")
     st.subheader("📈 Operating Characteristic (OC) Curve & PoS")
     eff_range = np.linspace(up['p0'] - 0.1, up['p1'] + 0.15, 8)
@@ -129,6 +129,8 @@ if 'best_design' in st.session_state:
             p_succ, _, _, _ = run_fast_batch(1000, int(best['N']), pe, 0.05, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
             oc_probs.append(p_succ)
     
+    st.session_state['oc_chart_data'] = pd.DataFrame({"True_Rate": eff_range, "PoS": oc_probs})
+    
     fig_oc, ax_oc = plt.subplots(figsize=(10, 3.5))
     ax_oc.plot(eff_range, oc_probs, marker='o', color='teal', label='Prob. of Success (PoS)')
     ax_oc.axvline(up['p0'], color='red', linestyle='--', label=f'Null ({up["p0"]})')
@@ -136,15 +138,19 @@ if 'best_design' in st.session_state:
     ax_oc.set_ylabel("Probability of Success"); ax_oc.set_xlabel("True Effect Rate"); ax_oc.legend(); ax_oc.grid(alpha=0.3)
     st.pyplot(fig_oc)
 
-    
+    # --- STRESS TEST WITH DETAILED SCENARIOS ---
     st.markdown("---")
     st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
     if st.button("📈 Run Multi-Scenario Stress Test"):
         scenarios = [
-            ("1. Super-Effective", up['p1'] + 0.1, 0.05), ("2. On-Target", up['p1'], 0.05),
-            ("3. Marginal", (up['p0'] + up['p1'])/2, 0.05), ("4. Null", up['p0'], 0.05),
-            ("5. Futile", up['p0'] - 0.1, 0.05), ("6. High Eff / Toxic", up['p1'] + 0.1, up['toxic_rate']),
-            ("7. Target Eff / Toxic", up['p1'], up['toxic_rate']), ("8. Null / Toxic", up['p0'], up['toxic_rate']),
+            (f"1. Super-Effective (Eff: {up['p1']+0.1:.0%}, Saf: 5%)", up['p1'] + 0.1, 0.05),
+            (f"2. On-Target (Eff: {up['p1']:.0%}, Saf: 5%)", up['p1'], 0.05),
+            (f"3. Marginal (Eff: {(up['p0']+up['p1'])/2:.0%}, Saf: 5%)", (up['p0'] + up['p1'])/2, 0.05),
+            (f"4. Null (Eff: {up['p0']:.0%}, Saf: 5%)", up['p0'], 0.05),
+            (f"5. Futile (Eff: {up['p0']-0.1:.0%}, Saf: 5%)", up['p0'] - 0.1, 0.05),
+            (f"6. High Eff / Toxic (Eff: {up['p1']+0.1:.0%}, Saf: {up['toxic_rate']:.0%})", up['p1'] + 0.1, up['toxic_rate']),
+            (f"7. Target Eff / Toxic (Eff: {up['p1']:.0%}, Saf: {up['toxic_rate']:.0%})", up['p1'], up['toxic_rate']),
+            (f"8. Null / Toxic (Eff: {up['p0']:.0%}, Saf: {up['toxic_rate']:.0%})", up['p0'], up['toxic_rate']),
         ]
         stress_data = []
         for name, pe, ps in scenarios:
@@ -173,50 +179,60 @@ if 'best_design' in st.session_state:
         * **Futility Efficiency**: The **{up['fut_conf']:.0%}** threshold protects resources when success is unlikely.
         """)
 
-    # --- EXPORT REPORT BUTTON ---
-    if 'stress_results' in st.session_state:
-        st.markdown("---")
-        report_params = pd.DataFrame([up]).T.reset_index().rename(columns={"index": "Parameter", 0: "Value"})
-        report_results = pd.DataFrame([best]).T.reset_index().rename(columns={"index": "Metric", 0: "Result"})
-        
-        combined_report = pd.concat([
-            pd.DataFrame([{"Parameter": "--- DESIGN SETTINGS ---", "Value": ""}]),
-            report_params,
-            pd.DataFrame([{"Parameter": "--- OPTIMAL RESULTS ---", "Value": ""}]),
-            report_results,
-            pd.DataFrame([{"Parameter": "--- STRESS TEST DATA ---", "Value": ""}]),
-            st.session_state['stress_results']
-        ], axis=0, ignore_index=True)
-
-        csv = combined_report.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Export Full Design Report (CSV)",
-            data=csv,
-            file_name="AVF_Bayesian_Design_Report.csv",
-            mime="text/csv"
-        )
-
     # --- BETA PLOTS ---
     st.markdown("---")
     st.subheader("📈 Bayesian Prior Probability Densities")
     x = np.linspace(0, 1, 100)
     col_plot1, col_plot2 = st.columns(2)
+    
+    y_eff = beta.pdf(x, up['p_a'], up['p_b'])
+    st.session_state['eff_prior_data'] = pd.DataFrame({"Rate": x, "Density": y_eff})
     with col_plot1:
-        y_eff = beta.pdf(x, up['p_a'], up['p_b'])
         fig_eff, ax_eff = plt.subplots(figsize=(6, 3.5))
         ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior: Beta({up["p_a"]}, {up["p_b"]})')
         ax_eff.fill_between(x, 0, y_eff, color='blue', alpha=0.1)
         ax_eff.axvline(up['p0'], color='red', linestyle='--', label=f'Null Hurdle ({up["p0"]})')
         ax_eff.set_title("Efficacy Prior Distribution", fontweight='bold'); ax_eff.set_xlabel("True Response Rate"); ax_eff.set_ylabel("Density"); ax_eff.legend(fontsize='small')
         st.pyplot(fig_eff)
+        
+    y_saf = beta.pdf(x, up['s_a'], up['s_b'])
+    st.session_state['saf_prior_data'] = pd.DataFrame({"Rate": x, "Density": y_saf})
     with col_plot2:
-        y_saf = beta.pdf(x, up['s_a'], up['s_b'])
         fig_saf, ax_saf = plt.subplots(figsize=(6, 3.5))
         ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior: Beta({up["s_a"]}, {up["s_b"]})')
         ax_saf.fill_between(x, 0, y_saf, color='orange', alpha=0.1)
         ax_saf.axvline(up['safe_limit'], color='red', linestyle='--', label=f'Safety Limit ({up["safe_limit"]})')
         ax_saf.set_title("Safety Prior Distribution", fontweight='bold'); ax_saf.set_xlabel("True SAE Rate"); ax_saf.set_ylabel("Density"); ax_saf.legend(fontsize='small')
         st.pyplot(fig_saf)
+
+    # --- ENHANCED EXPORT REPORT ---
+    if 'stress_results' in st.session_state:
+        st.markdown("---")
+        report_params = pd.DataFrame([up]).T.reset_index().rename(columns={"index": "Metric/Param", 0: "Value"})
+        report_results = pd.DataFrame([best]).T.reset_index().rename(columns={"index": "Metric/Param", 0: "Value"})
+        
+        combined_report = pd.concat([
+            pd.DataFrame([{"Metric/Param": "--- DESIGN SETTINGS ---", "Value": ""}]),
+            report_params,
+            pd.DataFrame([{"Metric/Param": "--- OPTIMAL RESULTS ---", "Value": ""}]),
+            report_results,
+            pd.DataFrame([{"Metric/Param": "--- STRESS TEST DATA ---", "Value": ""}]),
+            st.session_state['stress_results'].rename(columns={"Scenario": "Metric/Param", "Success %": "Value"}), # Simplifying for concat
+            pd.DataFrame([{"Metric/Param": "--- OC CURVE DATA ---", "Value": ""}]),
+            st.session_state['oc_chart_data'].rename(columns={"True_Rate": "Metric/Param", "PoS": "Value"}),
+            pd.DataFrame([{"Metric/Param": "--- EFFICACY PRIOR DATA ---", "Value": ""}]),
+            st.session_state['eff_prior_data'].rename(columns={"Rate": "Metric/Param", "Density": "Value"}),
+            pd.DataFrame([{"Metric/Param": "--- SAFETY PRIOR DATA ---", "Value": ""}]),
+            st.session_state['saf_prior_data'].rename(columns={"Rate": "Metric/Param", "Density": "Value"})
+        ], axis=0, ignore_index=True)
+
+        csv = combined_report.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="📥 Export Full Design Report & Chart Data (CSV)",
+            data=csv,
+            file_name="AVF_Regulatory_Design_Report.csv",
+            mime="text/csv"
+        )
 
     # --- TREND EXPLANATION ---
     st.info("### 🧐 Prior Trend Analysis")
