@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Dynamic hurdle logic and crash protection added.")
+st.markdown("Updated v14: Dynamic Hurdle Search, Safety Power Curve, and Regulatory Disclosures.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -36,7 +36,6 @@ min_power = st.sidebar.slider("Min Efficacy Power", 0.70, 0.99, 0.90)
 min_safety_power = st.sidebar.slider("Min Safety Power (Detection)", 0.70, 0.99, 0.95)
 
 st.sidebar.markdown("---")
-# NEW: Simulation Rigor Slider
 st.sidebar.header("🔬 Simulation Rigor")
 n_sims = st.sidebar.select_slider(
     "Number of Simulations",
@@ -56,11 +55,9 @@ n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 
 # --- STABLE VECTORIZED ENGINE ---
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b):
-    # REGULATORY REQUIREMENT: Fixed seed for reproducibility
     np.random.seed(42)
-    # CRASH FIX: Ensure probabilities are valid (0 <= p <= 1)
-    p_eff = np.clip(p_eff, 0.0, 1.0)
-    p_sae = np.clip(p_sae, 0.0, 1.0)
+    p_eff = np.clip(p_eff, 0.001, 0.999) # Boundary protection
+    p_sae = np.clip(p_sae, 0.001, 0.999)
     
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
@@ -98,23 +95,13 @@ if st.button("🚀 Find Optimal Sample Size"):
     results = []
     n_list = list(range(n_range[0], n_range[1] + 1, 2))
     
-    # LOGIC FIX: Dynamic Hurdles derived from user input
-    # We test the Null Rate (p0) and the Midpoint ((p0+p1)/2)
-    # We avoid testing p1 directly as a hurdle because it's usually too strict for a 'Success' bar.
-    hurdle_options = sorted(list(set([p0, round((p0 + p1)/2, 2)])))
+    # IMPROVEMENT: Expanded Dynamic Hurdle Search
+    hurdle_options = np.linspace(p0, (p0 + p1)/2, 5)
     
     with st.spinner(f"Searching for optimal design using {n_sims:,} simulations..."):
         for n in n_list:
-            #added stuff here
-                # Create 5 potential hurdles between Null and the Midpoint
-            hurdle_options = np.linspace(p0, (p0 + p1)/2, 5)
-
-            for n in n_list:
-                for hurdle in hurdle_options:
-                    # Round hurdle for cleaner protocol text
-                    hurdle = round(float(hurdle), 3)
- 
-                # Using n_sims for the search
+            for hurdle in hurdle_options:
+                hurdle = round(float(hurdle), 3)
                 alpha, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                 if alpha <= max_alpha:
                     pwr, _, _, _ = run_fast_batch(n_sims, n, p1, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
@@ -129,8 +116,7 @@ if st.button("🚀 Find Optimal Sample Size"):
             "eff_conf": eff_conf, "saf_conf": safety_conf, "fut_conf": fut_conf,
             "p_a": prior_alpha, "p_b": prior_beta, "s_a": s_prior_alpha, "s_b": s_prior_beta,
             "alpha_req": max_alpha, "pwr_req": min_power, "saf_pwr_req": min_safety_power,
-            "cohort": cohort_size,
-            "sim_rigor": n_sims 
+            "cohort": cohort_size, "sim_rigor": n_sims 
         }
 
 # --- PERSISTENT DISPLAY ---
@@ -149,30 +135,34 @@ if 'best_design' in st.session_state:
         st.write(f"2. **Interim Success**: Declare early success if $P(Rate > {best['Hurdle']}) > {up['eff_conf']}$.")
         st.write(f"3. **Safety Stop**: Terminate if $P(SAE Rate > {up['safe_limit']}) > {up['saf_conf']}$.")
         st.write(f"4. **Futility Rule**: From patient {int(best['N']/2)} onwards, stop if $P(Success) < {up['fut_conf']}$.")
-        st.markdown(f"5. **Final Analysis**: If the trial reaches {int(best['N'])} patients, the drug is successful if the posterior probability $P(Rate > {best['Hurdle']})$ exceeds **{up['eff_conf']}**.")
+        st.write(f"5. **Final Analysis**: If the trial reaches {int(best['N'])} patients, the drug is successful if the posterior probability $P(Rate > {best['Hurdle']})$ exceeds **{up['eff_conf']}**.")
+        # IMPROVEMENT: Regulatory Disclosure
+        st.caption("**Regulatory Note**: Success thresholds are held constant across all interim looks. Alpha risk accounts for cumulative inflation across all sequential peeks.")
 
     # --- REGULATORY OC CURVE ---
     st.markdown("---")
     st.subheader("📈 Operating Characteristic (OC) Curve & PoS")
     
-    # CRASH FIX: Ensure linspace never exceeds 0.0 - 1.0 range
-    low_b = max(0.0, up['p0'] - 0.15)
-    high_b = min(1.0, up['p1'] + 0.15)
-    eff_range = np.linspace(low_b, high_b, 20)
-    
+    # IMPROVEMENT: Dual Safety/Efficacy Curve
+    eff_range = np.linspace(max(0, up['p0'] - 0.15), min(1, up['p1'] + 0.15), 15)
     oc_probs = []
+    saf_probs = []
     with st.spinner(f"Generating OC Data with {up['sim_rigor']:,} simulations..."):
         for pe in eff_range:
             p_succ, _, _, _ = run_fast_batch(up['sim_rigor'], int(best['N']), pe, 0.05, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
             oc_probs.append(p_succ)
+            # Calculate safety stop probability at this same effect rate (assuming safe_limit is being approached)
+            _, p_saf_stop, _, _ = run_fast_batch(up['sim_rigor'], int(best['N']), pe, pe/2, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
+            saf_probs.append(p_saf_stop)
     
-    st.session_state['oc_chart_data'] = pd.DataFrame({"True_Rate": eff_range, "PoS": oc_probs})
+    st.session_state['oc_chart_data'] = pd.DataFrame({"True_Rate": eff_range, "PoS": oc_probs, "SafetyStop": saf_probs})
     
-    fig_oc, ax_oc = plt.subplots(figsize=(10, 3.5))
+    fig_oc, ax_oc = plt.subplots(figsize=(10, 4))
     ax_oc.plot(eff_range, oc_probs, marker='o', color='teal', label='Prob. of Success (PoS)')
+    ax_oc.plot(eff_range, saf_probs, marker='x', linestyle=':', color='orange', label='Prob. of Safety Stop (if SAEs follow Eff)')
     ax_oc.axvline(up['p0'], color='red', linestyle='--', label=f'Null ({up["p0"]})')
     ax_oc.axvline(up['p1'], color='green', linestyle='--', label=f'Target ({up["p1"]})')
-    ax_oc.set_ylabel("Probability of Success"); ax_oc.set_xlabel("True Effect Rate"); ax_oc.legend(); ax_oc.grid(alpha=0.3)
+    ax_oc.set_ylabel("Probability"); ax_oc.set_xlabel("True Effect Rate"); ax_oc.legend(); ax_oc.grid(alpha=0.3)
     st.pyplot(fig_oc)
 
     # --- STRESS TEST WITH DETAILED SCENARIOS ---
@@ -190,9 +180,9 @@ if 'best_design' in st.session_state:
             (f"8. Null / Toxic (Eff: {up['p0']:.0%}, Saf: {up['toxic_rate']:.0%})", up['p0'], up['toxic_rate']),
         ]
         stress_data = []
-        with st.spinner(f"Stressing trial with {up['sim_rigor']:,} simulations per scenario..."):
+        with st.spinner(f"Stressing trial..."):
             for name, pe, ps in scenarios:
-                pe = np.clip(pe, 0.0, 1.0)
+                pe = np.clip(pe, 0.001, 0.999)
                 pow_v, stop_v, asn_v, fut_v = run_fast_batch(up['sim_rigor'], int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
                 stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
         
@@ -205,18 +195,6 @@ if 'best_design' in st.session_state:
             "Avg N (ASN)": df_oc["ASN"].apply(lambda x: f"{x:.1f}")
         }).drop(columns="ASN"))
 
-        st.info("### 🧐 OC Summary Interpretation")
-        tox_capture = stress_data[6]["Safety Stop %"]
-        tox_asn = stress_data[6]["ASN"]
-        grad_asn = stress_data[0]["ASN"]
-        savings = (1 - (grad_asn / best['N'])) * 100
-
-        st.markdown(f"""
-        * **Safety Guardrail**: Identifies toxic drugs with **{tox_capture:.1%} accuracy**, stopping at an average of **{tox_asn:.1f}** patients.
-        * **Early Graduation**: Effective drugs save **{savings:.1f}%** of enrollment.
-        * **Futility Efficiency**: The **{up['fut_conf']:.0%}** threshold protects resources when success is unlikely.
-        """)
-
     # --- BETA PLOTS ---
     st.markdown("---")
     st.subheader("📈 Bayesian Prior Probability Densities")
@@ -227,58 +205,41 @@ if 'best_design' in st.session_state:
     st.session_state['eff_prior_data'] = pd.DataFrame({"Rate": x, "Density": y_eff})
     with col_plot1:
         fig_eff, ax_eff = plt.subplots(figsize=(6, 3.5))
-        ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior: Beta({up["p_a"]}, {up["p_b"]})')
-        ax_eff.fill_between(x, 0, y_eff, color='blue', alpha=0.1)
-        ax_eff.axvline(up['p0'], color='red', linestyle='--', label=f'Null Hurdle ({up["p0"]})')
-        ax_eff.set_title("Efficacy Prior Distribution", fontweight='bold'); ax_eff.set_xlabel("True Response Rate"); ax_eff.set_ylabel("Density"); ax_eff.legend(fontsize='small')
+        ax_eff.plot(x, y_eff, color='blue', lw=2, label=f'Eff Prior')
+        ax_eff.axvline(up['p0'], color='red', linestyle='--', label=f'Null ({up["p0"]})')
+        ax_eff.set_title("Efficacy Prior Distribution"); ax_eff.set_xlabel("Rate"); ax_eff.legend(fontsize='small')
         st.pyplot(fig_eff)
         
     y_saf = beta.pdf(x, up['s_a'], up['s_b'])
     st.session_state['saf_prior_data'] = pd.DataFrame({"Rate": x, "Density": y_saf})
     with col_plot2:
         fig_saf, ax_saf = plt.subplots(figsize=(6, 3.5))
-        ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior: Beta({up["s_a"]}, {up["s_b"]})')
-        ax_saf.fill_between(x, 0, y_saf, color='orange', alpha=0.1)
-        ax_saf.axvline(up['safe_limit'], color='red', linestyle='--', label=f'Safety Limit ({up["safe_limit"]})')
-        ax_saf.set_title("Safety Prior Distribution", fontweight='bold'); ax_saf.set_xlabel("True SAE Rate"); ax_saf.set_ylabel("Density"); ax_saf.legend(fontsize='small')
+        ax_saf.plot(x, y_saf, color='orange', lw=2, label=f'Saf Prior')
+        ax_saf.axvline(up['safe_limit'], color='red', linestyle='--', label=f'Limit ({up["safe_limit"]})')
+        ax_saf.set_title("Safety Prior Distribution"); ax_saf.set_xlabel("SAE Rate"); ax_saf.legend(fontsize='small')
         st.pyplot(fig_saf)
 
     # --- ENHANCED EXPORT REPORT ---
     if 'stress_results' in st.session_state:
         st.markdown("---")
-        report_params = pd.DataFrame([up]).T.reset_index().rename(columns={"index": "Metric/Param", 0: "Value"})
-        report_results = pd.DataFrame([best]).T.reset_index().rename(columns={"index": "Metric/Param", 0: "Value"})
+        report_params = pd.DataFrame([up]).T.reset_index().rename(columns={"index": "Metric", 0: "Value"})
+        report_results = pd.DataFrame([best]).T.reset_index().rename(columns={"index": "Metric", 0: "Value"})
         
         combined_report = pd.concat([
-            pd.DataFrame([{"Metric/Param": "--- DESIGN SETTINGS ---", "Value": ""}]),
+            pd.DataFrame([{"Metric": "--- DESIGN SETTINGS ---", "Value": ""}]),
             report_params,
-            pd.DataFrame([{"Metric/Param": "--- OPTIMAL RESULTS ---", "Value": ""}]),
+            pd.DataFrame([{"Metric": "--- OPTIMAL RESULTS ---", "Value": ""}]),
             report_results,
-            pd.DataFrame([{"Metric/Param": "--- STRESS TEST DATA ---", "Value": ""}]),
-            st.session_state['stress_results'].rename(columns={"Scenario": "Metric/Param", "Success %": "Value"}),
-            pd.DataFrame([{"Metric/Param": "--- OC CURVE DATA ---", "Value": ""}]),
-            st.session_state['oc_chart_data'].rename(columns={"True_Rate": "Metric/Param", "PoS": "Value"}),
-            pd.DataFrame([{"Metric/Param": "--- EFFICACY PRIOR DATA ---", "Value": ""}]),
-            st.session_state['eff_prior_data'].rename(columns={"Rate": "Metric/Param", "Density": "Value"}),
-            pd.DataFrame([{"Metric/Param": "--- SAFETY PRIOR DATA ---", "Value": ""}]),
-            st.session_state['saf_prior_data'].rename(columns={"Rate": "Metric/Param", "Density": "Value"})
+            pd.DataFrame([{"Metric": "--- STRESS TEST DATA ---", "Value": ""}]),
+            st.session_state['stress_results'].rename(columns={"Scenario": "Metric", "Success %": "Value"}),
+            pd.DataFrame([{"Metric": "--- OC CURVE DATA ---", "Value": ""}]),
+            st.session_state['oc_chart_data'].rename(columns={"True_Rate": "Metric", "PoS": "Value"}),
         ], axis=0, ignore_index=True)
 
         csv = combined_report.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            label="📥 Export Full Design Report & Chart Data (CSV)",
-            data=csv,
-            file_name="AVF_Regulatory_Design_Report.csv",
-            mime="text/csv"
-        )
+        st.download_button(label="📥 Export Full Design Report (CSV)", data=csv, file_name="AVF_Regulatory_Report_v14.csv", mime="text/csv")
 
-    # --- TREND EXPLANATION ---
     st.info("### 🧐 Prior Trend Analysis")
     eff_mode = (up['p_a'] - 1) / (up['p_a'] + up['p_b'] - 2) if (up['p_a'] + up['p_b']) > 2 else 0.5
-    saf_mode = (up['s_a'] - 1) / (up['s_a'] + up['s_b'] - 2) if (up['s_a'] + up['s_b']) > 2 else 0.5
-    st.markdown(f"""
-    * **Efficacy Trend**: Prior is currently **{"Optimistic" if eff_mode > up['p0'] else "Skeptical" if eff_mode < up['p0'] else "Neutral"}**.
-    * **Safety Trend**: Prior is **{"Cautious" if saf_mode > up['safe_limit']/2 else "Confident"}**.
-    * **Prior Strength**: Efficacy weight = **{up['p_a'] + up['p_b']:.1f}** patients | Safety weight = **{up['s_a'] + up['s_b']:.1f}** patients.
-    """)
-
+    st.markdown(f"* **Efficacy Trend**: Prior is **{'Optimistic' if eff_mode > up['p0'] else 'Skeptical' if eff_mode < up['p0'] else 'Neutral'}**.")
+    st.markdown(f"* **Prior Weight**: Efficacy: **{up['p_a'] + up['p_b']:.1f}** pts | Safety: **{up['s_a'] + up['s_b']:.1f}** pts.")
