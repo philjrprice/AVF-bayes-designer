@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="AVF Master Designer: Adaptive Suite", layout="wide")
 
 st.title("🧬 Master Designer: Adaptive OC & Specialized Priors")
-st.markdown("Updated: Simulation Rigor control added for regulatory-grade precision.")
+st.markdown("Updated: Dynamic hurdle logic and crash protection added.")
 
 # --- SIDEBAR: DESIGN GOALS ---
 st.sidebar.header("🎯 Efficacy & Safety")
@@ -58,6 +58,10 @@ n_range = st.sidebar.slider("N Search Range", 40, 150, (60, 100))
 def run_fast_batch(sims, max_n, p_eff, p_sae, hurdle, e_conf, limit, cohort_sz, s_conf, f_conf, p_a, p_b, s_a, s_b):
     # REGULATORY REQUIREMENT: Fixed seed for reproducibility
     np.random.seed(42)
+    # CRASH FIX: Ensure probabilities are valid (0 <= p <= 1)
+    p_eff = np.clip(p_eff, 0.0, 1.0)
+    p_sae = np.clip(p_sae, 0.0, 1.0)
+    
     outcomes = np.random.binomial(1, p_eff, (sims, max_n))
     saes = np.random.binomial(1, p_sae, (sims, max_n))
     stops_n = np.full(sims, max_n)
@@ -93,9 +97,15 @@ def newly_mapped(active, trig):
 if st.button("🚀 Find Optimal Sample Size"):
     results = []
     n_list = list(range(n_range[0], n_range[1] + 1, 2))
+    
+    # LOGIC FIX: Dynamic Hurdles derived from user input
+    # We test the Null Rate (p0) and the Midpoint ((p0+p1)/2)
+    # We avoid testing p1 directly as a hurdle because it's usually too strict for a 'Success' bar.
+    hurdle_options = sorted(list(set([p0, round((p0 + p1)/2, 2)])))
+    
     with st.spinner(f"Searching for optimal design using {n_sims:,} simulations..."):
         for n in n_list:
-            for hurdle in [0.55, 0.60, 0.65]:
+            for hurdle in hurdle_options:
                 # Using n_sims for the search
                 alpha, _, _, _ = run_fast_batch(n_sims, n, p0, 0.05, hurdle, eff_conf, safe_limit, n, safety_conf, fut_conf, prior_alpha, prior_beta, s_prior_alpha, s_prior_beta)
                 if alpha <= max_alpha:
@@ -112,7 +122,7 @@ if st.button("🚀 Find Optimal Sample Size"):
             "p_a": prior_alpha, "p_b": prior_beta, "s_a": s_prior_alpha, "s_b": s_prior_beta,
             "alpha_req": max_alpha, "pwr_req": min_power, "saf_pwr_req": min_safety_power,
             "cohort": cohort_size,
-            "sim_rigor": n_sims # Store simulation count for report
+            "sim_rigor": n_sims 
         }
 
 # --- PERSISTENT DISPLAY ---
@@ -136,11 +146,15 @@ if 'best_design' in st.session_state:
     # --- REGULATORY OC CURVE ---
     st.markdown("---")
     st.subheader("📈 Operating Characteristic (OC) Curve & PoS")
-    eff_range = np.linspace(up['p0'] - 0.1, up['p1'] + 0.15, 8)
+    
+    # CRASH FIX: Ensure linspace never exceeds 0.0 - 1.0 range
+    low_b = max(0.0, up['p0'] - 0.15)
+    high_b = min(1.0, up['p1'] + 0.15)
+    eff_range = np.linspace(low_b, high_b, 20)
+    
     oc_probs = []
     with st.spinner(f"Generating OC Data with {up['sim_rigor']:,} simulations..."):
         for pe in eff_range:
-            # Using user-defined simulation rigor
             p_succ, _, _, _ = run_fast_batch(up['sim_rigor'], int(best['N']), pe, 0.05, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
             oc_probs.append(p_succ)
     
@@ -158,19 +172,19 @@ if 'best_design' in st.session_state:
     st.subheader("📊 Operational Characteristics (OC) Stress-Tester")
     if st.button("📈 Run Multi-Scenario Stress Test"):
         scenarios = [
-            (f"1. Super-Effective (Eff: {up['p1']+0.1:.0%}, Saf: 5%)", up['p1'] + 0.1, 0.05),
+            (f"1. Super-Effective (Eff: {min(1.0, up['p1']+0.1):.0%}, Saf: 5%)", up['p1'] + 0.1, 0.05),
             (f"2. On-Target (Eff: {up['p1']:.0%}, Saf: 5%)", up['p1'], 0.05),
             (f"3. Marginal (Eff: {(up['p0']+up['p1'])/2:.0%}, Saf: 5%)", (up['p0'] + up['p1'])/2, 0.05),
             (f"4. Null (Eff: {up['p0']:.0%}, Saf: 5%)", up['p0'], 0.05),
-            (f"5. Futile (Eff: {up['p0']-0.1:.0%}, Saf: 5%)", up['p0'] - 0.1, 0.05),
-            (f"6. High Eff / Toxic (Eff: {up['p1']+0.1:.0%}, Saf: {up['toxic_rate']:.0%})", up['p1'] + 0.1, up['toxic_rate']),
+            (f"5. Futile (Eff: {max(0.0, up['p0']-0.1):.0%}, Saf: 5%)", up['p0'] - 0.1, 0.05),
+            (f"6. High Eff / Toxic (Eff: {min(1.0, up['p1']+0.1):.0%}, Saf: {up['toxic_rate']:.0%})", up['p1'] + 0.1, up['toxic_rate']),
             (f"7. Target Eff / Toxic (Eff: {up['p1']:.0%}, Saf: {up['toxic_rate']:.0%})", up['p1'], up['toxic_rate']),
             (f"8. Null / Toxic (Eff: {up['p0']:.0%}, Saf: {up['toxic_rate']:.0%})", up['p0'], up['toxic_rate']),
         ]
         stress_data = []
         with st.spinner(f"Stressing trial with {up['sim_rigor']:,} simulations per scenario..."):
             for name, pe, ps in scenarios:
-                pe = np.clip(pe, 0.01, 0.99)
+                pe = np.clip(pe, 0.0, 1.0)
                 pow_v, stop_v, asn_v, fut_v = run_fast_batch(up['sim_rigor'], int(best['N']), pe, ps, best['Hurdle'], up['eff_conf'], up['safe_limit'], up['cohort'], up['saf_conf'], up['fut_conf'], up['p_a'], up['p_b'], up['s_a'], up['s_b'])
                 stress_data.append({"Scenario": name, "Success %": pow_v, "Safety Stop %": stop_v, "Futility Stop %": fut_v, "ASN": asn_v})
         
