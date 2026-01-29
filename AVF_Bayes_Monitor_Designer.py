@@ -492,4 +492,5 @@ st.markdown("""
 - The app reports **Type I error** under \\(p=p_0\\) and **Power** under \\(p=p_1\\), both with toxicity at \\(q=q_1\\).
 - For more nuanced futility, you can switch to **PPoS at interims** or use a **posterior futility** criterion \\(\\Pr(p > p_1)\\) if desired.
 """)
-``
+
+
