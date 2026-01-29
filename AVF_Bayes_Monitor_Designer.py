@@ -408,7 +408,7 @@ with st.sidebar:
     st.number_input(
         "Monte Carlo replicates (n_sim)",
         min_value=1,
-        max_value=200000,
+        max_value=20000,
         value=DEFAULTS["n_sim"],
         step=1,
         key="n_sim",
@@ -511,3 +511,4 @@ if run_btn:
         .properties(width=800, height=300)
     )
     st.altair_chart(chart, use_container_width=True)
+
