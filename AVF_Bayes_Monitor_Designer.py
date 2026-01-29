@@ -14,7 +14,14 @@ from scipy.special import comb, beta as beta_fn
 # ------------------------------
 st.set_page_config(page_title="Bayesian Single-Arm Monitor Designer", layout="wide")
 
-# Initialize session state for auto-run triggers and input persistence
+def _rerun():
+    """Use st.rerun if available; else fallback to st.experimental_rerun."""
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
+
+# Initialize session state defaults
 defaults = {
     "p0": 0.20,
     "p1": 0.40,
@@ -39,7 +46,6 @@ defaults = {
     "seed": 12345,
     "auto_run": False,
 }
-
 for k, v in defaults.items():
     st.session_state.setdefault(k, v)
 
@@ -48,21 +54,17 @@ for k, v in defaults.items():
 # ------------------------------
 
 def posterior_prob_p_greater_than(p0: float, a: float, b: float) -> float:
-    """
-    Compute posterior Pr(p > p0) when posterior is Beta(a, b).
-    """
+    """Compute posterior Pr(p > p0) when posterior is Beta(a, b)."""
     return 1.0 - beta.cdf(p0, a, b)
 
 def posterior_prob_q_exceeds(qmax: float, a: float, b: float) -> float:
-    """
-    Compute posterior Pr(q > qmax) when posterior is Beta(a, b).
-    """
+    """Compute posterior Pr(q > qmax) when posterior is Beta(a, b)."""
     return 1.0 - beta.cdf(qmax, a, b)
 
 def minimal_successes_for_posterior_success(n: int, p0: float, a0: float, b0: float, gamma_e: float) -> Optional[int]:
     """
-    For final look size n, compute the smallest r such that Pr(p > p0 | r, n) >= gamma_e.
-    Returns None if no such r exists (i.e., criterion cannot be met).
+    For look size n, compute the smallest r such that Pr(p > p0 | r, n) >= gamma_e.
+    Returns None if no such r exists.
     """
     for r in range(0, n + 1):
         a_post = a0 + r
@@ -86,10 +88,8 @@ def safety_stop_threshold(n: int, qmax: float, a_s: float, b_s: float, gamma_s: 
 def beta_binomial_predictive_prob_at_least(current_r: int, current_n: int, final_N: int,
                                            a0: float, b0: float, r_star_final: int) -> float:
     """
-    Predictive probability (over future responses) that final total successes >= r_star_final.
-    Posterior after current data is Beta(a_post, b_post). Future m = final_N - current_n.
-    Predictive distribution for future successes J is Beta-Binomial:
-        Pr(J=j) = C(m, j) * Beta(j + a_post, m - j + b_post) / Beta(a_post, b_post)
+    Predictive probability that total successes at final_N >= r_star_final,
+    given current data and Beta(a0+r, b0+current_n-r) posterior.
     """
     m = final_N - current_n
     a_post = a0 + current_r
@@ -178,37 +178,30 @@ def simulate_one_trial(design: Design, true_p: float, true_q: Optional[float],
                        bounds: Dict[int, Dict[str, Optional[int]]],
                        rng: np.random.Generator) -> Tuple[bool, int, bool, int]:
     """
-    Simulate a single trial path with sequential Bernoulli outcomes for efficacy and safety.
-    Returns:
-      (success_flag, n_used, safety_stopped_flag, looks_used)
+    Simulate a single trial path: returns (efficacy_success, n_used, safety_stopped, looks_used).
     """
     N = design.N
     responses = rng.binomial(1, true_p, size=N)
     tox = rng.binomial(1, true_q, size=N) if (true_q is not None) else np.zeros(N, dtype=int)
 
-    success = False
-    safety_stopped = False
     looks_used = 0
-
     for n in design.look_schedule:
         r = int(np.sum(responses[:n]))
         t = int(np.sum(tox[:n]))
         looks_used += 1
 
-        # Safety check first (if enabled)
+        # Safety check first
         if design.qmax is not None and design.gamma_s is not None:
             t_safety_min = bounds[n]["t_safety_min"]
             if t_safety_min is not None and t >= t_safety_min:
-                safety_stopped = True
                 return (False, n, True, looks_used)
 
         # Efficacy success check
         r_success_min = bounds[n]["r_success_min"]
         if r_success_min is not None and r >= r_success_min:
-            success = True
             return (True, n, False, looks_used)
 
-        # Futility via predictive probability (except at final look)
+        # Predictive futility (except at final)
         r_star_final = bounds[n]["r_star_final"]
         if n < N and r_star_final is not None:
             ppos = beta_binomial_predictive_prob_at_least(
@@ -218,18 +211,16 @@ def simulate_one_trial(design: Design, true_p: float, true_q: Optional[float],
             if ppos < design.psi_fut:
                 return (False, n, False, looks_used)
 
-        # Final look: conclude success/failure if no early stop
+        # Final look summary if we reach N
         if n == N:
             if r_star_final is not None and r >= r_star_final:
-                success = True
-            return (success, n, False, looks_used)
+                return (True, n, False, looks_used)
+            return (False, n, False, looks_used)
 
     return (False, N, False, looks_used)
 
 def evaluate_design(design: Design, n_sim: int = 20000, seed: int = 12345) -> OperatingCharacteristics:
-    """
-    Evaluate operating characteristics using Monte Carlo simulation.
-    """
+    """Evaluate operating characteristics via Monte Carlo simulation."""
     rng = np.random.default_rng(seed)
     bounds = compute_boundaries(design)
 
@@ -275,9 +266,7 @@ def evaluate_design(design: Design, n_sim: int = 20000, seed: int = 12345) -> Op
 # ------------------------------
 
 def build_equal_looks(N: int, K_interims: int) -> List[int]:
-    """
-    Build K_interims interim looks + final at N, spaced roughly equally.
-    """
+    """Build K_interims interim looks + final at N, spaced roughly equally."""
     if K_interims < 0:
         K_interims = 0
     looks = []
@@ -307,9 +296,7 @@ def grid_search_designs(
     alpha_target: float, power_target: float,
     N_budget: Optional[int] = None
 ) -> pd.DataFrame:
-    """
-    Scan a grid of (N, K_interims), evaluate characteristics, and return a DataFrame.
-    """
+    """Scan a grid of (N, K_interims), evaluate characteristics, and return a DataFrame."""
     rows = []
     for N in range(N_min, N_max + 1):
         for K in range(K_min, K_max + 1):
@@ -361,16 +348,12 @@ def grid_search_designs(
 # ------------------------------
 
 def final_success_boundary_info(N: int, p0: float, a_e: float, b_e: float, gamma_e: float) -> Dict[str, Optional[int]]:
-    """
-    Report minimal successes required at final N to meet posterior success (if it exists).
-    """
+    """Report minimal successes required at final N to meet posterior success (if it exists)."""
     r_star = minimal_successes_for_posterior_success(N, p0, a_e, b_e, gamma_e)
     return {"N": N, "r_star_final": r_star, "exists": r_star is not None}
 
 def safety_boundary_info(N: int, qmax: float, a_s: float, b_s: float, gamma_s: float) -> Dict[str, Optional[int]]:
-    """
-    Report minimal toxicities required at final N to trigger safety stop (if enabled).
-    """
+    """Report minimal toxicities required at final N to trigger safety stop (if enabled)."""
     t_star = safety_stop_threshold(N, qmax, a_s, b_s, gamma_s)
     return {"N": N, "t_safety_min_final": t_star, "exists": t_star is not None}
 
@@ -384,23 +367,64 @@ st.caption("Posterior success, predictive futility, and optional safety monitori
 with st.sidebar:
     st.header("Inputs")
 
-    # Efficacy inputs
-    st.session_state["p0"] = st.number_input("Null efficacy rate p₀", 0.0, 1.0, st.session_state["p0"], 0.01, format="%.2f", key="p0")
-    st.session_state["p1"] = st.number_input("Expected efficacy rate p₁", 0.0, 1.0, st.session_state["p1"], 0.01, format="%.2f", key="p1")
-    st.session_state["a_e"] = st.number_input("Efficacy prior alpha (aₑ)", 0.0, 100.0, st.session_state["a_e"], 0.1, format="%.2f", key="a_e")
-    st.session_state["b_e"] = st.number_input("Efficacy prior beta (bₑ)", 0.0, 100.0, st.session_state["b_e"], 0.1, format="%.2f", key="b_e")
-    st.session_state["gamma_e"] = st.number_input("Posterior success threshold γₑ (e.g., 0.95)", 0.5, 0.999, st.session_state["gamma_e"], 0.01, key="gamma_e")
+    # Efficacy inputs (NOTE: Do not assign to st.session_state within the widget call)
+    st.number_input(
+        "Null efficacy rate p₀", min_value=0.0, max_value=1.0,
+        value=float(st.session_state.get("p0", defaults["p0"])), step=0.01,
+        format="%.2f", key="p0"
+    )
+    st.number_input(
+        "Expected efficacy rate p₁", min_value=0.0, max_value=1.0,
+        value=float(st.session_state.get("p1", defaults["p1"])), step=0.01,
+        format="%.2f", key="p1"
+    )
+    st.number_input(
+        "Efficacy prior alpha (aₑ)", min_value=0.0, max_value=100.0,
+        value=float(st.session_state.get("a_e", defaults["a_e"])), step=0.1,
+        format="%.2f", key="a_e"
+    )
+    st.number_input(
+        "Efficacy prior beta (bₑ)", min_value=0.0, max_value=100.0,
+        value=float(st.session_state.get("b_e", defaults["b_e"])), step=0.1,
+        format="%.2f", key="b_e"
+    )
+    st.number_input(
+        "Posterior success threshold γₑ (e.g., 0.95)", min_value=0.5, max_value=0.999,
+        value=float(st.session_state.get("gamma_e", defaults["gamma_e"])), step=0.01, key="gamma_e"
+    )
 
-    st.session_state["psi_fut"] = st.number_input("Predictive futility threshold ψ (e.g., 0.05)", 0.0, 0.5, st.session_state["psi_fut"], 0.01, key="psi_fut")
+    st.number_input(
+        "Predictive futility threshold ψ (e.g., 0.05)", min_value=0.0, max_value=0.5,
+        value=float(st.session_state.get("psi_fut", defaults["psi_fut"])), step=0.01, key="psi_fut"
+    )
 
     st.divider()
-    st.session_state["enable_safety"] = st.checkbox("Enable safety/toxicity monitoring", value=st.session_state["enable_safety"], key="enable_safety")
+    st.checkbox("Enable safety/toxicity monitoring", value=bool(st.session_state.get("enable_safety", defaults["enable_safety"])), key="enable_safety")
     if st.session_state["enable_safety"]:
-        st.session_state["qmax"] = st.number_input("Unacceptable toxicity rate q_max", 0.0, 1.0, st.session_state["qmax"], 0.01, format="%.2f", key="qmax")
-        st.session_state["q1"] = st.number_input("Expected toxicity rate q₁", 0.0, 1.0, st.session_state["q1"], 0.01, format="%.2f", key="q1")
-        st.session_state["a_s"] = st.number_input("Safety prior alpha (aₛ)", 0.0, 100.0, st.session_state["a_s"], 0.1, format="%.2f", key="a_s")
-        st.session_state["b_s"] = st.number_input("Safety prior beta (bₛ)", 0.0, 100.0, st.session_state["b_s"], 0.1, format="%.2f", key="b_s")
-        st.session_state["gamma_s"] = st.number_input("Posterior safety threshold γₛ (e.g., 0.90)", 0.5, 0.999, st.session_state["gamma_s"], 0.01, key="gamma_s")
+        st.number_input(
+            "Unacceptable toxicity rate q_max", min_value=0.0, max_value=1.0,
+            value=float(st.session_state.get("qmax", defaults["qmax"])), step=0.01,
+            format="%.2f", key="qmax"
+        )
+        st.number_input(
+            "Expected toxicity rate q₁", min_value=0.0, max_value=1.0,
+            value=float(st.session_state.get("q1", defaults["q1"])), step=0.01,
+            format="%.2f", key="q1"
+        )
+        st.number_input(
+            "Safety prior alpha (aₛ)", min_value=0.0, max_value=100.0,
+            value=float(st.session_state.get("a_s", defaults["a_s"])), step=0.1,
+            format="%.2f", key="a_s"
+        )
+        st.number_input(
+            "Safety prior beta (bₛ)", min_value=0.0, max_value=100.0,
+            value=float(st.session_state.get("b_s", defaults["b_s"])), step=0.1,
+            format="%.2f", key="b_s"
+        )
+        st.number_input(
+            "Posterior safety threshold γₛ (e.g., 0.90)", min_value=0.5, max_value=0.999,
+            value=float(st.session_state.get("gamma_s", defaults["gamma_s"])), step=0.01, key="gamma_s"
+        )
     else:
         st.session_state["qmax"] = None
         st.session_state["q1"] = None
@@ -408,37 +432,33 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Grid search")
-    st.session_state["N_min"] = st.number_input("Minimum N", 5, 5000, st.session_state["N_min"], 1, key="N_min")
-    st.session_state["N_max"] = st.number_input("Maximum N", st.session_state["N_min"], 5000, st.session_state["N_max"], 1, key="N_max")
-    st.session_state["K_min"] = st.number_input("Min interim looks (K)", 0, 40, st.session_state["K_min"], 1, key="K_min")
-    st.session_state["K_max"] = st.number_input("Max interim looks (K)", st.session_state["K_min"], 40, st.session_state["K_max"], 1, key="K_max")
+    st.number_input("Minimum N", min_value=5, max_value=5000, value=int(st.session_state.get("N_min", defaults["N_min"])), step=1, key="N_min")
+    st.number_input("Maximum N", min_value=int(st.session_state["N_min"]), max_value=5000, value=int(st.session_state.get("N_max", defaults["N_max"])), step=1, key="N_max")
+    st.number_input("Min interim looks (K)", min_value=0, max_value=40, value=int(st.session_state.get("K_min", defaults["K_min"])), step=1, key="K_min")
+    st.number_input("Max interim looks (K)", min_value=int(st.session_state["K_min"]), max_value=40, value=int(st.session_state.get("K_max", defaults["K_max"])), step=1, key="K_max")
 
     st.divider()
     st.subheader("Operating targets & simulation")
-    st.session_state["alpha_target"] = st.number_input("Max Type I error (α target)", 0.0, 0.5, st.session_state["alpha_target"], 0.01, key="alpha_target")
-    st.session_state["power_target"] = st.number_input("Min power (target)", 0.0, 1.0, st.session_state["power_target"], 0.01, key="power_target")
-    st.session_state["N_budget"] = st.number_input("N budget for 'High power' (optional)", 0, 5000, st.session_state["N_budget"], 1, key="N_budget")
-    st.session_state["n_sim"] = st.number_input("Monte Carlo replicates", 1000, 200000, st.session_state["n_sim"], 1000, key="n_sim")
-    st.session_state["seed"] = st.number_input("Random seed", 0, 9999999, st.session_state["seed"], 1, key="seed")
+    st.number_input("Max Type I error (α target)", min_value=0.0, max_value=0.5, value=float(st.session_state.get("alpha_target", defaults["alpha_target"])), step=0.01, key="alpha_target")
+    st.number_input("Min power (target)", min_value=0.0, max_value=1.0, value=float(st.session_state.get("power_target", defaults["power_target"])), step=0.01, key="power_target")
+    st.number_input("N budget for 'High power' (optional)", min_value=0, max_value=5000, value=int(st.session_state.get("N_budget", defaults["N_budget"])), step=1, key="N_budget")
+    st.number_input("Monte Carlo replicates", min_value=1000, max_value=200000, value=int(st.session_state.get("n_sim", defaults["n_sim"])), step=1000, key="n_sim")
+    st.number_input("Random seed", min_value=0, max_value=9999999, value=int(st.session_state.get("seed", defaults["seed"])), step=1, key="seed")
 
     run_btn = st.button("Run grid search")
 
 # Trigger auto run if requested
 if run_btn:
     st.session_state["auto_run"] = True
-if st.session_state.get("auto_run", False):
-    # proceed to run and then reset flag after completion
-    run_now = True
-else:
-    run_now = False
+run_now = bool(st.session_state.get("auto_run", False))
 
 st.markdown("### How it works")
 st.write("""
 - **Efficacy success**: stop if posterior probability that \(p > p_0\) exceeds γₑ.
 - **Futility**: stop if the **predictive probability** of meeting the posterior success at the **final N** drops below ψ.
 - **Safety (optional)**: stop if posterior probability that \(q > q_{max}\) exceeds γₛ.
-- **Interims**: equally spaced looks up to K (rounded). All boundaries are computed from Beta‑Binomial conjugacy.
-- Designs are simulated to estimate **Type I error (α)**, **power**, and **expected sample size (ESS)**.
+- **Interims**: equally spaced looks up to K (rounded). Boundaries use Beta‑Binomial conjugacy.
+- We simulate designs to estimate **Type I error (α)**, **power**, and **expected sample size (ESS)**.
 """)
 
 # ------------------------------
@@ -458,7 +478,7 @@ if run_now:
             gamma_s=st.session_state["gamma_s"] if st.session_state["enable_safety"] else None,
             n_sim=int(st.session_state["n_sim"]), seed=int(st.session_state["seed"]),
             alpha_target=float(st.session_state["alpha_target"]), power_target=float(st.session_state["power_target"]),
-            N_budget=int(st.session_state["N_budget"]) if st.session_state["N_budget"] > 0 else None
+            N_budget=int(st.session_state["N_budget"]) if int(st.session_state["N_budget"]) > 0 else None
         )
     st.success("Grid search complete.")
     st.session_state["auto_run"] = False  # reset auto-run
@@ -476,17 +496,17 @@ if run_now:
             if st.button("🔄 Expand N range (+50) & auto‑rerun"):
                 st.session_state["N_max"] = int(st.session_state["N_max"]) + 50
                 st.session_state["auto_run"] = True
-                st.experimental_rerun()
+                _rerun()
         with colB:
             if st.button("📉 Relax γₑ by 0.05 & auto‑rerun"):
                 st.session_state["gamma_e"] = max(0.5, float(st.session_state["gamma_e"]) - 0.05)
                 st.session_state["auto_run"] = True
-                st.experimental_rerun()
+                _rerun()
         with colC:
             if st.button("🧪 Increase ψ by 0.05 & auto‑rerun"):
                 st.session_state["psi_fut"] = min(0.5, float(st.session_state["psi_fut"]) + 0.05)
                 st.session_state["auto_run"] = True
-                st.experimental_rerun()
+                _rerun()
 
         # Infeasibility diagnostics
         st.markdown("#### Infeasibility diagnostics")
@@ -494,7 +514,7 @@ if run_now:
                                            float(st.session_state["a_e"]), float(st.session_state["b_e"]),
                                            float(st.session_state["gamma_e"]))
         if info["exists"]:
-            st.write(f"At N={info['N']}, minimal successes needed for posterior success: **r* = {info['r_star_final']}**.")
+            st.write(f"At N={info['N']}, minimal successes for posterior success: **r* = {info['r_star_final']}**.")
         else:
             st.write(f"At N={info['N']}, **no number of successes** can satisfy posterior success with γₑ={st.session_state['gamma_e']}. "
                      "Try relaxing γₑ or increasing N.")
@@ -607,13 +627,12 @@ if run_now:
 st.divider()
 st.markdown("""
 **Tips & Notes**
-- Consider **Jeffreys priors** \\(\\text{Beta}(0.5, 0.5)\\) for robustness, or **Beta(1,1)** if you prefer non-informative.
+- Consider **Jeffreys priors** \\(\\text{Beta}(0.5, 0.5)\\) or **Beta(1,1)** as non-informative starts.
 - Typical choices: γₑ ∈ [0.90, 0.99], ψ ∈ [0.05, 0.20], γₛ ∈ [0.80, 0.95].
-- If safety is enabled, the safety rule is checked **before** efficacy rules at each look.
-- The app reports **Type I error** under \\(p=p_0\\) and **Power** under \\(p=p_1\\), both with toxicity at \\(q=q_1\\).
-- For more nuanced futility, you can switch to **PPoS at interims** or use a **posterior futility** criterion \\(\\Pr(p > p_1)\\).
-- Large simulations (e.g., n_sim ≥ 50k) can be slow. Start with 10–20k and increase if needed.
+- Safety is checked **before** efficacy at each look.
+- Reported: **Type I error** under \\(p=p_0\\) and **Power** under \\(p=p_1\\) (toxicity at \\(q=q_1\\)).
+- Large simulations (e.g., n_sim ≥ 50k) are slow; start with 10–20k and scale up.
 """)
 
 # Disclaimer
-st.caption("This app provides exploratory design/simulation. Final trial designs should be reviewed by a qualified statistician and aligned with regulatory guidance.")
+st.caption("Exploratory design/simulation. Final trial designs should be reviewed by a qualified statistician and align with regulatory guidance.")
