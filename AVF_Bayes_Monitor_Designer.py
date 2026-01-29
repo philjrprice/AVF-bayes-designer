@@ -1,5 +1,5 @@
 # =============================================================================
-# AVF_Bayes_Monitor_Designer.py  (Streamlit-optimized, with n_sim fixes)
+# AVF_Bayes_Monitor_Designer.py  (Streamlit-optimized, with α-guard & uncertainty)
 # =============================================================================
 
 import math
@@ -214,7 +214,7 @@ def simulate_one_trial(
 
 
 def evaluate_design(design: Design, n_sim: int = 1, seed: int = 123) -> OperatingCharacteristics:
-    """Default n_sim=1 (it will be overridden by the widget)."""
+    """Default n_sim=1 (widget overrides), supports quick-scan mode."""
     rng = np.random.default_rng(seed)
     bounds = compute_boundaries(design)
 
@@ -308,7 +308,8 @@ def cached_grid_search(
     N_min, N_max, K_min, K_max,
     p0, p1, a_e, b_e, a_s, b_s, qmax, q1,
     gamma_e, psi_fut, gamma_s, n_sim, seed,
-    alpha_target, power_target, N_budget
+    alpha_target, power_target, N_budget,
+    require_alpha_for_high_power  # NEW: α guard toggle
 ) -> pd.DataFrame:
 
     rows = []
@@ -352,8 +353,11 @@ def cached_grid_search(
         df.loc[smallest.index, "selection"] += "|smallest_N"
         df.loc[sweet.index, "selection"] += "|sweet_spot"
 
+    # High power (optionally guard α)
     if N_budget is not None and N_budget > 0:
         under = df[df["N"] <= N_budget]
+        if require_alpha_for_high_power:
+            under = under[under["meets_alpha"]]
         if not under.empty:
             best = under.sort_values(["power", "ESS_p1"], ascending=[False, True]).head(3)
             df.loc[best.index, "selection"] += "|high_power"
@@ -407,15 +411,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Targets & Simulation")
-    require_alpha_for_high_power = st.checkbox(
-    "Require α constraint for 'High power' recommendations",
-    value=True,
-    help="When on, High power designs must also meet the α target."
-    )
 
     st.number_input("Max Type I error α target", 0.0, 0.5, DEFAULTS["alpha_target"], 0.01, key="alpha_target")
     st.number_input("Min Power target", 0.0, 1.0, DEFAULTS["power_target"], 0.01, key="power_target")
     st.number_input("N budget (optional)", 0, 5000, DEFAULTS["N_budget"], 1, key="N_budget")
+
+    # NEW: α guard for High power
+    require_alpha_for_high_power = st.checkbox(
+        "Require α constraint for 'High power' recommendations",
+        value=True,
+        help="When on, High power designs must also meet the α target."
+    )
 
     # **Allow sub-1k simulations (down to 1)** — new key to break any stale constraints
     st.number_input(
@@ -429,6 +435,9 @@ with st.sidebar:
     )
 
     st.number_input("Random seed", 0, 9999999, DEFAULTS["seed"], 1, key="seed")
+
+    # Optional: show only feasible designs in the summary table
+    show_only_feasible = st.checkbox("Show only designs meeting α & power targets", value=False)
 
     run_btn = st.button("Run grid search", type="primary")
 
@@ -471,6 +480,7 @@ if run_btn:
         alpha_target=float(st.session_state["alpha_target"]),
         power_target=float(st.session_state["power_target"]),
         N_budget=int(st.session_state["N_budget"]),
+        require_alpha_for_high_power=require_alpha_for_high_power,
     )
 
     num_designs = (params["N_max"] - params["N_min"] + 1) * (params["K_max"] - params["K_min"] + 1)
@@ -484,13 +494,37 @@ if run_btn:
         df = cached_grid_search(**params)
     st.success(f"Completed in {time.time() - start:.2f} sec.")
 
+    # ----- Monte Carlo uncertainty (SE & approx 95% CI) -----
+    def binom_se(p: float, n: int) -> float:
+        return float(np.sqrt(max(p * (1 - p), 0.0) / max(n, 1)))
+
+    n_used = int(st.session_state["n_sim_v2"])
+    df["alpha_se"] = df["alpha"].apply(lambda p: binom_se(float(p), n_used))
+    df["power_se"] = df["power"].apply(lambda p: binom_se(float(p), n_used))
+    df["alpha_95ci"] = df["alpha_se"] * 1.96
+    df["power_95ci"] = df["power_se"] * 1.96
+
+    # Apply optional filter for summary view
+    df_view = df[df["is_feasible"]] if show_only_feasible else df
+
     # Display results
     feasible = df[df["is_feasible"]]
     if feasible.empty:
         st.warning("No feasible designs met α & power targets.")
 
     st.subheader("Summary of Designs")
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(
+        df_view[
+            [
+                "selection","is_feasible","N","K_interims","looks",
+                "alpha","alpha_se","alpha_95ci",
+                "power","power_se","power_95ci",
+                "ESS_p0","ESS_p1","avg_looks_p1",
+                "safety_stop_q1","safety_stop_qmax",
+            ]
+        ],
+        use_container_width=True
+    )
 
     st.subheader("Recommended Designs")
 
@@ -504,7 +538,17 @@ if run_btn:
         if subset.empty:
             st.info("None.")
         else:
-            st.dataframe(subset, use_container_width=True)
+            st.dataframe(
+                subset[
+                    [
+                        "N","K_interims","looks",
+                        "alpha","alpha_se","alpha_95ci",
+                        "power","power_se","power_95ci",
+                        "ESS_p1"
+                    ]
+                ],
+                use_container_width=True
+            )
 
     st.download_button(
         "Download CSV",
@@ -522,9 +566,8 @@ if run_btn:
             x="N:Q",
             y="power:Q",
             color="is_feasible:N",
-            tooltip=["N","K_interims","alpha","power","ESS_p1"]
+            tooltip=["N","K_interims","alpha","power","ESS_p1","alpha_95ci","power_95ci"]
         )
-        .properties(width=800, height=300)
+        .properties(width=900, height=340)
     )
     st.altair_chart(chart, use_container_width=True)
-
