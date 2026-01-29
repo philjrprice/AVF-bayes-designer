@@ -752,4 +752,5 @@ st.markdown(
 )
 
 st.caption("Tip: If you want the safety rule to be more/less sensitive, adjust θ_tox and/or q_max; you can also strengthen or weaken the safety prior.")
-``
+
+
