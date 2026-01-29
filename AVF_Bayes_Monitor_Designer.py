@@ -1,8 +1,8 @@
 # =============================================================================
 # AVF_Bayes_Monitor_Designer.py
 # Streamlit app with per-look posterior success thresholds (alpha-spending style),
-# calibration to Type I error target, fast vectorized calibration, and
-# human-friendly (plain language) tables.
+# calibration to Type I error target, fast vectorized calibration, human-friendly tables,
+# and a targeted "Re-evaluate shortlisted designs" panel.
 # =============================================================================
 
 import time
@@ -399,7 +399,6 @@ def cached_calibrate_single_gamma(
     """Bisection on a single posterior threshold gamma_e to achieve alpha <= target."""
     def alpha_at_gamma(gamma: float) -> float:
         if fast_mode:
-            # use vectorized alpha eval
             d = Design(N, K, list(look_tuple), a_e, b_e, a_s, b_s, p0, p1, qmax, q1, psi_fut, gamma_s, gamma_e=gamma)
             return vectorized_alpha_under_p0(d, n_sim=n_sim_cal, seed=seed + int(gamma * 1e6) % 1000000,
                                              skip_futility=skip_futility_during_cal)
@@ -409,7 +408,6 @@ def cached_calibrate_single_gamma(
         return float(oc["alpha"])
 
     lo, hi = g_low, g_high
-    # Quick check at hi
     if alpha_at_gamma(hi) <= alpha_target + tol_alpha:
         return hi
 
@@ -667,6 +665,20 @@ with st.sidebar:
 # Main UI
 # -----------------------------------------------------------------------------
 st.title("Bayesian Single‑Arm Monitoring Study Designer")
+
+with st.expander("📋 Workflow Guide (click to expand)", expanded=False):
+    st.markdown("""
+**Recommended workflow**
+1. **Quick scan**: Keep `n_sim = 1–100` and a modest grid (e.g., N=30–80, K=0–2) to map the space quickly.  
+2. **Choose calibration**:  
+   - *Single γₑ*: same threshold at all looks, calibrated to hit α target.  
+   - *Per‑look γₑ vector*: early looks stricter (set φ≈3), calibrated to hit α target overall.  
+3. **Calibrate**: Use Calibration `n_sim = 500–2000` with *fast calibration ON* and *skip futility* (faster).  
+4. **Review**: Toggle **“Show only designs meeting α & power”** to filter to feasible designs.  
+5. **Re‑evaluate shortlist**: Use the **“Re‑evaluate shortlisted designs”** panel with `n_sim = 2000–5000` to get stable α/power for your top picks (thresholds held fixed).  
+6. **Finalize**: Choose the design balancing α control, power, and average sample size; export CSV for records (optional: add a PDF exporter later).
+""")
+
 st.info(
     "Use **Per-look γₑ vector** to make early interims stricter and keep overall α under control. "
     "Calibrate with a modest n_sim (e.g., 500–2000), then re-evaluate shortlisted designs with larger n_sim."
@@ -775,6 +787,71 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
     if "P(stop for safety | q_max)" in df: cols.append("P(stop for safety | q_max)")
 
     return df[cols]
+
+# ----- Helpers to re-evaluate a single design with fixed thresholds -----
+def _reval_one_row(row: pd.Series, n_sim_big: int, seed_base: int) -> Dict:
+    """
+    Re-evaluate a single design row from df with larger n_sim, holding thresholds fixed.
+    Returns a dict with updated OC plus the identifying info.
+    """
+    N = int(row["N"])
+    looks = list(row["looks"])
+    K = int(row["K_interims"])
+    a_e = float(st.session_state["a_e"])
+    b_e = float(st.session_state["b_e"])
+    a_s = float(st.session_state.get("a_s") or 0.0)
+    b_s = float(st.session_state.get("b_s") or 0.0)
+    p0 = float(st.session_state["p0"])
+    p1 = float(st.session_state["p1"])
+    qmax = st.session_state.get("qmax")
+    q1 = st.session_state.get("q1")
+    psi_fut = float(st.session_state["psi_fut"])
+    gamma_s = st.session_state.get("gamma_s")
+
+    seed = int(seed_base + 9973*N + 37*K + n_sim_big)
+
+    # If row has a per-look vector, evaluate with that vector; otherwise single γe
+    gamma_vec = row.get("gamma_e_vector", None)
+    if gamma_vec is not None and isinstance(gamma_vec, (list, tuple)):
+        oc = cached_evaluate_vector(
+            N, K, tuple(looks),
+            a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
+            tuple(float(g) for g in gamma_vec),
+            psi_fut, gamma_s,
+            n_sim_big, seed, skip_futility=False
+        )
+    else:
+        ge = float(row.get("gamma_e_used", st.session_state["gamma_e"]))
+        oc = cached_evaluate_single(
+            N, K, tuple(looks),
+            a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
+            ge, psi_fut, gamma_s,
+            n_sim_big, seed, skip_futility=False
+        )
+
+    return {
+        "N": N,
+        "K_interims": K,
+        "looks": looks,
+        "gamma_e_used": row.get("gamma_e_used", None),
+        "gamma_e_vector": row.get("gamma_e_vector", None),
+        "alpha": oc["alpha"],
+        "power": oc["power"],
+        "ESS_p0": oc["ess_p0"],
+        "ESS_p1": oc["ess_p1"],
+        "avg_looks_p1": oc["avg_looks"]
+    }
+
+def _add_uncertainty_columns(df_in: pd.DataFrame, n_sim_val: int) -> pd.DataFrame:
+    df = df_in.copy()
+    def _se(p):
+        p = float(p)
+        return (p * (1 - p) / max(n_sim_val, 1))**0.5
+    df["alpha_se"] = df["alpha"].apply(_se)
+    df["power_se"] = df["power"].apply(_se)
+    df["alpha_95ci"] = df["alpha_se"] * 1.96
+    df["power_95ci"] = df["power_se"] * 1.96
+    return df
 
 # -----------------------------------------------------------------------------
 # Run
@@ -896,3 +973,64 @@ if run_btn:
         .properties(width=900, height=340)
     )
     st.altair_chart(chart, use_container_width=True)
+
+    # -------------------- Re-evaluate shortlisted designs (targeted, fixed thresholds) --------------------
+    with st.expander("🔁 Re‑evaluate shortlisted designs (fixed thresholds)"):
+        st.markdown(
+            "Pick designs to re‑simulate with a larger `n_sim`. "
+            "This holds the calibrated thresholds fixed so you can measure α/power precisely."
+        )
+
+        # Defaults: all recommended + (optionally) the top 5 feasible by power
+        default_idx = list(df[df["selection"].str.contains("smallest_N|high_power|sweet_spot", na=False)].index)
+        if len(default_idx) == 0:
+            default_idx = list(df.sort_values(["is_feasible","power","ESS_p1"], ascending=[False, False, True]).head(5).index)
+
+        choose_rows = st.multiselect(
+            "Choose designs (by row index)",
+            options=list(df.index),
+            default=default_idx,
+            help="Select rows from the table above by their index."
+        )
+
+        n_sim_big = st.number_input("n_sim for re‑evaluation", min_value=1000, max_value=200000, value=5000, step=500)
+        seed_big = st.number_input("Base seed for re‑evaluation", min_value=0, max_value=9999999, value=20260129, step=1)
+
+        if st.button("Run re‑evaluation on selected"):
+            if len(choose_rows) == 0:
+                st.warning("Select at least one row.")
+            else:
+                with st.spinner("Re‑evaluating selected designs..."):
+                    rows = []
+                    for ridx in choose_rows:
+                        rows.append(_reval_one_row(df.loc[ridx], int(n_sim_big), int(seed_big)))
+                    re_df = pd.DataFrame(rows)
+                    re_df = _add_uncertainty_columns(re_df, int(n_sim_big))
+
+                st.success("Re‑evaluation complete.")
+                # Show in plain language
+                re_view = re_df.copy()
+                re_view["When we check (patients enrolled)"] = re_view["looks"].apply(_fmt_looks)
+                re_view["Success threshold(s) γₑ"] = np.where(
+                    re_view.get("gamma_e_vector").notna() if "gamma_e_vector" in re_view else False,
+                    re_view.get("gamma_e_vector", None).apply(_fmt_gamma_vec),
+                    re_view.get("gamma_e_used", None).apply(lambda g: "—" if g is None or (isinstance(g, float) and np.isnan(g)) else f"{float(g):.3f}")
+                )
+                re_view = re_view[[
+                    "N","K_interims","When we check (patients enrolled)","Success threshold(s) γₑ",
+                    "alpha","alpha_95ci","power","power_95ci","ESS_p1","ESS_p0","avg_looks_p1"
+                ]].rename(columns={
+                    "N":"Max patients (N)",
+                    "K_interims":"Interim checks (K)",
+                    "ESS_p1":"Avg patients if p = p₁",
+                    "ESS_p0":"Avg patients if p = p₀",
+                    "alpha":"Type I error (α)",
+                    "power":"Power"
+                })
+                st.dataframe(re_view, use_container_width=True)
+
+                st.download_button(
+                    "Download re‑evaluation (CSV)",
+                    re_df.to_csv(index=False).encode(),
+                    file_name="reevaluated_designs.csv"
+                )
