@@ -1,5 +1,5 @@
 # =============================================================================
-# bayes_single_arm_app.py  (Optimized for Hugging Face Spaces)
+# AVF_Bayes_Monitor_Designer.py  (Streamlit-optimized, with n_sim fixes)
 # =============================================================================
 
 import math
@@ -51,8 +51,7 @@ DEFAULTS = {
     "power_target": 0.80,
     "N_budget": 80,
 
-    # Simulation defaults
-    # *** n_sim = 1 is the key speed-up ***
+    # Simulation defaults (key speed-up)
     "n_sim": 1,
     "seed": 12345,
 }
@@ -214,7 +213,8 @@ def simulate_one_trial(
     return (False, N, False, looks_used)
 
 
-def evaluate_design(design: Design, n_sim: int = 100, seed: int = 123) -> OperatingCharacteristics:
+def evaluate_design(design: Design, n_sim: int = 1, seed: int = 123) -> OperatingCharacteristics:
+    """Default n_sim=1 (it will be overridden by the widget)."""
     rng = np.random.default_rng(seed)
     bounds = compute_boundaries(design)
 
@@ -366,6 +366,14 @@ def cached_grid_search(
 # =============================================================================
 with st.sidebar:
     st.header("Inputs")
+
+    # One-click way to clear OLD widget state and cached results
+    if st.button("Reset UI & clear cache"):
+        st.cache_data.clear()
+        st.session_state.clear()  # clears all widget keys and values
+        st.success("Cache & UI state cleared. Please rerun your grid search.")
+        st.stop()  # end this run so the app reloads fresh
+
     st.markdown("⚡ *Quick-Scan Mode Enabled (n_sim defaults to 1)*")
 
     st.number_input("Null efficacy rate p₀", 0.0, 1.0, DEFAULTS["p0"], 0.01, key="p0")
@@ -404,14 +412,14 @@ with st.sidebar:
     st.number_input("Min Power target", 0.0, 1.0, DEFAULTS["power_target"], 0.01, key="power_target")
     st.number_input("N budget (optional)", 0, 5000, DEFAULTS["N_budget"], 1, key="N_budget")
 
-    # **Allow sub-1k simulations (down to 1)**
+    # **Allow sub-1k simulations (down to 1)** — new key to break any stale constraints
     st.number_input(
         "Monte Carlo replicates (n_sim)",
         min_value=1,
-        max_value=20000,
-        value=1,
+        max_value=200000,  # generous headroom
+        value=DEFAULTS["n_sim"],
         step=1,
-        key="n_sim",
+        key="n_sim_v2",
         help="1–100: instant quick scan; 100–1000: fast; 2000+: accurate"
     )
 
@@ -453,7 +461,7 @@ if run_btn:
         gamma_e=float(st.session_state["gamma_e"]),
         psi_fut=float(st.session_state["psi_fut"]),
         gamma_s=st.session_state.get("gamma_s"),
-        n_sim=int(st.session_state["n_sim"]),
+        n_sim=int(st.session_state["n_sim_v2"]),
         seed=int(st.session_state["seed"]),
         alpha_target=float(st.session_state["alpha_target"]),
         power_target=float(st.session_state["power_target"]),
@@ -462,6 +470,9 @@ if run_btn:
 
     num_designs = (params["N_max"] - params["N_min"] + 1) * (params["K_max"] - params["K_min"] + 1)
     st.write(f"Evaluating ~{num_designs} designs × {params['n_sim']} sims each (cached).")
+
+    # Sanity check: show what n_sim is actually used
+    st.caption(f"Running with n_sim = {params['n_sim']}")
 
     start = time.time()
     with st.spinner("Running grid search..."):
@@ -511,5 +522,3 @@ if run_btn:
         .properties(width=800, height=300)
     )
     st.altair_chart(chart, use_container_width=True)
-
-
