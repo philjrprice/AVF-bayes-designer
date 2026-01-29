@@ -409,7 +409,7 @@ with st.sidebar:
         "Monte Carlo replicates (n_sim)",
         min_value=1,
         max_value=20000,
-        value=DEFAULTS["n_sim"],
+        value=1,
         step=1,
         key="n_sim",
         help="1–100: instant quick scan; 100–1000: fast; 2000+: accurate"
@@ -511,4 +511,5 @@ if run_btn:
         .properties(width=800, height=300)
     )
     st.altair_chart(chart, use_container_width=True)
+
 
