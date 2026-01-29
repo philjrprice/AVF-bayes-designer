@@ -2,7 +2,7 @@
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
 # Rapid screener + deep-dive simulation
 #
-# Author: M365 Copilot for Phil
+# Author: M365 Copilot for Phil (patched with Plotly-optional + deep-dive KeyError fix)
 # Notes:
 #  - Uses Beta-Binomial conjugacy for exact final posterior and predictive probabilities.
 #  - Interim stopping: stop for futility if predictive probability of final success < c_futility.
@@ -14,7 +14,13 @@ import pandas as pd
 import streamlit as st
 from scipy.stats import beta
 from scipy.special import betaln, comb
-import plotly.express as px
+
+# ----- Plotly is optional (graceful fallback to Streamlit charts) -----
+try:
+    import plotly.express as px
+    _HAS_PLOTLY = True
+except Exception:
+    _HAS_PLOTLY = False
 
 # ----------------------------
 # Core math utilities
@@ -78,8 +84,7 @@ def predictive_prob_of_final_success(a0, b0, N_total, x_curr, n_curr, p0, theta_
     """
     Predictive probability (over future data) that final posterior criterion
     (P(p > p0 | final data) >= theta_final) will be met, given current x_curr, n_curr.
-
-    This is exact under Beta-Binomial predictive with posterior Beta(a0+x_curr, b0+n_curr-x_curr).
+    Exact under Beta-Binomial predictive with posterior Beta(a0+x_curr, b0+n_curr-x_curr).
     """
     a_post, b_post = beta_posterior_params(a0, b0, x_curr, n_curr)
     m_remain = N_total - n_curr
@@ -93,12 +98,10 @@ def compute_interim_futility_cutoffs(a0, b0, N_total, looks, p0, theta_final, c_
     """
     For each interim look n in looks (n < N_total), compute the minimum current successes x_min_to_continue
     such that PPoS >= c_futility. (Monotone in x.)
-
-    Returns dict: look_n -> x_min_to_continue
+    Returns dict: look_n -> x_min_to_continue (None => never continue).
     """
     cutoffs = {}
     for n in looks:
-        # binary search for minimal x such that PPoS >= c_futility
         lo, hi = 0, n
         ans = n + 1
         while lo <= hi:
@@ -109,7 +112,7 @@ def compute_interim_futility_cutoffs(a0, b0, N_total, looks, p0, theta_final, c_
                 hi = mid - 1
             else:
                 lo = mid + 1
-        cutoffs[n] = None if ans == n + 1 else int(ans)  # None means never continue (always stop)
+        cutoffs[n] = None if ans == n + 1 else int(ans)
     return cutoffs
 
 # ----------------------------
@@ -163,37 +166,42 @@ def simulate_design(design, p, U):
             cum_x[active] += np.sum(X[active, n_curr:look_n], axis=1)
             n_curr = look_n
 
-        # Evaluate early success (optional)
-        if allow_early:
+        # Early success (optional)
+        if allow_early and active.any():
             a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr)
-            # vectorized posterior prob > p0
             post_probs = 1.0 - beta.cdf(p0, a_post, b_post)
             early_succ = (post_probs >= theta_final)
-            idx = np.where(active)[0][early_succ]
-            success[idx] = True
-            stopped[idx] = True
-            final_n[idx] = n_curr
-            active[idx] = False
-            stop_by_look_counts[li] += early_succ.sum()
+            if np.any(early_succ):
+                idx_active = np.where(active)[0]
+                idx = idx_active[early_succ]
+                success[idx] = True
+                stopped[idx] = True
+                final_n[idx] = n_curr
+                active[idx] = False
+                stop_by_look_counts[li] += early_succ.sum()
 
-        # Futility stopping: use x_min_to_continue
+        if not active.any():
+            break
+
+        # Futility stopping
         x_min = x_min_to_continue.get(look_n, None)
         if x_min is None:
             # never continue -> everyone stops (if still active)
             idx = np.where(active)[0]
-            stopped[idx] = True
-            final_n[idx] = n_curr
-            active[idx] = False
-            stop_by_look_counts[li] += idx.size
+            if idx.size > 0:
+                stopped[idx] = True
+                final_n[idx] = n_curr
+                active[idx] = False
+                stop_by_look_counts[li] += idx.size
         else:
             need_continue = cum_x[active] >= x_min
-            # those who do not meet x_min stop for futility
             idx_all_active = np.where(active)[0]
             idx_stop = idx_all_active[~need_continue]
-            stopped[idx_stop] = True
-            final_n[idx_stop] = n_curr
-            active[idx_stop] = False
-            stop_by_look_counts[li] += idx_stop.size
+            if idx_stop.size > 0:
+                stopped[idx_stop] = True
+                final_n[idx_stop] = n_curr
+                active[idx_stop] = False
+                stop_by_look_counts[li] += idx_stop.size
 
         if not active.any():
             break
@@ -204,11 +212,10 @@ def simulate_design(design, p, U):
         if add > 0:
             cum_x[active] += np.sum(X[active, n_curr:N], axis=1)
             n_curr = N
-        # final decision: posterior > p0 ?= success (s_min_final shortcut)
-        # Using s_min_final is faster:
         succ_final = (cum_x[active] >= s_min_final)
         idx_active = np.where(active)[0]
-        success[idx_active[succ_final]] = True
+        if np.any(succ_final):
+            success[idx_active[succ_final]] = True
         stopped[idx_active] = True
         final_n[idx_active] = N
 
@@ -259,12 +266,14 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
 
         x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks, p0, theta_final, c_futility)
 
+        # NOTE: include p1 so deep-dive can reference it safely
         design = dict(
             N_total=N, looks=looks, a0=a0, b0=b0, p0=p0,
             theta_final=theta_final, c_futility=c_futility,
             allow_early_success=allow_early,
             s_min_final=s_min,
-            x_min_to_continue_by_look=x_min_to_continue
+            x_min_to_continue_by_look=x_min_to_continue,
+            p1=p1
         )
 
         # Simulate under p0 and p1 using the SAME uniforms for variance reduction
@@ -288,10 +297,20 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
         designs_built.append(design)
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df, designs_built
-    # Rank: meet constraints first, then sort by ESS@p0 ascending then N_total ascending
     return df, designs_built
+
+# ----------------------------
+# Plotting helper (Plotly or fallback)
+# ----------------------------
+
+def plot_lines(df, x, y, title):
+    if _HAS_PLOTLY:
+        fig = px.line(df, x=x, y=y, title=title)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.subheader(title)
+        chart_df = df[[x, y]].set_index(x)
+        st.line_chart(chart_df)
 
 # ----------------------------
 # Streamlit UI
@@ -356,11 +375,9 @@ def look_schedule(N, scheme):
         looks = [int(np.floor(0.5 * N))]
     elif scheme == "2 interims at 33% & 67%":
         looks = [int(np.floor(0.33 * N)), int(np.floor(0.67 * N))]
-        # ensure uniqueness and < N
         looks = sorted(list({min(max(1, l), N - 1) for l in looks if 0 < l < N}))
     else:
         looks = []
-    # Ensure all looks < N
     looks = [l for l in looks if l < N]
     return sorted(list(dict.fromkeys(looks)))
 
@@ -373,7 +390,7 @@ for N in Ns:
         "a0": a0,
         "b0": b0,
         "p0": p0,
-        "p1": p1,
+        "p1": p1,  # ensure p1 is present in grid items
         "theta_final": theta_final,
         "c_futility": c_futility,
         "allow_early_success": allow_early_success
@@ -405,96 +422,100 @@ else:
     if df_ok.empty:
         st.info("No candidates met the α and power constraints. Displaying the full screening table for reference.")
         st.dataframe(df_screen.sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True))
+        df_to_select_from = df_screen.sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True)
     else:
         df_ranked = df_ok.sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True)
         st.dataframe(df_ranked.head(15))
         st.success(f"Found {len(df_ok)} candidate designs meeting constraints. Showing top 15 by ESS @ p0.")
+        df_to_select_from = df_ranked
 
     # Selection for deep dive
     st.write("### 2) Deep Dive on Selected Design")
     st.caption("Pick a row index from the (filtered) table above for a high-precision simulation and OC plots.")
     idx = st.number_input("Row index (0-based from the filtered table above)", min_value=0, value=0, step=1)
 
-    if not df_ok.empty and idx < len(df_ok):
-        chosen = df_ok.iloc[int(idx)]
+    # Choose a design row
+    if len(df_to_select_from) > 0:
+        idx_used = int(np.clip(idx, 0, len(df_to_select_from) - 1))
+        chosen = df_to_select_from.iloc[idx_used]
     else:
-        # fallback to best in full screen if no OK
-        chosen = df_screen.sort_values(["ESS @ p0", "N_total"]).iloc[0]
+        chosen = None
 
-    st.write("**Chosen design**")
-    show_cols = ["N_total", "looks", "theta_final", "c_futility", "allow_early_success",
-                 "Type I error @ p0", "Power @ p1", "ESS @ p0", "ESS @ p1", "s_min_final"]
-    st.json({k: (int(chosen[k]) if isinstance(chosen[k], (np.integer,)) else chosen[k]) for k in show_cols})
-    st.caption("Interim continue thresholds (x ≥ x_min to continue):")
-    st.write(chosen["x_min_to_continue"])
+    if chosen is not None:
+        st.write("**Chosen design**")
+        show_cols = ["N_total", "looks", "theta_final", "c_futility", "allow_early_success",
+                     "Type I error @ p0", "Power @ p1", "ESS @ p0", "ESS @ p1", "s_min_final"]
+        st.json({k: (int(chosen[k]) if isinstance(chosen[k], (np.integer,)) else chosen.get(k, None)) for k in show_cols})
+        st.caption("Interim continue thresholds (x ≥ x_min to continue):")
+        st.write(chosen["x_min_to_continue"])
 
-    # Deep dive controls
-    st.write("#### Deep-dive Simulation Settings")
-    col_d1, col_d2 = st.columns(2)
-    with col_d1:
-        n_sims_deep = st.number_input("Deep-dive sims", min_value=2000, max_value=500000, value=100000, step=5000)
-    with col_d2:
-        p_grid_min = st.number_input("OC curve p-min", min_value=0.0, max_value=1.0, value=max(0.0, p0 - 0.15), step=0.01)
-        p_grid_max = st.number_input("OC curve p-max", min_value=0.0, max_value=1.0, value=min(1.0, p1 + 0.20), step=0.01)
-    n_grid = st.slider("Number of points on OC grid", min_value=5, max_value=40, value=15, step=1)
-    seed_deep = st.number_input("Deep-dive seed", min_value=1, value=seed + 1, step=1)
+        # Deep dive controls
+        st.write("#### Deep-dive Simulation Settings")
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            n_sims_deep = st.number_input("Deep-dive sims", min_value=2000, max_value=500000, value=100000, step=5000)
+        with col_d2:
+            p_grid_min = st.number_input("OC curve p-min", min_value=0.0, max_value=1.0, value=max(0.0, p0 - 0.15), step=0.01)
+            p_grid_max = st.number_input("OC curve p-max", min_value=0.0, max_value=1.0, value=min(1.0, p1 + 0.20), step=0.01)
+        n_grid = st.slider("Number of points on OC grid", min_value=5, max_value=40, value=15, step=1)
+        seed_deep = st.number_input("Deep-dive seed", min_value=1, value=seed + 1, step=1)
 
-    # Build design dict
-    design = chosen["_design"]
+        # Design dict from chosen row
+        design = chosen["_design"]
 
-    # Deep-dive simulation
-    if st.button("Run Deep-Dive Simulation", type="primary"):
-        rng = np.random.default_rng(seed_deep)
-        U_deep = rng.uniform(size=(n_sims_deep, design["N_total"]))
+        # Use defensive access so older cached objects don't break
+        p0_used = design.get("p0", p0)
+        p1_used = design.get("p1", p1)
 
-        # Key points p0 and p1
-        res_p0 = simulate_design(design, design["p0"], U_deep)
-        res_p1 = simulate_design(design, design["p1"], U_deep)
+        # Deep-dive simulation
+        if st.button("Run Deep-Dive Simulation", type="primary"):
+            rng = np.random.default_rng(seed_deep)
+            U_deep = rng.uniform(size=(n_sims_deep, design["N_total"]))
 
-        st.write("##### Point Estimates")
-        cols = st.columns(4)
-        cols[0].metric("Type I error @ p0", f"{res_p0['reject_rate']:.3f}")
-        cols[1].metric("Power @ p1", f"{res_p1['reject_rate']:.3f}")
-        cols[2].metric("ESS @ p0", f"{res_p0['ess']:.1f}")
-        cols[3].metric("ESS @ p1", f"{res_p1['ess']:.1f}")
+            res_p0 = simulate_design(design, p0_used, U_deep)
+            res_p1 = simulate_design(design, p1_used, U_deep)
 
-        # Stop dist tables
-        st.write("##### Sample Size Distribution @ p0")
-        st.dataframe(res_p0["stop_dist"])
-        st.write("##### Sample Size Distribution @ p1")
-        st.dataframe(res_p1["stop_dist"])
+            st.write("##### Point Estimates")
+            cols = st.columns(4)
+            cols[0].metric("Type I error @ p0", f"{res_p0['reject_rate']:.3f}")
+            cols[1].metric("Power @ p1", f"{res_p1['reject_rate']:.3f}")
+            cols[2].metric("ESS @ p0", f"{res_p0['ess']:.1f}")
+            cols[3].metric("ESS @ p1", f"{res_p1['ess']:.1f}")
 
-        # OC curves across grid
-        ps = np.linspace(p_grid_min, p_grid_max, n_grid)
-        oc = []
-        ess_curve = []
-        # To keep runtime sane, reuse same uniforms for all p
-        for pp in ps:
-            r = simulate_design(design, pp, U_deep)
-            oc.append(r["reject_rate"])
-            ess_curve.append(r["ess"])
+            # Stop dist tables
+            st.write("##### Sample Size Distribution @ p0")
+            st.dataframe(res_p0["stop_dist"])
+            st.write("##### Sample Size Distribution @ p1")
+            st.dataframe(res_p1["stop_dist"])
 
-        df_oc = pd.DataFrame({"p": ps, "Reject_Prob": oc, "ESS": ess_curve})
-        fig1 = px.line(df_oc, x="p", y="Reject_Prob", title="Operating Characteristic: P(Declare Success) vs p",
-                       range_y=[0, 1])
-        fig2 = px.line(df_oc, x="p", y="ESS", title="Expected Sample Size vs p")
-        st.plotly_chart(fig1, use_container_width=True)
-        st.plotly_chart(fig2, use_container_width=True)
+            # OC curves across grid
+            ps = np.linspace(p_grid_min, p_grid_max, n_grid)
+            oc = []
+            ess_curve = []
+            for pp in ps:
+                r = simulate_design(design, pp, U_deep)
+                oc.append(r["reject_rate"])
+                ess_curve.append(r["ess"])
 
-        st.write("##### Exportable Design Summary")
-        export = dict(
-            N_total=int(design["N_total"]),
-            looks=[int(x) for x in design["looks"]],
-            prior=dict(a0=float(design["a0"]), b0=float(design["b0"])),
-            null_p0=float(design["p0"]),
-            theta_final=float(design["theta_final"]),
-            c_futility=float(design["c_futility"]),
-            allow_early_success=bool(design["allow_early_success"]),
-            final_success_min_successes=int(design["s_min_final"]),
-            interim_continue_thresholds={int(k): (None if v is None else int(v)) for k, v in design["x_min_to_continue_by_look"].items()},
-            notes="Continue at interim n if current successes x >= threshold; else stop for futility."
-        )
-        st.code(repr(export), language="python")
+            df_oc = pd.DataFrame({"p": ps, "Reject_Prob": oc, "ESS": ess_curve})
+            plot_lines(df_oc, x="p", y="Reject_Prob", title="Operating Characteristic: P(Declare Success) vs p")
+            plot_lines(df_oc, x="p", y="ESS", title="Expected Sample Size vs p")
+
+            st.write("##### Exportable Design Summary")
+            export = dict(
+                N_total=int(design["N_total"]),
+                looks=[int(x) for x in design["looks"]],
+                prior=dict(a0=float(design["a0"]), b0=float(design["b0"])),
+                null_p0=float(p0_used),
+                target_p1=float(p1_used),
+                theta_final=float(design["theta_final"]),
+                c_futility=float(design["c_futility"]),
+                allow_early_success=bool(design["allow_early_success"]),
+                final_success_min_successes=int(design["s_min_final"]),
+                interim_continue_thresholds={int(k): (None if v is None else int(v)) for k, v in design["x_min_to_continue_by_look"].items()},
+                notes="Continue at interim n if current successes x >= threshold; else stop for futility."
+            )
+            st.code(repr(export), language="python")
 
 st.write("---")
 st.write("### Methodological Details (what the app computes)")
@@ -525,4 +546,4 @@ st.markdown(
 """
 )
 
-st.caption("Tip: You can adapt this to co-primary endpoints or add safety monitoring by duplicating the same machinery for a toxicity rate with its own thresholds.")
+st.caption("Tip: You can adapt this to co-primary endpoints or add safety monitoring by duplicating the machinery for a toxicity rate with its own thresholds.")
