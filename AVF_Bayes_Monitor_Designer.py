@@ -1,7 +1,8 @@
 # =============================================================================
 # AVF_Bayes_Monitor_Designer.py
 # Streamlit app with per-look posterior success thresholds (alpha-spending style),
-# calibration to Type I error target, and faster vectorized calibration.
+# calibration to Type I error target, fast vectorized calibration, and
+# human-friendly (plain language) tables.
 # =============================================================================
 
 import time
@@ -264,13 +265,11 @@ def vectorized_alpha_under_p0(
     rng = np.random.default_rng(seed)
     N = design.N
     looks = design.look_schedule
-    L = len(looks)
 
     # Precompute integer boundaries with current thresholds
     bounds = compute_boundaries(design)
     r_mins = np.array([bounds[n]["r_success_min"] if bounds[n]["r_success_min"] is not None else N+1 for n in looks], dtype=int)
     t_mins = np.array([bounds[n]["t_safety_min"] if bounds[n]["t_safety_min"] is not None else N+1 for n in looks], dtype=int)
-    r_star_final = bounds[looks[-1]]["r_star_final"]
 
     # Generate trial matrices
     resp = rng.binomial(1, design.p0, size=(n_sim, N))
@@ -293,19 +292,14 @@ def vectorized_alpha_under_p0(
         # Safety first
         if t is not None:
             stop_safety = active & (t >= t_mins[i])
-            active[stop_safety] = False  # stop, but not success
+            active[stop_safety] = False
 
         # Efficacy success
         got_success = active & (r >= r_mins[i])
         success[got_success] = True
         active[got_success] = False
 
-        # Futility (optional) — skipped by default during calibration for speed
-        if (not skip_futility) and (n < N) and (r_star_final is not None):
-            # Predictive prob is expensive; leave off in calibration.
-            pass
-
-        # Final look — those still active are evaluated at final implicitly by r_mins[-1]
+        # Futility skipped during calibration for speed
         if n == N:
             break
 
@@ -679,6 +673,109 @@ st.info(
 )
 st.markdown("---")
 
+# ---------- Helpers for plain-language tables ----------
+def _fmt_looks(looks):
+    if looks is None or (isinstance(looks, float) and np.isnan(looks)):
+        return "—"
+    try:
+        return ", ".join(str(int(n)) for n in looks)
+    except Exception:
+        return str(looks)
+
+def _fmt_gamma_vec(gvec):
+    if gvec is None or (isinstance(gvec, float) and np.isnan(gvec)):
+        return "—"
+    try:
+        return ", ".join(f"{float(g):.3f}" for g in gvec)
+    except Exception:
+        return str(gvec)
+
+def _fmt_r_by_look(r_by_look):
+    """
+    r_by_look is a list like [(n1, rmin1), (n2, rmin2), ...]
+    Render as: n=10: r≥3; n=20: r≥6; ...
+    """
+    if r_by_look is None or (isinstance(r_by_look, float) and np.isnan(r_by_look)):
+        return "—"
+    try:
+        parts = []
+        for n, r in r_by_look:
+            rtxt = "—" if r is None else str(int(r))
+            parts.append(f"n={int(n)}: r≥{rtxt}")
+        return "; ".join(parts)
+    except Exception:
+        return str(r_by_look)
+
+def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
+    """Build a human-friendly table for display."""
+    df = df_src.copy()
+
+    # High-level design
+    df["Max patients (N)"] = df["N"]
+    df["Interim checks (K)"] = df["K_interims"]
+    df["When we check (patients enrolled)"] = df["looks"].apply(_fmt_looks)
+
+    # Success threshold(s): per-look vector if present, else single gamma
+    def _gamma_text_row(row):
+        gv = row.get("gamma_e_vector", None)
+        if gv is not None:
+            return _fmt_gamma_vec(gv)
+        gu = row.get("gamma_e_used", None)
+        if gu is None or (isinstance(gu, float) and np.isnan(gu)):
+            return "—"
+        return f"{float(gu):.3f}"
+
+    df["Success threshold(s) γₑ"] = df.apply(_gamma_text_row, axis=1)
+
+    # Integer boundaries
+    df["Min responses needed at each check"] = df["r_success_by_look"].apply(_fmt_r_by_look)
+    df["Final responses needed"] = df["r_star_final"].apply(
+        lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else str(int(x))
+    )
+
+    # Operating characteristics (with uncertainty)
+    df["Type I error (α)"] = df["alpha"].map(lambda x: f"{float(x):.3f}")
+    df["α ±95% CI width"] = df.get("alpha_95ci", pd.Series(index=df.index, data=np.nan)).map(
+        lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"±{float(x):.3f}"
+    )
+    df["Power"] = df["power"].map(lambda x: f"{float(x):.3f}")
+    df["Power ±95% CI width"] = df.get("power_95ci", pd.Series(index=df.index, data=np.nan)).map(
+        lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"±{float(x):.3f}"
+    )
+
+    # Workload / efficiency
+    df["Avg patients if p = p₁"] = df["ESS_p1"].map(lambda x: f"{float(x):.1f}")
+    df["Avg patients if p = p₀"] = df["ESS_p0"].map(lambda x: f"{float(x):.1f}")
+    df["Avg checks if p = p₁"] = df["avg_looks_p1"].map(lambda x: f"{float(x):.2f}")
+
+    # Feasibility tag
+    df["Meets α & power?"] = df["is_feasible"].map({True: "Yes", False: "No"})
+    df["Tag(s)"] = df.get("selection", "").replace({np.nan: ""})
+
+    # Optional safety columns if available
+    if "safety_stop_q1" in df:
+        df["P(stop for safety | q₁)"] = df["safety_stop_q1"].map(
+            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
+        )
+    if "safety_stop_qmax" in df:
+        df["P(stop for safety | q_max)"] = df["safety_stop_qmax"].map(
+            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
+        )
+
+    # Column order for summary table
+    cols = [
+        "Tag(s)","Meets α & power?","Max patients (N)","Interim checks (K)",
+        "When we check (patients enrolled)",
+        "Success threshold(s) γₑ","Min responses needed at each check","Final responses needed",
+        "Type I error (α)","α ±95% CI width","Power","Power ±95% CI width",
+        "Avg patients if p = p₁","Avg patients if p = p₀","Avg checks if p = p₁"
+    ]
+    # Append safety columns if present
+    if "P(stop for safety | q₁)" in df: cols.append("P(stop for safety | q₁)")
+    if "P(stop for safety | q_max)" in df: cols.append("P(stop for safety | q_max)")
+
+    return df[cols]
+
 # -----------------------------------------------------------------------------
 # Run
 # -----------------------------------------------------------------------------
@@ -739,48 +836,50 @@ if run_btn:
     # Optional feasibility filter
     df_view = df[df["is_feasible"]] if show_only_feasible else df
 
-    # Display
-    if df[df["is_feasible"]].empty:
-        st.warning("No feasible designs met α & power targets with the current inputs.")
-
+    # -------------------- Summary of Designs (Plain Language) --------------------
     st.subheader("Summary of Designs")
-    st.dataframe(
-        df_view[
-            [
-                "selection","is_feasible","N","K_interims","looks",
-                "gamma_e_used","gamma_e_vector","r_star_final","r_success_by_look",
-                "alpha","alpha_se","alpha_95ci",
-                "power","power_se","power_95ci",
-                "ESS_p0","ESS_p1","avg_looks_p1",
-                "safety_stop_q1","safety_stop_qmax"
-            ]
-        ],
-        use_container_width=True
-    )
 
+    plain_summary = _make_plain_table(df_view)
+    st.dataframe(plain_summary, use_container_width=True)
+
+    with st.expander("What do these columns mean?"):
+        st.markdown("""
+- **Max patients (N)**: Maximum number of patients if the study runs to completion.
+- **Interim checks (K)**: How many interim analyses before the final look.
+- **When we check (patients enrolled)**: Patient counts (cumulative) at which we perform each look.
+- **Success threshold(s) γₑ**: Posterior probability threshold(s) to declare success (one per look if calibrated per‑look).
+- **Min responses needed at each check**: For each look `n`, the minimum number of responders `r` required to meet the success rule at that look.
+- **Final responses needed**: Minimum total responders required at the final analysis to declare success.
+- **Type I error (α)**: Chance of a false positive (declaring success when the true rate is **p₀**).
+- **Power**: Chance of correctly declaring success when the true rate is **p₁**.
+- **Avg patients if p = p₁ / p₀**: Expected sample size under **p₁** / **p₀**.
+- **Avg checks if p = p₁**: Average number of looks used when the true rate is **p₁**.
+- **P(stop for safety | q₁ / q_max)** (if shown): Probability of stopping early for safety under the given toxicity rate.
+""")
+
+    # -------------------- Recommended Designs (Plain Language) -------------------
     st.subheader("Recommended Designs")
-    for label, tag in [
-        ("Smallest N", "smallest_N"),
-        ("High Power (under N budget)", "high_power"),
-        ("Sweet Spot (min ESS_p1)", "sweet_spot"),
-    ]:
-        subset = df[df["selection"].str.contains(tag, na=False)]
-        st.write(f"### {label}")
+
+    def _show_recs(df_src: pd.DataFrame, tag: str, title: str):
+        subset = df_src[df_src["selection"].str.contains(tag, na=False)]
+        st.write(f"### {title}")
         if subset.empty:
             st.info("None.")
-        else:
-            st.dataframe(
-                subset[
-                    [
-                        "N","K_interims","looks",
-                        "gamma_e_used","gamma_e_vector","r_star_final","r_success_by_look",
-                        "alpha","alpha_se","alpha_95ci",
-                        "power","power_se","power_95ci","ESS_p1"
-                    ]
-                ],
-                use_container_width=True
-            )
+            return
+        st.dataframe(
+            _make_plain_table(subset)[[
+                "Max patients (N)","Interim checks (K)","When we check (patients enrolled)",
+                "Success threshold(s) γₑ","Min responses needed at each check","Final responses needed",
+                "Type I error (α)","Power","Avg patients if p = p₁"
+            ]],
+            use_container_width=True
+        )
 
+    _show_recs(df, "smallest_N", "Smallest N (meets α & power)")
+    _show_recs(df, "high_power", "High Power (under N budget)")
+    _show_recs(df, "sweet_spot", "Sweet Spot (min Avg patients if p = p₁)")
+
+    # -------------------- Download + Chart --------------------
     st.download_button("Download CSV", df.to_csv(index=False).encode(), "bayes_monitor_designs.csv")
 
     st.markdown("---")
