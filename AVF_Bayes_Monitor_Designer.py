@@ -407,6 +407,11 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Targets & Simulation")
+    require_alpha_for_high_power = st.checkbox(
+    "Require α constraint for 'High power' recommendations",
+    value=True,
+    help="When on, High power designs must also meet the α target."
+    )
 
     st.number_input("Max Type I error α target", 0.0, 0.5, DEFAULTS["alpha_target"], 0.01, key="alpha_target")
     st.number_input("Min Power target", 0.0, 1.0, DEFAULTS["power_target"], 0.01, key="power_target")
@@ -522,3 +527,4 @@ if run_btn:
         .properties(width=800, height=300)
     )
     st.altair_chart(chart, use_container_width=True)
+
