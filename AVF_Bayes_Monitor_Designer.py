@@ -1,20 +1,39 @@
 # =============================================================================
-# AVF_Bayes_Monitor_Designer.py
+# AVF_Bayes_Monitor_Designer.py  (single-file, optimized)
 # Bayesian Single-Arm Monitoring Study Designer
 # - Classic grid search (with fixed or calibrated success thresholds)
 # - Staged Workflow search (fast → faithful → racing → precise finalists)
 # - Calibration fixes: minimal-γ bisection + exact refinement
 # - Vectorized α honors futility if requested (falls back to exact sim)
+# - Lazy imports for SciPy/NumPy/Altair to speed initial load
 # - Plain-language summaries & re-evaluation panel
 # =============================================================================
+
+# Lightweight imports only at top-level
 import time
 from dataclasses import dataclass
-from typing import List, Tuple, Optional, Dict, Iterable
-import numpy as np
-import pandas as pd
+from typing import List, Tuple, Optional, Dict
 import streamlit as st
-from scipy.special import comb, beta as beta_fn
-from scipy.stats import beta
+import pandas as pd
+
+# -----------------------------------------------------------------------------
+# Lazy import helpers (heavy libs only loaded when actually used)
+# -----------------------------------------------------------------------------
+def lazy_numpy():
+    import numpy as _np
+    return _np
+
+def lazy_scipy_stats_beta():
+    from scipy.stats import beta as _beta
+    return _beta
+
+def lazy_scipy_special():
+    from scipy.special import comb as _comb, beta as _beta_fn
+    return _comb, _beta_fn
+
+def lazy_altair():
+    import altair as _alt
+    return _alt
 
 # -----------------------------------------------------------------------------
 # Streamlit configuration
@@ -85,12 +104,14 @@ class OperatingCharacteristics:
     success_prob_by_look: Dict[int, float]
 
 # -----------------------------------------------------------------------------
-# Bayesian helpers
+# Bayesian helpers (lazy SciPy inside)
 # -----------------------------------------------------------------------------
 def posterior_prob_p_greater_than(p0: float, a: float, b: float) -> float:
+    beta = lazy_scipy_stats_beta()
     return 1.0 - beta.cdf(p0, a, b)
 
 def posterior_prob_q_exceeds(qmax: float, a: float, b: float) -> float:
+    beta = lazy_scipy_stats_beta()
     return 1.0 - beta.cdf(qmax, a, b)
 
 def minimal_successes_for_posterior_success(
@@ -112,6 +133,8 @@ def beta_binomial_predictive_prob_at_least(
     a0: float, b0: float, r_star_final: int
 ) -> float:
     """Predictive probability that future successes bring total >= r_star_final."""
+    np = lazy_numpy()
+    comb, beta_fn = lazy_scipy_special()
     m = final_N - current_n
     a_post = a0 + current_r
     b_post = b0 + current_n - current_r
@@ -131,7 +154,7 @@ def beta_binomial_predictive_prob_at_least(
 def compute_boundaries(design: Design) -> Dict[int, Dict[str, Optional[int]]]:
     """
     Compute per-look success (r_min) and safety (t_min) boundaries.
-    If gamma_e_vector is given, use the entry aligned to the look index; otherwise use gamma_e scalar.
+    If gamma_e_vector is given, use that entry; else use gamma_e scalar.
     """
     bounds: Dict[int, Dict[str, Optional[int]]] = {}
     looks = design.look_schedule
@@ -162,13 +185,13 @@ def compute_boundaries(design: Design) -> Dict[int, Dict[str, Optional[int]]]:
 # -----------------------------------------------------------------------------
 def simulate_one_trial(
     design: Design, true_p: float, true_q: Optional[float],
-    bounds: Dict[int, Dict[str, Optional[int]]], rng: np.random.Generator,
+    bounds: Dict[int, Dict[str, Optional[int]]], rng,  # rng is numpy Generator
     skip_futility: bool = False
 ) -> Tuple[bool, int, bool, int]:
     """
     Returns (success, n_used, safety_stopped, looks_used).
-    skip_futility=True is used during calibration for speed; evaluation uses futility.
     """
+    np = lazy_numpy()
     N = design.N
     responses = rng.binomial(1, true_p, N)
     tox = rng.binomial(1, true_q, N) if (true_q is not None) else np.zeros(N, dtype=int)
@@ -211,6 +234,7 @@ def simulate_one_trial(
 def evaluate_design(
     design: Design, n_sim: int = 1, seed: int = 123, skip_futility: bool = False
 ) -> OperatingCharacteristics:
+    np = lazy_numpy()
     rng = np.random.default_rng(seed)
     bounds = compute_boundaries(design)
 
@@ -261,16 +285,16 @@ def vectorized_alpha_under_p0(
         oc = evaluate_design(design, n_sim=n_sim, seed=seed, skip_futility=False)
         return float(oc.alpha)
 
-    rng = np.random.default_rng(seed)
+    np = lazy_numpy()
+    # Precompute integer boundaries with current thresholds
+    bounds = compute_boundaries(design)
     N = design.N
     looks = design.look_schedule
 
-    # Precompute integer boundaries with current thresholds
-    bounds = compute_boundaries(design)
     r_mins = np.array([bounds[n]["r_success_min"] if bounds[n]["r_success_min"] is not None else N+1 for n in looks], dtype=int)
     t_mins = np.array([bounds[n]["t_safety_min"] if bounds[n]["t_safety_min"] is not None else N+1 for n in looks], dtype=int)
 
-    # Generate trial matrices
+    rng = np.random.default_rng(seed)
     resp = rng.binomial(1, design.p0, size=(n_sim, N))
     tox = None
     if design.q1 is not None and design.qmax is not None and design.gamma_s is not None:
@@ -297,7 +321,7 @@ def vectorized_alpha_under_p0(
         success[got_success] = True
         active[got_success] = False
 
-        # (Futility is intentionally skipped in vectorized fast mode)
+        # Futility intentionally skipped in vectorized fast mode
         if n == N:
             break
 
@@ -371,15 +395,10 @@ def cached_boundaries_for_design(
     return compute_boundaries(design)
 
 # -----------------------------------------------------------------------------
-# Calibration helpers (fixed)
+# Calibration helpers (fixed, with exact refinement)
 # -----------------------------------------------------------------------------
 def perlook_gamma_vector_from_final(gamma_final: float, L: int, phi: float) -> List[float]:
-    """
-    Construct per-look posterior thresholds:
-    gamma_l = 1 - (1 - gamma_final) * s_l
-    with s_l = (l/L)^phi, l = 1..L (final l=L gives s_L=1 => gamma_L=gamma_final).
-    phi >= 1 makes early looks stricter (O'Brien-Fleming-like as phi grows).
-    """
+    np = lazy_numpy()
     idx = np.arange(1, L + 1, dtype=float)
     s = (idx / L) ** max(phi, 0.5)
     return [float(1.0 - (1.0 - gamma_final) * sl) for sl in s]
@@ -397,7 +416,7 @@ def cached_calibrate_single_gamma(
     """
     Calibrate a single posterior success threshold γe to control α.
     Returns the minimal γe such that α ≤ target (within tol).
-    If fast_mode or skip_futility_during_cal is True, performs a small exact refinement.
+    If fast_mode or skip_futility_during_cal is True, perform a small exact refinement.
     """
     def alpha_at_gamma(gamma: float, fast: bool = True) -> float:
         if fast:
@@ -431,6 +450,7 @@ def cached_calibrate_single_gamma(
         gamma_fast = float(hi)
 
     if fast_mode or skip_futility_during_cal:
+        np = lazy_numpy()
         window = 0.03
         grid = np.linspace(max(g_low, gamma_fast - window), min(g_high, gamma_fast + window), 7)
         good = [g for g in grid if alpha_at_gamma(float(g), fast=False) <= alpha_target + tol_alpha]
@@ -450,7 +470,7 @@ def cached_calibrate_perlook_gamma(
 ) -> Tuple[float, Tuple[float, ...]]:
     """
     Calibrate per-look thresholds by bisection on γ_final; γ vector derived via φ.
-    Returns (γ_final*, γ_vec*), minimal γ_final controlling α (within tol), with refinement if needed.
+    Returns (γ_final*, γ_vec*), minimal γ_final controlling α (within tol), with refinement.
     """
     L = len(look_tuple)
 
@@ -489,6 +509,7 @@ def cached_calibrate_perlook_gamma(
         gamma_fast = float(hi); gamma_vec_fast = tuple(perlook_gamma_vector_from_final(gamma_fast, L, phi))
 
     if fast_mode or skip_futility_during_cal:
+        np = lazy_numpy()
         window = 0.03
         grid = np.linspace(max(g_low, gamma_fast - window), min(g_high, gamma_fast + window), 7)
         best_gamma = None
@@ -502,7 +523,7 @@ def cached_calibrate_perlook_gamma(
     return float(gamma_fast), gamma_vec_fast
 
 # -----------------------------------------------------------------------------
-# Classic grid search (unchanged API; tags tightened later)
+# Classic grid search
 # -----------------------------------------------------------------------------
 @st.cache_data(show_spinner=True)
 def cached_grid_search(
@@ -616,8 +637,8 @@ def cached_grid_search(
 # -----------------------------------------------------------------------------
 # ===== STAGED WORKFLOW IMPLEMENTATION =====
 # -----------------------------------------------------------------------------
-# Small utilities
 def _se(p: float, n: int) -> float:
+    np = lazy_numpy()
     return float(np.sqrt(max(p * (1 - p), 0.0) / max(n, 1)))
 
 def _dominates(r_by_look_A: List[Tuple[int,int]], r_by_look_B: List[Tuple[int,int]]) -> bool:
@@ -631,6 +652,7 @@ def _dominates(r_by_look_A: List[Tuple[int,int]], r_by_look_B: List[Tuple[int,in
 def _implausible_final_rstar(N: int, p1: float, r_star_final: Optional[int]) -> bool:
     if r_star_final is None:
         return False
+    np = lazy_numpy()
     mu = N * p1
     var = N * p1 * (1 - p1)
     thr = mu + 3.0 * np.sqrt(max(var, 1e-12))
@@ -638,7 +660,8 @@ def _implausible_final_rstar(N: int, p1: float, r_star_final: Optional[int]) -> 
 
 def _parse_schedule(schedule_str: str) -> List[Tuple[int, float]]:
     """
-    Parse racing schedule like "1000@0.5,2000@0.5,5000@1.0" -> [(1000,0.5),(2000,0.5),(5000,1.0)]
+    Parse racing schedule like "1000@0.5,2000@0.5,5000@1.0"
+    -> [(1000,0.5),(2000,0.5),(5000,1.0)]
     """
     out = []
     if not schedule_str:
@@ -650,10 +673,9 @@ def _parse_schedule(schedule_str: str) -> List[Tuple[int, float]]:
         out.append((int(float(n)), float(k)))
     return out
 
-# Candidate wrapper with cumulative stats (for racing)
 @dataclass
 class EvalStats:
-    n_eval: int = 0  # number of batches added (info only)
+    n_eval: int = 0
     n_sims: int = 0
     alpha_sum: float = 0.0
     power_sum: float = 0.0
@@ -682,24 +704,24 @@ class Candidate:
         self.stats.ess_p0_sum += oc.ess_p0 * n_batch
         self.stats.ess_p1_sum += oc.ess_p1 * n_batch
 
-# Gates
 def _gate_alpha_point(alpha_hat: float, n: int, alpha_target: float, z: float) -> str:
+    np = lazy_numpy()
     if n <= 0: return "undecided"
-    lo = alpha_hat - z * _se(alpha_hat, n)
-    hi = alpha_hat + z * _se(alpha_hat, n)
+    lo = alpha_hat - z * float(np.sqrt(max(alpha_hat*(1-alpha_hat),0)/n))
+    hi = alpha_hat + z * float(np.sqrt(max(alpha_hat*(1-alpha_hat),0)/n))
     if hi <= alpha_target: return "promote"
     if lo >  alpha_target: return "prune"
     return "gray"
 
 def _gate_power_point(power_hat: float, n: int, power_target: float, z: float) -> str:
+    np = lazy_numpy()
     if n <= 0: return "undecided"
-    lo = power_hat - z * _se(power_hat, n)
-    hi = power_hat + z * _se(power_hat, n)
+    lo = power_hat - z * float(np.sqrt(max(power_hat*(1-power_hat),0)/n))
+    hi = power_hat + z * float(np.sqrt(max(power_hat*(1-power_hat),0)/n))
     if lo >= power_target: return "promote"
     if hi <  power_target: return "prune"
     return "gray"
 
-# Stage 0: Deterministic pruning (dominance + implausible final boundary)
 def _stage0_filter(rows_stage0: List[dict], p1: float) -> List[dict]:
     # Implausible final r*
     keep = []
@@ -726,7 +748,6 @@ def _stage0_filter(rows_stage0: List[dict], p1: float) -> List[dict]:
         out.extend([g for g, m in zip(group, marks) if m])
     return out
 
-# Successive-halving racing
 def successive_halving(cands: List[Candidate], schedule: List[Tuple[int,float]], seed_base: int,
                        alpha_target: float) -> List[Candidate]:
     pool = list(cands)
@@ -746,9 +767,6 @@ def successive_halving(cands: List[Candidate], schedule: List[Tuple[int,float]],
         pool = [c for (c, *_ ) in scored[:k]]
     return pool
 
-# -----------------------------------------------------------------------------
-# ===== STAGED WORKFLOW DRIVER =====
-# -----------------------------------------------------------------------------
 def run_staged_workflow(
     N_min, N_max, K_min, K_max,
     p0, p1, a_e, b_e, a_s, b_s, qmax, q1,
@@ -770,14 +788,13 @@ def run_staged_workflow(
     2) Exact α (futility ON)
     3) Exact power
     4) Racing (successive halving)
-    5) Final precise eval (implicit in racing result + later re-eval panel)
     """
-    # ---------- Build initial grid & (fast) calibrate ----------
     rows = []
+    # ---------- Build initial grid & (fast) calibrate ----------
     for N in range(N_min, N_max + 1):
         for K in range(K_min, K_max + 1):
             looks = build_equal_looks(N, K)
-            # Calibration per design (fast mode)
+            # Calibration per design (fast mode for Stage 1)
             if cal_mode.lower().startswith("off"):
                 gamma_used = DEFAULTS["gamma_e"]
                 gamma_vec = None
@@ -822,7 +839,7 @@ def run_staged_workflow(
 
     # ---------- Stage 0: Deterministic pruning ----------
     rows0 = _stage0_filter(rows, p1=p1)
-    # Optional hard N budget filter (but allow surveying above-budget if wanted)
+    # Optional hard N budget filter (but allow surveying near budget)
     if N_budget is not None and N_budget > 0:
         rows0 = [r for r in rows0 if r["N"] <= max(N_budget, N_min)]
 
@@ -844,9 +861,8 @@ def run_staged_workflow(
             )
         gate = _gate_alpha_point(oc_alpha, stage1_nsim, alpha_target, z_early)
         s1.append({**row, "alpha_hat_s1": oc_alpha, "n_s1": stage1_nsim, "gate_s1": gate})
-    # Keep promoted + gray; limit carry to top by optimistic margin
+    # Keep promoted + gray; limit carry
     s1_keep = [r for r in s1 if r["gate_s1"] in ("promote", "gray")]
-    # Rank by optimistic alpha margin (lower is better)
     s1_keep.sort(key=lambda r: (r["alpha_hat_s1"], r["N"]))
     s1_keep = s1_keep[:max(1, carry_limit_stage1)]
 
@@ -870,7 +886,6 @@ def run_staged_workflow(
         s2.append({**row, "alpha_hat_s2": float(oc["alpha"]), "n_s2": stage2_alpha_nsim,
                    "ESS_p0_s2": float(oc["ess_p0"]), "gate_s2": gate})
     s2_keep = [r for r in s2 if r["gate_s2"] in ("promote", "gray")]
-    # limit carry
     s2_keep.sort(key=lambda r: (r["alpha_hat_s2"], r.get("ESS_p0_s2", 1e9)))
     s2_keep = s2_keep[:max(1, carry_limit_stage2)]
 
@@ -898,7 +913,6 @@ def run_staged_workflow(
     s3_keep = s3_keep[:max(1, carry_limit_stage3)]
 
     # ---------- Stage 4: Racing ----------
-    # Initialize candidates
     cands: List[Candidate] = []
     for row in s3_keep:
         N, K, looks = int(row["N"]), int(row["K_interims"]), list(row["looks"])
@@ -921,7 +935,7 @@ def run_staged_workflow(
             r_star_final=c.bounds[looks[-1]]["r_star_final"],
             alpha=c.stats.alpha_mean(), power=c.stats.power_mean(),
             ESS_p0=c.stats.ESS_p0_mean(), ESS_p1=c.stats.ESS_p1_mean(),
-            avg_looks_p1=np.nan,  # (optional to compute path-wise again)
+            avg_looks_p1=np.nan if (np := lazy_numpy()) is not None else np.nan,  # optional
             safety_stop_q1=None, safety_stop_qmax=None,
             meets_alpha=(c.stats.alpha_mean() <= alpha_target),
             meets_power=(c.stats.power_mean() >= power_target),
@@ -942,7 +956,6 @@ def run_staged_workflow(
         df.loc[sweet.index, "selection"] += "\nsweet_spot"
         if N_budget is not None and N_budget > 0:
             under = df[df["N"] <= N_budget]
-            # Require α by default; prefer meeting power target too
             under = under[under["meets_alpha"]]
             pool = under[under["power"] >= power_target]
             if pool.empty: pool = under
@@ -1050,6 +1063,7 @@ with st.sidebar:
         fast_mode_s1 = st.checkbox("Stage 1 calibration uses fast vectorized α", value=True)
         skip_fut_s1 = st.checkbox("Stage 1 calibration skips futility", value=True)
 
+    show_only_feasible = st.checkbox("Show only designs meeting α & power targets", value=False)
     run_btn = st.button("Run search", type="primary")
 
 # -----------------------------------------------------------------------------
@@ -1061,7 +1075,7 @@ with st.expander("📋 Workflow Guide (click to expand)", expanded=False):
     st.markdown("""
 **Recommended workflow**
 - **Classic Grid**: quick scan with small `n_sim`, calibrate fast, then re-run selected rows at high `n_sim`.
-- **Staged Workflow**: let the app prune aggressively with fast α, check α exactly, check power, race the survivors, then re-evaluate finalists precisely.
+- **Staged Workflow**: prune aggressively with fast α, check α exactly, check power, race the survivors, then re-evaluate finalists precisely.
 
 **Tips**
 - Use φ≈1.5–3.0 to make early looks stricter in per-look mode.
@@ -1073,7 +1087,7 @@ st.markdown("---")
 
 # ---- Helpers for plain-language tables ----
 def _fmt_looks(looks):
-    if looks is None or (isinstance(looks, float) and np.isnan(looks)):
+    if looks is None or (isinstance(looks, float) and pd.isna(looks)):
         return "—"
     try:
         return ", ".join(str(int(n)) for n in looks)
@@ -1081,7 +1095,7 @@ def _fmt_looks(looks):
         return str(looks)
 
 def _fmt_gamma_vec(gvec):
-    if gvec is None or (isinstance(gvec, float) and np.isnan(gvec)):
+    if gvec is None or (isinstance(gvec, float) and pd.isna(gvec)):
         return "—"
     try:
         return ", ".join(f"{float(g):.3f}" for g in gvec)
@@ -1093,7 +1107,7 @@ def _fmt_r_by_look(r_by_look):
     r_by_look is a list like [(n1, rmin1), (n2, rmin2), ...]
     Render as: n=10: r≥3; n=20: r≥6; ...
     """
-    if r_by_look is None or (isinstance(r_by_look, float) and np.isnan(r_by_look)):
+    if r_by_look is None or (isinstance(r_by_look, float) and pd.isna(r_by_look)):
         return "—"
     try:
         parts = []
@@ -1120,7 +1134,7 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
         if gv is not None:
             return _fmt_gamma_vec(gv)
         gu = row.get("gamma_e_used", None)
-        if gu is None or (isinstance(gu, float) and np.isnan(gu)):
+        if gu is None or (isinstance(gu, float) and pd.isna(gu)):
             return "—"
         return f"{float(gu):.3f}"
     df["Success threshold(s) γₑ"] = df.apply(_gamma_text_row, axis=1)
@@ -1128,7 +1142,7 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
     # Integer boundaries
     df["Min responses needed at each check"] = df["r_success_by_look"].apply(_fmt_r_by_look)
     df["Final responses needed"] = df["r_star_final"].apply(
-        lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else str(int(x))
+        lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) else str(int(x))
     )
 
     # Operating characteristics (with uncertainty)
@@ -1136,13 +1150,13 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
         df["Type I error (α)"] = df["alpha"].map(lambda x: f"{float(x):.3f}")
     if "alpha_95ci" in df:
         df["α ±95% CI width"] = df["alpha_95ci"].map(
-            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"±{float(x):.3f}"
+            lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"±{float(x):.3f}"
         )
     if "power" in df:
         df["Power"] = df["power"].map(lambda x: f"{float(x):.3f}")
     if "power_95ci" in df:
         df["Power ±95% CI width"] = df["power_95ci"].map(
-            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"±{float(x):.3f}"
+            lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"±{float(x):.3f}"
         )
 
     # Workload / efficiency
@@ -1156,15 +1170,15 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
     # Feasibility tag
     if "is_feasible" in df:
         df["Meets α & power?"] = df["is_feasible"].map({True: "Yes", False: "No"})
-    df["Tag(s)"] = df.get("selection", "").replace({np.nan: ""})
+    df["Tag(s)"] = df.get("selection", "").replace({pd.NA: "", None: ""})
     # Optional safety shown if present
     if "safety_stop_q1" in df:
         df["P(stop for safety \n q₁)"] = df["safety_stop_q1"].map(
-            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
+            lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"{float(x):.3f}"
         )
     if "safety_stop_qmax" in df:
         df["P(stop for safety \n q_max)"] = df["safety_stop_qmax"].map(
-            lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
+            lambda x: "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"{float(x):.3f}"
         )
 
     # Column order
@@ -1249,6 +1263,7 @@ if run_btn:
         alpha_target=float(st.session_state["alpha_target"]),
         power_target=float(st.session_state["power_target"]),
         N_budget=int(st.session_state["N_budget"]),
+        # (phi intentionally NOT included here to avoid double-pass)
     )
     grid_ranges = dict(
         N_min=int(st.session_state["N_min"]), N_max=int(st.session_state["N_max"]),
@@ -1266,6 +1281,7 @@ if run_btn:
             require_alpha_for_high_power=bool(require_alpha_for_high_power),
             cal_mode=mode_key,
             cal_n_sim=int(cal_n_sim),
+            phi=float(phi),              # pass phi explicitly (no double)
             fast_mode=bool(fast_mode),
             skip_fut_cal=bool(skip_fut_cal),
         )
@@ -1282,7 +1298,6 @@ if run_btn:
 
     else:
         # Staged Workflow
-        # Pull staged settings from sidebar
         z_early = float(z_early)
         z_strict = float(z_strict)
         stage1_nsim = int(stage1_nsim)
@@ -1321,7 +1336,7 @@ if run_btn:
         st.warning("No designs survived the filters. Try relaxing gates or widening the grid.")
         st.stop()
 
-    # Add SE / 95% CI if the evaluation had a uniform n_sim (classic), otherwise skip
+    # Add SE / 95% CI if evaluation had a uniform n_sim (classic)
     if search_mode.startswith("Classic"):
         n_used = int(st.session_state["n_sim_v2"])
         df["alpha_se"] = df["alpha"].apply(lambda p: _se(float(p), n_used))
@@ -1329,8 +1344,7 @@ if run_btn:
         df["alpha_95ci"] = df["alpha_se"] * 1.96
         df["power_95ci"] = df["power_se"] * 1.96
 
-    # Optional feasibility filter (toggle above)
-    show_only_feasible = st.session_state.get("show_only_feasible", False)
+    # Optional feasibility filter
     df_view = df[df["is_feasible"]] if show_only_feasible and "is_feasible" in df else df
 
     # -------------------- Summary of Designs (Plain Language) --------------------
@@ -1379,7 +1393,7 @@ if run_btn:
     st.download_button("Download CSV", df.to_csv(index=False).encode(), "bayes_monitor_designs.csv")
     st.markdown("---")
 
-    import altair as alt
+    alt = lazy_altair()
     chart = (
         alt.Chart(df)
         .mark_circle(size=60)
@@ -1426,11 +1440,14 @@ if run_btn:
                     # Show in plain language
                     re_view = re_df.copy()
                     re_view["When we check (patients enrolled)"] = re_view["looks"].apply(_fmt_looks)
-                    re_view["Success threshold(s) γₑ"] = np.where(
-                        re_view.get("gamma_e_vector").notna() if "gamma_e_vector" in re_view else False,
-                        re_view.get("gamma_e_vector", None).apply(_fmt_gamma_vec),
-                        re_view.get("gamma_e_used", None).apply(lambda g: "—" if g is None or (isinstance(g, float) and np.isnan(g)) else f"{float(g):.3f}")
-                    )
+                    re_view["Success threshold(s) γₑ"] = pd.Series([
+                        _fmt_gamma_vec(x) if isinstance(x, (list, tuple)) else (
+                            "—" if x is None or (isinstance(x, float) and pd.isna(x)) else f"{float(x):.3f}"
+                        )
+                        for x in re_df.get("gamma_e_vector", pd.Series([None]*len(re_df))).where(
+                            pd.notna(re_df.get("gamma_e_vector", pd.Series([None]*len(re_df)))), re_df.get("gamma_e_used", pd.Series([None]*len(re_df)))
+                        )
+                    ])
                     re_view = re_view[[
                         "N","K_interims","When we check (patients enrolled)","Success threshold(s) γₑ",
                         "alpha","alpha_95ci","power","power_95ci","ESS_p1","ESS_p0","avg_looks_p1"
@@ -1448,4 +1465,3 @@ if run_btn:
                         re_df.to_csv(index=False).encode(),
                         file_name="reevaluated_designs.csv"
                     )
-
