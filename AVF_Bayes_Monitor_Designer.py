@@ -1,11 +1,12 @@
 # app.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# Rapid screener + deep-dive simulation
+# Rapid screener + deep-dive simulation WITH optional safety monitoring
 #
 # Author: M365 Copilot for Phil
 # Features:
 #  - Wide range of interim schedules: equal-spaced (1..8), custom percentages, or custom absolute Ns.
 #  - Separate posterior success thresholds for interim early success (θ_interim) and final (θ_final).
+#  - Optional safety (toxicity) monitoring via Beta–Binomial rule at interims and final.
 #  - Plotly optional (falls back to Streamlit charts).
 #  - Screening uses small sims with common random numbers; deep-dive uses larger sims.
 
@@ -77,7 +78,6 @@ def beta_binomial_cdf_upper_tail(y_min, m, a, b):
         return 0.0
     ys = np.arange(y_min, m + 1)
     logs = np.array([log_beta_binomial_pmf(int(y), m, a, b) for y in ys])
-    # stabilize with log-sum-exp
     mlog = np.max(logs)
     return float(np.exp(mlog) * np.sum(np.exp(logs - mlog)))
 
@@ -118,59 +118,41 @@ def compute_interim_futility_cutoffs(a0, b0, N_total, looks, p0, theta_final, c_
 
 
 # ----------------------------
-# Simulation engine
+# Simulation engines
 # ----------------------------
 
 def simulate_design(design, p, U):
     """
-    Simulate one design under Bernoulli(p) using shared uniforms U of shape (n_sims, N_total).
-    design dict:
-        - N_total
-        - looks (sorted list of interim sample sizes)
-        - a0, b0
-        - p0
-        - theta_final
-        - theta_interim (used only for early success at interims)
-        - c_futility
-        - allow_early_success (bool)
-        - s_min_final (int)
-        - x_min_to_continue_by_look: dict look_n -> x_min_needed
-    Returns dict with results:
-        - reject_rate
-        - ess
-        - stop_probs_by_look (list aligned with looks)
-        - stop_dist (DataFrame of sample size distribution)
+    Efficacy-only simulation (used in SCREENING for speed).
+    Simulate one design under Bernoulli(p) with shared uniforms U (n_sims x N).
+    Returns reject_rate, ess, stop_dist.
     """
     N = design["N_total"]
     looks = design["looks"]
     a0 = design["a0"]; b0 = design["b0"]
     p0 = design["p0"]; theta_final = design["theta_final"]
-    theta_interim = design.get("theta_interim", theta_final)  # fallback if not present
+    theta_interim = design.get("theta_interim", theta_final)
     c_fut = design["c_futility"]
     allow_early = design["allow_early_success"]
     s_min_final = design["s_min_final"]
     x_min_to_continue = design["x_min_to_continue_by_look"]
 
     n_sims = U.shape[0]
-    # Realizations: successes per subject
     X = (U[:, :N] < p).astype(np.int16)
     cum_x = np.zeros(n_sims, dtype=np.int32)
     n_curr = 0
     active = np.ones(n_sims, dtype=bool)
-    stopped = np.zeros(n_sims, dtype=bool)
     success = np.zeros(n_sims, dtype=bool)
     final_n = np.zeros(n_sims, dtype=np.int32)
-
     stop_by_look_counts = np.zeros(len(looks), dtype=np.int64)
 
-    # Go through interim looks
     for li, look_n in enumerate(looks):
         add = look_n - n_curr
         if add > 0:
             cum_x[active] += np.sum(X[active, n_curr:look_n], axis=1)
             n_curr = look_n
 
-        # Early success (uses theta_interim)
+        # Early success (efficacy)
         if allow_early and active.any():
             a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr)
             post_probs = 1.0 - beta.cdf(p0, a_post, b_post)
@@ -179,7 +161,6 @@ def simulate_design(design, p, U):
                 idx_active = np.where(active)[0]
                 idx = idx_active[early_succ]
                 success[idx] = True
-                stopped[idx] = True
                 final_n[idx] = n_curr
                 active[idx] = False
                 stop_by_look_counts[li] += early_succ.sum()
@@ -187,12 +168,11 @@ def simulate_design(design, p, U):
         if not active.any():
             break
 
-        # Futility stopping (continue only if x >= x_min)
+        # Futility (PPoS continue threshold)
         x_min = x_min_to_continue.get(look_n, None)
         if x_min is None:
             idx = np.where(active)[0]
             if idx.size > 0:
-                stopped[idx] = True
                 final_n[idx] = n_curr
                 active[idx] = False
                 stop_by_look_counts[li] += idx.size
@@ -201,7 +181,6 @@ def simulate_design(design, p, U):
             idx_all_active = np.where(active)[0]
             idx_stop = idx_all_active[~need_continue]
             if idx_stop.size > 0:
-                stopped[idx_stop] = True
                 final_n[idx_stop] = n_curr
                 active[idx_stop] = False
                 stop_by_look_counts[li] += idx_stop.size
@@ -209,7 +188,7 @@ def simulate_design(design, p, U):
         if not active.any():
             break
 
-    # Final look for those still active
+    # Final
     if active.any():
         add = N - n_curr
         if add > 0:
@@ -217,37 +196,162 @@ def simulate_design(design, p, U):
             n_curr = N
         succ_final = (cum_x[active] >= s_min_final)
         idx_active = np.where(active)[0]
-        if np.any(succ_final):
-            success[idx_active[succ_final]] = True
-        stopped[idx_active] = True
+        success[idx_active[succ_final]] = True
         final_n[idx_active] = N
 
     reject_rate = success.mean()
     ess = final_n.mean()
 
-    # Stop distribution
     unique_ns, counts = np.unique(final_n, return_counts=True)
-    stop_dist = pd.DataFrame({
-        "N_stop": unique_ns,
-        "Probability": counts / n_sims
-    }).sort_values("N_stop")
+    stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop")
+
+    return {"reject_rate": float(reject_rate),
+            "ess": float(ess),
+            "stop_probs_by_look": (stop_by_look_counts / n_sims).tolist(),
+            "stop_dist": stop_dist}
+
+
+def simulate_design_with_safety(design, p_eff, p_tox, U_eff, U_tox):
+    """
+    Joint efficacy + safety simulation (used in DEEP DIVE).
+    Safety rule: stop if P(q > q_max | data) >= theta_tox at interims/final.
+    Returns reject_rate (declare efficacy success), ess, safety_stop_prob, stop_dist.
+    """
+    N = design["N_total"]
+    looks = design["looks"]
+    a0 = design["a0"]; b0 = design["b0"]
+    p0 = design["p0"]; theta_final = design["theta_final"]
+    theta_interim = design.get("theta_interim", theta_final)
+    c_fut = design["c_futility"]
+    allow_early = design["allow_early_success"]
+    s_min_final = design["s_min_final"]
+    x_min_to_continue = design["x_min_to_continue_by_look"]
+
+    tox = design.get("safety", None)
+
+    n_sims = U_eff.shape[0]
+    X_eff = (U_eff[:, :N] < p_eff).astype(np.int16)
+    X_tox = (U_tox[:, :N] < p_tox).astype(np.int16) if tox is not None else None
+
+    cum_x = np.zeros(n_sims, dtype=np.int32)
+    cum_t = np.zeros(n_sims, dtype=np.int32) if tox is not None else None
+    n_curr = 0
+    active = np.ones(n_sims, dtype=bool)
+    success = np.zeros(n_sims, dtype=bool)
+    final_n = np.zeros(n_sims, dtype=np.int32)
+    safety_stop_counts = np.zeros(len(looks) + 1, dtype=np.int64)  # per interim + final
+
+    for li, look_n in enumerate(looks):
+        add = look_n - n_curr
+        if add > 0:
+            cum_x[active] += np.sum(X_eff[active, n_curr:look_n], axis=1)
+            if tox is not None:
+                cum_t[active] += np.sum(X_tox[active, n_curr:look_n], axis=1)
+            n_curr = look_n
+
+        # 1) Safety check first
+        if tox is not None and active.any():
+            a_t = tox["a_t0"] + (cum_t[active] if cum_t is not None else 0)
+            b_t = tox["b_t0"] + (n_curr - (cum_t[active] if cum_t is not None else 0))
+            prob_tox_high = 1.0 - beta.cdf(tox["q_max"], a_t, b_t)
+            unsafe = (prob_tox_high >= tox["theta_tox"])
+            if np.any(unsafe):
+                idx_active = np.where(active)[0]
+                idx = idx_active[unsafe]
+                final_n[idx] = n_curr
+                active[idx] = False
+                safety_stop_counts[li] += unsafe.sum()
+
+        if not active.any():
+            break
+
+        # 2) Early efficacy success
+        if allow_early and active.any():
+            a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr)
+            post_probs = 1.0 - beta.cdf(p0, a_post, b_post)
+            early_succ = (post_probs >= theta_interim)
+            if np.any(early_succ):
+                idx_active = np.where(active)[0]
+                idx = idx_active[early_succ]
+                success[idx] = True
+                final_n[idx] = n_curr
+                active[idx] = False
+
+        if not active.any():
+            break
+
+        # 3) Futility by PPoS
+        x_min = x_min_to_continue.get(look_n, None)
+        if x_min is None:
+            idx = np.where(active)[0]
+            if idx.size > 0:
+                final_n[idx] = n_curr
+                active[idx] = False
+        else:
+            need_continue = cum_x[active] >= x_min
+            idx_all_active = np.where(active)[0]
+            idx_stop = idx_all_active[~need_continue]
+            if idx_stop.size > 0:
+                final_n[idx_stop] = n_curr
+                active[idx_stop] = False
+
+        if not active.any():
+            break
+
+    # Final for those still active
+    if active.any():
+        add = N - n_curr
+        if add > 0:
+            cum_x[active] += np.sum(X_eff[active, n_curr:N], axis=1)
+            if tox is not None:
+                cum_t[active] += np.sum(X_tox[active, n_curr:N], axis=1)
+            n_curr = N
+
+        # Safety at final
+        if tox is not None and active.any():
+            a_t = tox["a_t0"] + cum_t[active]
+            b_t = tox["b_t0"] + (n_curr - cum_t[active])
+            prob_tox_high = 1.0 - beta.cdf(tox["q_max"], a_t, b_t)
+            unsafe = (prob_tox_high >= tox["theta_tox"])
+            if np.any(unsafe):
+                idx_active = np.where(active)[0]
+                idx = idx_active[unsafe]
+                final_n[idx] = n_curr
+                active[idx] = False
+                safety_stop_counts[-1] += unsafe.sum()
+
+        # Efficacy final decision
+        if active.any():
+            succ_final = (cum_x[active] >= s_min_final)
+            idx_active = np.where(active)[0]
+            success[idx_active[succ_final]] = True
+            final_n[idx_active] = N
+
+    reject_rate = success.mean()
+    ess = final_n.mean()
+    safety_stop_prob = safety_stop_counts.sum() / n_sims if tox is not None else 0.0
+
+    unique_ns, counts = np.unique(final_n, return_counts=True)
+    stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop")
 
     return {
         "reject_rate": float(reject_rate),
         "ess": float(ess),
-        "stop_probs_by_look": (stop_by_look_counts / n_sims).tolist(),
+        "safety_stop_prob": float(safety_stop_prob),
         "stop_dist": stop_dist
     }
 
 
+# ----------------------------
+# Screening (efficacy-only for speed)
+# ----------------------------
+
 def shortlist_designs(param_grid, n_sims_small, seed, U=None):
     """
     Screen designs quickly using small simulation with common random numbers U.
-    param_grid: list of design parameter dicts (without precomputed cutoffs)
-    Returns DataFrame with key metrics under p0 and p1 and references to full design definitions.
+    Efficacy-only (no safety) to keep this stage fast.
     """
     rng = np.random.default_rng(seed)
-    # Build shared uniforms if not supplied
     if U is None:
         Nmax = max([g["N_total"] for g in param_grid])
         U = rng.uniform(size=(n_sims_small, Nmax))
@@ -266,12 +370,10 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
 
         s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
         if s_min is None:
-            # final criterion impossible to meet; drop
             continue
 
         x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks, p0, theta_final, c_futility)
 
-        # include theta_interim and p1 so deep-dive can reference them safely
         design = dict(
             N_total=N, looks=looks, a0=a0, b0=b0, p0=p0,
             theta_final=theta_final, theta_interim=theta_interim,
@@ -280,7 +382,6 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
             p1=p1
         )
 
-        # Simulate under p0 and p1 using the SAME uniforms for variance reduction
         res_p0 = simulate_design(design, p0, U[:, :N])
         res_p1 = simulate_design(design, p1, U[:, :N])
 
@@ -336,8 +437,9 @@ with st.expander("Assumptions & Notes", expanded=False):
 - **Interim futility**: stop if predictive probability of final success (PPoS) < c_futility.
 - **Predictive probability** is computed **exactly** under Beta–Binomial predictive distribution.
 - **Early success at interims**: if enabled, stop early if P(p > p₀ | data) ≥ **θ_interim** (which can differ from θ_final).
-- Rapid **screening** uses small simulations with **common random numbers**.
-- **Deep dive**: larger simulations on selected candidates for precise operating characteristics.
+- **Safety (optional)**: stop if P(q > q_max | data) ≥ θ_tox at interims/final.
+- Rapid **screening** uses small simulations with **common random numbers** (efficacy-only for speed).
+- **Deep dive**: larger joint simulations (efficacy + safety) for precise operating characteristics.
         """
     )
 
@@ -346,11 +448,11 @@ st.sidebar.header("Design Inputs")
 col_sb1, col_sb2 = st.sidebar.columns(2)
 with col_sb1:
     p0 = st.number_input("Null rate p0", min_value=0.0, max_value=1.0, value=0.20, step=0.01, format="%.2f")
-    a0 = st.number_input("Prior a₀", min_value=0.0, value=1.0, step=0.5)
+    a0 = st.number_input("Prior a₀ (efficacy)", min_value=0.0, value=1.0, step=0.5)
     theta_final = st.number_input("θ_final (posterior threshold at final)", min_value=0.5, max_value=0.999, value=0.95, step=0.01, format="%.3f")
 with col_sb2:
     p1 = st.number_input("Target rate p1", min_value=0.0, max_value=1.0, value=0.40, step=0.01, format="%.2f")
-    b0 = st.number_input("Prior b₀", min_value=0.0, value=1.0, step=0.5)
+    b0 = st.number_input("Prior b₀ (efficacy)", min_value=0.0, value=1.0, step=0.5)
     c_futility = st.number_input("c_futility (PPoS futility cutoff)", min_value=0.0, max_value=0.5, value=0.05, step=0.01, format="%.3f")
 
 allow_early_success = st.sidebar.checkbox("Allow early success at interims", value=False)
@@ -359,6 +461,20 @@ theta_interim = st.sidebar.number_input(
     min_value=0.5, max_value=0.999, value=float(theta_final), step=0.01, format="%.3f",
     help="Used only if 'Allow early success' is checked."
 )
+
+# ---- Safety monitoring options ----
+st.sidebar.subheader("Safety Monitoring (optional)")
+enable_safety = st.sidebar.checkbox("Enable safety monitoring", value=True)
+if enable_safety:
+    col_s1, col_s2 = st.sidebar.columns(2)
+    with col_s1:
+        a_t0 = st.number_input("Safety prior a_t0", min_value=0.0, value=1.0, step=0.5)
+        q_max = st.number_input("q_max (max acceptable toxicity)", min_value=0.0, max_value=1.0, value=0.15, step=0.01, format="%.2f")
+    with col_s2:
+        b_t0 = st.number_input("Safety prior b_t0", min_value=0.0, value=9.0, step=0.5)
+        theta_tox = st.number_input("θ_tox (toxicity stopping threshold)", min_value=0.5, max_value=0.999, value=0.90, step=0.01, format="%.3f")
+else:
+    a_t0 = b_t0 = q_max = theta_tox = None
 
 # ---- Wider interim look options ----
 st.sidebar.subheader("Interim Look Schedule")
@@ -437,7 +553,6 @@ def look_schedule(N, mode, k_looks=None, perc_str=None, ns_str=None):
         looks = []
     elif mode == "Equal-spaced (k looks)":
         k = int(k_looks or 1)
-        # Interims at roughly i/(k+1) * N (i=1..k)
         looks = [int(np.floor(i * N / (k + 1))) for i in range(1, k + 1)]
     elif mode == "Custom percentages":
         fracs = parse_percent_list(perc_str or "")
@@ -447,7 +562,6 @@ def look_schedule(N, mode, k_looks=None, perc_str=None, ns_str=None):
         looks = ns
     else:
         looks = []
-    # Clean up: 1..N-1, unique, sorted
     looks = [int(min(max(1, l), N - 1)) for l in looks if 0 < l < N]
     looks = sorted(list(dict.fromkeys(looks)))
     return looks
@@ -503,7 +617,7 @@ else:
 
     # Selection for deep dive
     st.write("### 2) Deep Dive on Selected Design")
-    st.caption("Pick a row index from the (filtered) table above for a high-precision simulation and OC plots.")
+    st.caption("Pick a row index from the (filtered) table above for a high-precision joint simulation (efficacy + safety).")
     idx = st.number_input("Row index (0-based from the filtered table above)", min_value=0, value=0, step=1)
 
     # Choose a design row
@@ -526,59 +640,78 @@ else:
         st.write("#### Deep-dive Simulation Settings")
         col_d1, col_d2 = st.columns(2)
         with col_d1:
-            n_sims_deep = st.number_input("Deep-dive sims", min_value=2000, max_value=500000, value=100000, step=5000)
+            n_sims_deep = st.number_input("Deep-dive sims", min_value=2000, max_value=800000, value=150000, step=5000)
         with col_d2:
-            p_grid_min = st.number_input("OC curve p-min", min_value=0.0, max_value=1.0, value=max(0.0, p0 - 0.15), step=0.01)
-            p_grid_max = st.number_input("OC curve p-max", min_value=0.0, max_value=1.0, value=min(1.0, p1 + 0.20), step=0.01)
-        n_grid = st.slider("Number of points on OC grid", min_value=5, max_value=40, value=15, step=1)
-        seed_deep = st.number_input("Deep-dive seed", min_value=1, value=seed + 1, step=1)
+            seed_deep = st.number_input("Deep-dive seed", min_value=1, value=seed + 1, step=1)
 
-        # Design dict from chosen row
-        design = chosen["_design"]
+        # Toxicity scenarios
+        st.write("#### Toxicity scenarios for deep dive")
+        col_q1, col_q2, col_q3 = st.columns(3)
+        with col_q1:
+            q_good = st.number_input("q_good (benign toxicity)", min_value=0.0, max_value=1.0, value=0.10, step=0.01)
+        with col_q2:
+            q_bad = st.number_input("q_bad (concerning toxicity)", min_value=0.0, max_value=1.0, value=0.20, step=0.01)
+        with col_q3:
+            q_for_OC = st.number_input("q_for_OC (toxicity for OC/ESS curves)", min_value=0.0, max_value=1.0, value=0.10, step=0.01)
 
+        # Design dict from chosen row; add safety config from UI
+        design = dict(chosen["_design"])  # copy
+        if enable_safety:
+            design["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
         # Use defensive access so older cached objects don't break
         p0_used = design.get("p0", p0)
         p1_used = design.get("p1", p1)
 
         # Deep-dive simulation
-        if st.button("Run Deep-Dive Simulation", type="primary"):
+        if st.button("Run Deep-Dive Simulation (efficacy + safety)", type="primary"):
             rng = np.random.default_rng(seed_deep)
-            U_deep = rng.uniform(size=(n_sims_deep, design["N_total"]))
+            Ueff = rng.uniform(size=(n_sims_deep, design["N_total"]))
+            Utox = rng.uniform(size=(n_sims_deep, design["N_total"]))
 
-            res_p0 = simulate_design(design, p0_used, U_deep)
-            res_p1 = simulate_design(design, p1_used, U_deep)
+            # Point metrics (with safety if enabled)
+            res_p0_qgood = simulate_design_with_safety(design, p_eff=p0_used, p_tox=q_good, U_eff=Ueff, U_tox=Utox)
+            res_p1_qgood = simulate_design_with_safety(design, p_eff=p1_used, p_tox=q_good, U_eff=Ueff, U_tox=Utox)
+            res_p1_qbad  = simulate_design_with_safety(design, p_eff=p1_used, p_tox=q_bad,  U_eff=Ueff, U_tox=Utox)
 
-            st.write("##### Point Estimates")
-            cols = st.columns(4)
-            cols[0].metric("Type I error @ p0", f"{res_p0['reject_rate']:.3f}")
-            cols[1].metric("Power @ p1", f"{res_p1['reject_rate']:.3f}")
-            cols[2].metric("ESS @ p0", f"{res_p0['ess']:.1f}")
-            cols[3].metric("ESS @ p1", f"{res_p1['ess']:.1f}")
+            st.write("##### Point Estimates (joint, with safety if enabled)")
+            cols = st.columns(5)
+            cols[0].metric("Type I @ p0, q_good", f"{res_p0_qgood['reject_rate']:.3f}")
+            cols[1].metric("Power @ p1, q_good", f"{res_p1_qgood['reject_rate']:.3f}")
+            cols[2].metric("ESS @ p0, q_good", f"{res_p0_qgood['ess']:.1f}")
+            cols[3].metric("ESS @ p1, q_good", f"{res_p1_qgood['ess']:.1f}")
+            if enable_safety:
+                cols[4].metric("Safety stop @ p1, q_bad", f"{res_p1_qbad['safety_stop_prob']:.3f}")
 
-            # Stop dist tables
-            st.write("##### Sample Size Distribution @ p0")
-            st.dataframe(res_p0["stop_dist"])
-            st.write("##### Sample Size Distribution @ p1")
-            st.dataframe(res_p1["stop_dist"])
+            st.write("##### Sample Size Distribution @ p0 (q_good)")
+            st.dataframe(res_p0_qgood["stop_dist"])
+            st.write("##### Sample Size Distribution @ p1 (q_good)")
+            st.dataframe(res_p1_qgood["stop_dist"])
 
-            # OC curves across grid
+            # OC and ESS curves across p with fixed q_for_OC
+            st.write("##### OC & ESS vs efficacy p (with toxicity fixed at q_for_OC)")
+            p_grid_min = st.number_input("OC curve p-min", min_value=0.0, max_value=1.0, value=max(0.0, p0_used - 0.15), step=0.01)
+            p_grid_max = st.number_input("OC curve p-max", min_value=0.0, max_value=1.0, value=min(1.0, p1_used + 0.20), step=0.01)
+            n_grid = st.slider("Number of points on OC grid", min_value=5, max_value=40, value=15, step=1)
+
             ps = np.linspace(p_grid_min, p_grid_max, n_grid)
             oc = []
             ess_curve = []
+            # reuse uniforms for speed/variance reduction
             for pp in ps:
-                r = simulate_design(design, pp, U_deep)
+                r = simulate_design_with_safety(design, p_eff=pp, p_tox=q_for_OC, U_eff=Ueff, U_tox=Utox)
                 oc.append(r["reject_rate"])
                 ess_curve.append(r["ess"])
 
             df_oc = pd.DataFrame({"p": ps, "Reject_Prob": oc, "ESS": ess_curve})
-            plot_lines(df_oc, x="p", y="Reject_Prob", title="Operating Characteristic: P(Declare Success) vs p")
-            plot_lines(df_oc, x="p", y="ESS", title="Expected Sample Size vs p")
+            plot_lines(df_oc, x="p", y="Reject_Prob", title=f"Operating Characteristic: P(Declare Success) vs p (q={q_for_OC:.2f})")
+            plot_lines(df_oc, x="p", y="ESS", title=f"Expected Sample Size vs p (q={q_for_OC:.2f})")
 
             st.write("##### Exportable Design Summary")
             export = dict(
                 N_total=int(design["N_total"]),
                 looks=[int(x) for x in design["looks"]],
-                prior=dict(a0=float(design["a0"]), b0=float(design["b0"])),
+                prior_efficacy=dict(a0=float(design["a0"]), b0=float(design["b0"])),
+                prior_safety=(dict(a_t0=float(a_t0), b_t0=float(b_t0)) if enable_safety else None),
                 null_p0=float(p0_used),
                 target_p1=float(p1_used),
                 theta_final=float(design["theta_final"]),
@@ -587,9 +720,11 @@ else:
                 allow_early_success=bool(design["allow_early_success"]),
                 final_success_min_successes=int(design["s_min_final"]),
                 interim_continue_thresholds={int(k): (None if v is None else int(v)) for k, v in design["x_min_to_continue_by_look"].items()},
+                safety_rule=(dict(q_max=float(q_max), theta_tox=float(theta_tox)) if enable_safety else None),
                 notes=(
-                    "Early success at interim n if P(p>p0|data) ≥ θ_interim. "
-                    "Continue if current successes x ≥ interim threshold; else stop for futility. "
+                    "Safety: stop if P(q>q_max|data) ≥ θ_tox at interims or final; "
+                    "Efficacy: early success if P(p>p0|data) ≥ θ_interim; "
+                    "Futility: stop if PPoS(final success) < c_futility; "
                     "Final success if P(p>p0|final data) ≥ θ_final."
                 )
             )
@@ -599,20 +734,22 @@ st.write("---")
 st.write("### Methodological Details (what the app computes)")
 st.markdown(
     r"""
-- **Posterior**: With prior \(p \sim \text{Beta}(a_0, b_0)\), and data \(X \sim \text{Binomial}(n, p)\),  
+- **Posterior**: With prior \(p \sim \text{Beta}(a_0, b_0)\), and data \(X \sim \text{Binomial}(n, p)\),
   \(p \mid X=x \sim \text{Beta}(a_0 + x,\, b_0 + n - x)\).
 
-- **Final success** requires \(\Pr(p > p_0 \mid a_0+x, b_0+n-x) \ge \theta_{\text{final}}\).  
+- **Final success** requires \(\Pr(p > p_0 \mid a_0+x, b_0+n-x) \ge \theta_{\text{final}}\).
   For fixed \(N\), this gives a **minimum total successes** \(s_{\min}\) at the final look, found via binary search.
 
-- **Predictive probability of success (PPoS)** at interim \(n\) with \(x\) successes:  
-  Let \(m = N - n\) remain. With posterior \(p \mid x \sim \text{Beta}(a_0+x, b_0+n-x)\),  
-  the predictive distribution for future successes \(Y\) is **Beta–Binomial**.  
-  If \(s_{\min}\) is the final boundary, we need \(Y \ge s_{\min}-x\).  
+- **Predictive probability of success (PPoS)** at interim \(n\) with \(x\) successes:
+  Let \(m = N - n\) remain. With posterior \(p \mid x \sim \text{Beta}(a_0+x, b_0+n-x)\),
+  the predictive distribution for future successes \(Y\) is **Beta–Binomial**.
+  If \(s_{\min}\) is the final boundary, we need \(Y \ge s_{\min}-x\).
   Thus \(\mathrm{PPoS} = \Pr(Y \ge s_{\min}-x)\), compared to \(c_{\text{futility}}\).
 
-- **Early success at interims** uses \(\theta_{\text{interim}}\), which can be set different from \(\theta_{\text{final}}\).
+- **Safety**: With prior \(q \sim \text{Beta}(a_{t0}, b_{t0})\), at interims/final we stop
+  if \(\Pr(q > q_{\max} \mid \text{data}) \ge \theta_{\text{tox}}\).
 """
 )
 
-st.caption("Tip: Consider θ_interim ≥ θ_final if you want conservative early success while preserving final sensitivity.")
+st.caption("Tip: If you want the safety rule to be more/less sensitive, adjust θ_tox and/or q_max; you can also strengthen or weaken the safety prior.")
+``
