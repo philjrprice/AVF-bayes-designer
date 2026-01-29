@@ -1,5 +1,5 @@
 # =============================================================================
-# AVF_Bayes_Monitor_Designer.py  (Streamlit-optimized, with α-guard & uncertainty)
+# AVF_Bayes_Monitor_Designer.py  (Streamlit-optimized, with α-calibration & per-look boundaries)
 # =============================================================================
 
 import math
@@ -52,7 +52,7 @@ DEFAULTS = {
     "N_budget": 80,
 
     # Simulation defaults (key speed-up)
-    "n_sim": 1,
+    "n_sim": 1,       # quick-scan by default
     "seed": 12345,
 }
 
@@ -214,7 +214,7 @@ def simulate_one_trial(
 
 
 def evaluate_design(design: Design, n_sim: int = 1, seed: int = 123) -> OperatingCharacteristics:
-    """Default n_sim=1 (widget overrides), supports quick-scan mode."""
+    """Default n_sim=1 for quick-scan; UI overrides for precision."""
     rng = np.random.default_rng(seed)
     bounds = compute_boundaries(design)
 
@@ -284,7 +284,7 @@ def build_equal_looks(N: int, K: int) -> List[int]:
 
 
 # =============================================================================
-# Cached wrappers (massive speedups)
+# Cached wrappers (major performance gains)
 # =============================================================================
 @st.cache_data(show_spinner=True)
 def cached_evaluate(
@@ -303,13 +303,82 @@ def cached_evaluate(
     return oc.__dict__
 
 
+@st.cache_data(show_spinner=False)
+def cached_boundaries(
+    N: int, look_tuple: Tuple[int, ...],
+    a_e: float, b_e: float, p0: float, gamma_e: float,
+    a_s: float, b_s: float, qmax: Optional[float], gamma_s: Optional[float]
+) -> Dict[int, Dict[str, Optional[int]]]:
+    design = Design(
+        N=N, K_interims=len(look_tuple)-1, look_schedule=list(look_tuple),
+        a_e=a_e, b_e=b_e, a_s=a_s, b_s=b_s, p0=p0, p1=p0,  # p1 unused
+        qmax=qmax, q1=None, gamma_e=gamma_e, psi_fut=1.0,  # psi_fut unused
+        gamma_s=gamma_s
+    )
+    return compute_boundaries(design)
+
+
+@st.cache_data(show_spinner=True)
+def cached_calibrate_gamma_single(
+    N: int, K: int, look_tuple: Tuple[int, ...],
+    a_e: float, b_e: float, a_s: float, b_s: float,
+    p0: float, p1: float, qmax: Optional[float], q1: Optional[float],
+    psi_fut: float, gamma_s: Optional[float],
+    alpha_target: float,
+    n_sim_cal: int, seed: int,
+    g_low: float = 0.50, g_high: float = 0.999, tol_alpha: float = 0.005, max_iter: int = 14
+) -> float:
+    """
+    Calibrate a single posterior success threshold gamma_e for (N,K) to achieve alpha <= alpha_target.
+    Bisection on gamma_e using Monte Carlo under p0.
+    Returns gamma_e_star.
+    """
+    # Helper to get alpha at given gamma
+    def alpha_at_gamma(gamma: float) -> float:
+        oc = cached_evaluate(
+            N, K, look_tuple, a_e, b_e, a_s, b_s,
+            p0, p1, qmax, q1, gamma, psi_fut, gamma_s,
+            n_sim_cal, seed + int(gamma*1e6) % 1000000
+        )
+        return float(oc["alpha"])
+
+    lo, hi = g_low, g_high
+    a_lo = alpha_at_gamma(lo)
+    a_hi = alpha_at_gamma(hi)
+
+    # If already within tolerance at hi, return hi (usually stricter)
+    if a_hi <= alpha_target + tol_alpha:
+        return hi
+
+    # If even gamma=lo is too strict (very low alpha), expand low if needed
+    # (rare, but safeguard).
+    if a_lo > alpha_target:
+        # Cannot meet alpha target with this bracket; return midpoint as fallback
+        return max(min((lo + hi) / 2.0, 0.999), 0.5)
+
+    gamma_star = hi
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        a_mid = alpha_at_gamma(mid)
+        if a_mid <= alpha_target + tol_alpha:
+            gamma_star = mid
+            hi = mid  # try to be a bit more lenient for power
+        else:
+            lo = mid
+        if abs(hi - lo) < 1e-3:
+            break
+
+    return float(gamma_star)
+
+
 @st.cache_data(show_spinner=True)
 def cached_grid_search(
     N_min, N_max, K_min, K_max,
     p0, p1, a_e, b_e, a_s, b_s, qmax, q1,
     gamma_e, psi_fut, gamma_s, n_sim, seed,
     alpha_target, power_target, N_budget,
-    require_alpha_for_high_power  # NEW: α guard toggle
+    require_alpha_for_high_power,
+    calibrate_gamma, calibration_n_sim
 ) -> pd.DataFrame:
 
     rows = []
@@ -317,19 +386,42 @@ def cached_grid_search(
         for K in range(K_min, K_max + 1):
             looks = build_equal_looks(N, K)
 
+            gamma_used = gamma_e
+            # Optional calibration: find gamma_e per (N,K) to hit alpha target
+            if calibrate_gamma:
+                gamma_used = cached_calibrate_gamma_single(
+                    N, K, tuple(looks),
+                    a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
+                    psi_fut, gamma_s,
+                    alpha_target=alpha_target,
+                    n_sim_cal=calibration_n_sim, seed=seed + N + K
+                )
+
             oc = cached_evaluate(
                 N, K, tuple(looks),
                 a_e, b_e, a_s, b_s,
                 p0, p1, qmax, q1,
-                gamma_e, psi_fut, gamma_s,
-                n_sim, seed + N + K
+                gamma_used, psi_fut, gamma_s,
+                n_sim, seed + 1000 + N + K
             )
+
+            # Per-look integer boundaries (success minima)
+            bnd = cached_boundaries(
+                N=N, look_tuple=tuple(looks),
+                a_e=a_e, b_e=b_e, p0=p0, gamma_e=gamma_used,
+                a_s=a_s, b_s=b_s, qmax=qmax, gamma_s=gamma_s
+            )
+            r_by_look = [(n, bnd[n]["r_success_min"]) for n in looks]
+            r_final = bnd[looks[-1]]["r_star_final"]
 
             rows.append(
                 dict(
                     N=N,
                     K_interims=K,
                     looks=looks,
+                    gamma_e_used=gamma_used,
+                    r_success_by_look=r_by_look,
+                    r_star_final=r_final,
                     alpha=oc["alpha"],
                     power=oc["power"],
                     ESS_p0=oc["ess_p0"],
@@ -386,7 +478,7 @@ with st.sidebar:
     st.number_input("Efficacy prior alpha aₑ", 0.0, 100.0, DEFAULTS["a_e"], 0.1, key="a_e")
     st.number_input("Efficacy prior beta bₑ", 0.0, 100.0, DEFAULTS["b_e"], 0.1, key="b_e")
 
-    st.number_input("Posterior success threshold γₑ", 0.5, 0.999, DEFAULTS["gamma_e"], 0.01, key="gamma_e")
+    st.number_input("Posterior success threshold γₑ (used only if calibration is OFF)", 0.5, 0.999, DEFAULTS["gamma_e"], 0.01, key="gamma_e")
     st.number_input("Predictive futility threshold ψ", 0.0, 0.5, DEFAULTS["psi_fut"], 0.01, key="psi_fut")
 
     st.divider()
@@ -436,6 +528,20 @@ with st.sidebar:
 
     st.number_input("Random seed", 0, 9999999, DEFAULTS["seed"], 1, key="seed")
 
+    st.divider()
+    st.subheader("Calibration (optional)")
+    calibrate_gamma = st.checkbox(
+        "Calibrate γₑ per (N, K) to achieve α ≤ target",
+        value=False,
+        help="If ON, the app finds a γₑ that meets α target under p0 for each design, "
+             "then reports per-look integer success boundaries."
+    )
+    calibration_n_sim = st.number_input(
+        "Calibration n_sim (per bisection step)",
+        min_value=100, max_value=200000, value=1000, step=100,
+        help="Smaller is faster but noisier; 500–2000 is typical."
+    )
+
     # Optional: show only feasible designs in the summary table
     show_only_feasible = st.checkbox("Show only designs meeting α & power targets", value=False)
 
@@ -449,7 +555,8 @@ st.title("Bayesian Single‑Arm Monitoring Study Designer")
 
 st.info(
     "⚡ **Quick‑Scan Mode:** Default `n_sim = 1`.\n\n"
-    "Set `n_sim` ≥ 2000 for more stable, accurate operating characteristics."
+    "Set `n_sim` ≥ 2000 for more stable, accurate operating characteristics. "
+    "Calibration adds extra simulation; start with a small grid or small calibration n_sim."
 )
 
 st.markdown("---")
@@ -481,13 +588,18 @@ if run_btn:
         power_target=float(st.session_state["power_target"]),
         N_budget=int(st.session_state["N_budget"]),
         require_alpha_for_high_power=require_alpha_for_high_power,
+        calibrate_gamma=bool(calibrate_gamma),
+        calibration_n_sim=int(calibration_n_sim),
     )
 
     num_designs = (params["N_max"] - params["N_min"] + 1) * (params["K_max"] - params["K_min"] + 1)
-    st.write(f"Evaluating ~{num_designs} designs × {params['n_sim']} sims each (cached).")
+    st.write(f"Evaluating ~{num_designs} designs (K∈[{st.session_state['K_min']},{st.session_state['K_max']}]) "
+             f"× {params['n_sim']} sims each (cached).")
+    if calibrate_gamma:
+        st.write(f"Calibration bisections per design use n_sim = {params['calibration_n_sim']} (cached).")
 
-    # Sanity check: show what n_sim is actually used
-    st.caption(f"Running with n_sim = {params['n_sim']}")
+    # Sanity check: show what n_sim is actually used for evaluation
+    st.caption(f"Evaluation n_sim = {params['n_sim']}")
 
     start = time.time()
     with st.spinner("Running grid search..."):
@@ -517,6 +629,7 @@ if run_btn:
         df_view[
             [
                 "selection","is_feasible","N","K_interims","looks",
+                "gamma_e_used","r_star_final","r_success_by_look",
                 "alpha","alpha_se","alpha_95ci",
                 "power","power_se","power_95ci",
                 "ESS_p0","ESS_p1","avg_looks_p1",
@@ -542,6 +655,7 @@ if run_btn:
                 subset[
                     [
                         "N","K_interims","looks",
+                        "gamma_e_used","r_star_final","r_success_by_look",
                         "alpha","alpha_se","alpha_95ci",
                         "power","power_se","power_95ci",
                         "ESS_p1"
@@ -566,7 +680,7 @@ if run_btn:
             x="N:Q",
             y="power:Q",
             color="is_feasible:N",
-            tooltip=["N","K_interims","alpha","power","ESS_p1","alpha_95ci","power_95ci"]
+            tooltip=["N","K_interims","alpha","power","ESS_p1","gamma_e_used"]
         )
         .properties(width=900, height=340)
     )
