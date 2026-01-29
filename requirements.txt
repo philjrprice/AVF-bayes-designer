@@ -1,7 +1,7 @@
 streamlit
 numpy
-pandas
 scipy
-altair
+pandas
+plotly
 
 
