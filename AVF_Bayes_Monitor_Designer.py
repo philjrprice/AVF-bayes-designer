@@ -1,5 +1,5 @@
 # =============================================================================
-# bayes_single_arm_app.py  (Optimized for Streamlit Cloud)
+# bayes_single_arm_app.py  (Optimized for Hugging Face Spaces)
 # =============================================================================
 
 import math
@@ -352,7 +352,7 @@ def cached_grid_search(
         df.loc[smallest.index, "selection"] += "|smallest_N"
         df.loc[sweet.index, "selection"] += "|sweet_spot"
 
-    if N_budget is not None:
+    if N_budget is not None and N_budget > 0:
         under = df[df["N"] <= N_budget]
         if not under.empty:
             best = under.sort_values(["power", "ESS_p1"], ascending=[False, True]).head(3)
@@ -497,7 +497,7 @@ if run_btn:
     )
 
     st.markdown("---")
-    # Quick chart
+    # Quick chart (import altair only when needed)
     import altair as alt
     chart = (
         alt.Chart(df)
