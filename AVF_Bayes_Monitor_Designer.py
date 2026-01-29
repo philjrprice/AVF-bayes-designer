@@ -1249,7 +1249,6 @@ if run_btn:
         alpha_target=float(st.session_state["alpha_target"]),
         power_target=float(st.session_state["power_target"]),
         N_budget=int(st.session_state["N_budget"]),
-        phi=float(phi),
     )
     grid_ranges = dict(
         N_min=int(st.session_state["N_min"]), N_max=int(st.session_state["N_max"]),
@@ -1449,3 +1448,4 @@ if run_btn:
                         re_df.to_csv(index=False).encode(),
                         file_name="reevaluated_designs.csv"
                     )
+
