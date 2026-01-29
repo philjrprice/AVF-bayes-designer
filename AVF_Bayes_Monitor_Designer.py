@@ -79,6 +79,18 @@ DEFAULTS = {
 }
 
 # -----------------------------------------------------------------------------
+# SAFE session_state getter (prevents KeyError on first run)
+# -----------------------------------------------------------------------------
+def ss_get(key: str, default):
+    """
+    Safe session_state getter: returns value if present; otherwise sets and returns default.
+    Use this for all reads of values that may not be initialized yet.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
+
+# -----------------------------------------------------------------------------
 # Data structures
 # -----------------------------------------------------------------------------
 @dataclass
@@ -651,7 +663,8 @@ with st.sidebar:
 
     st.subheader("Stage 4 (racing: successive halving)")
     sched_str = st.text_input("Racing schedule '1000@0.5,2000@0.5,5000@1.0'", "1000@0.5,2000@0.5,5000@1.0")
-    seed = st.number_input("Base RNG seed", 0, 9999999, DEFAULTS["seed"], 1)
+    # 🔧 Fix: bind seed input to session_state and show safe default
+    st.number_input("Base RNG seed", 0, 9999999, ss_get("seed", DEFAULTS["seed"]), 1, key="seed")
 
     st.subheader("Stage 5 (final precise re-evaluation)")
     s5_nsim = st.number_input("Final n_sim for finalists", 1000, 200000, 5000, 500)
@@ -764,6 +777,7 @@ if btn_s0_s1:
             looks = build_equal_looks(N, K)
 
             # Calibration choice
+            base_seed = int(ss_get("seed", DEFAULTS["seed"]))
             if cal_mode.startswith("Off"):
                 gamma_used = float(st.session_state["gamma_e"])
                 gamma_vec = None
@@ -775,7 +789,7 @@ if btn_s0_s1:
                     float(st.session_state["p0"]), float(st.session_state["p1"]),
                     st.session_state.get("qmax"), st.session_state.get("q1"),
                     float(st.session_state["psi_fut"]), st.session_state.get("gamma_s"),
-                    float(st.session_state["alpha_target"]), int(cal_n_sim), int(st.session_state["seed"] + 17*N + 11*K),
+                    float(st.session_state["alpha_target"]), int(cal_n_sim), int(base_seed + 17*N + 11*K),
                     g_low=0.50, g_high=0.999, tol_alpha=0.005,
                     fast_mode=True, skip_futility_during_cal=bool(cal_skip_fut)
                 )
@@ -788,7 +802,7 @@ if btn_s0_s1:
                     float(st.session_state["p0"]), float(st.session_state["p1"]),
                     st.session_state.get("qmax"), st.session_state.get("q1"),
                     float(st.session_state["psi_fut"]), st.session_state.get("gamma_s"),
-                    float(st.session_state["alpha_target"]), int(cal_n_sim), int(st.session_state["seed"] + 23*N + 13*K),
+                    float(st.session_state["alpha_target"]), int(cal_n_sim), int(base_seed + 23*N + 13*K),
                     phi=float(phi), g_low=0.50, g_high=0.999, tol_alpha=0.005,
                     fast_mode=True, skip_futility_during_cal=bool(cal_skip_fut)
                 )
@@ -828,7 +842,8 @@ if btn_s0_s1:
     # Stage 1 vectorized α under p0 (futility skipped)
     survivors = []
     from concurrent.futures import ThreadPoolExecutor
-    seed_base = int(st.session_state["seed"]) + 10000
+    seed_base = int(ss_get("seed", DEFAULTS["seed"])) + 10000
+
     def s1_eval(row):
         N, K, looks = int(row["N"]), int(row["K_interims"]), list(row["looks"])
         design = Design(
@@ -884,7 +899,7 @@ if btn_s2:
     else:
         start = time.time()
         stats = st.session_state.setdefault("stats_store", {})
-        seed_base = int(st.session_state["seed"]) + 20000
+        seed_base = int(ss_get("seed", DEFAULTS["seed"])) + 20000
         survivors = []
         for _, row in st.session_state["stage1_df"].iterrows():
             row = row.to_dict()
@@ -937,7 +952,7 @@ if btn_s3:
     else:
         start = time.time()
         stats = st.session_state.setdefault("stats_store", {})
-        seed_base = int(st.session_state["seed"]) + 30000
+        seed_base = int(ss_get("seed", DEFAULTS["seed"])) + 30000
         source_df = st.session_state["stage2_df"] if "stage2_df" in st.session_state and not st.session_state["stage2_df"].empty else st.session_state["stage1_df"]
         survivors = []
         for _, row in source_df.iterrows():
@@ -1009,7 +1024,7 @@ if btn_s4:
                  else st.session_state["stage1_df"])
         rows_in = [r._asdict() if hasattr(r, "_asdict") else r for _, r in df_src.iterrows()]
         finalists = successive_halving(
-            rows_in, schedule, int(st.session_state["seed"]) + 40000,
+            rows_in, schedule, int(ss_get("seed", DEFAULTS["seed"])) + 40000,
             float(st.session_state["alpha_target"]),
             float(st.session_state["a_e"]), float(st.session_state["b_e"]),
             float(st.session_state.get("a_s") or 0.0), float(st.session_state.get("b_s") or 0.0),
@@ -1058,7 +1073,7 @@ if btn_s5:
         st.warning("Run racing (Stage 4) first, or at least Stage 3.")
     else:
         start = time.time()
-        seed_base = int(st.session_state["seed"]) + 50000
+        seed_base = int(ss_get("seed", DEFAULTS["seed"])) + 50000
         rows = []
         df_src = st.session_state["stage4_df"] if "stage4_df" in st.session_state and not st.session_state["stage4_df"].empty else st.session_state["stage3_df"]
         for i, row in df_src.iterrows():
