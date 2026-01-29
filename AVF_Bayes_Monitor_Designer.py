@@ -2,12 +2,12 @@
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
 # Rapid screener + deep-dive simulation
 #
-# Author: M365 Copilot for Phil (patched with Plotly-optional + deep-dive KeyError fix)
-# Notes:
-#  - Uses Beta-Binomial conjugacy for exact final posterior and predictive probabilities.
-#  - Interim stopping: stop for futility if predictive probability of final success < c_futility.
-#  - Optional early success if posterior >= theta_final at interim.
-#  - Screening uses small sims with common random numbers; deep-dive uses larger sims as requested.
+# Author: M365 Copilot for Phil
+# Features:
+#  - Wide range of interim schedules: equal-spaced (1..8), custom percentages, or custom absolute Ns.
+#  - Separate posterior success thresholds for interim early success (θ_interim) and final (θ_final).
+#  - Plotly optional (falls back to Streamlit charts).
+#  - Screening uses small sims with common random numbers; deep-dive uses larger sims.
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
+
 
 # ----------------------------
 # Core math utilities
@@ -115,6 +116,7 @@ def compute_interim_futility_cutoffs(a0, b0, N_total, looks, p0, theta_final, c_
         cutoffs[n] = None if ans == n + 1 else int(ans)
     return cutoffs
 
+
 # ----------------------------
 # Simulation engine
 # ----------------------------
@@ -128,6 +130,7 @@ def simulate_design(design, p, U):
         - a0, b0
         - p0
         - theta_final
+        - theta_interim (used only for early success at interims)
         - c_futility
         - allow_early_success (bool)
         - s_min_final (int)
@@ -142,6 +145,7 @@ def simulate_design(design, p, U):
     looks = design["looks"]
     a0 = design["a0"]; b0 = design["b0"]
     p0 = design["p0"]; theta_final = design["theta_final"]
+    theta_interim = design.get("theta_interim", theta_final)  # fallback if not present
     c_fut = design["c_futility"]
     allow_early = design["allow_early_success"]
     s_min_final = design["s_min_final"]
@@ -166,11 +170,11 @@ def simulate_design(design, p, U):
             cum_x[active] += np.sum(X[active, n_curr:look_n], axis=1)
             n_curr = look_n
 
-        # Early success (optional)
+        # Early success (uses theta_interim)
         if allow_early and active.any():
             a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr)
             post_probs = 1.0 - beta.cdf(p0, a_post, b_post)
-            early_succ = (post_probs >= theta_final)
+            early_succ = (post_probs >= theta_interim)
             if np.any(early_succ):
                 idx_active = np.where(active)[0]
                 idx = idx_active[early_succ]
@@ -183,10 +187,9 @@ def simulate_design(design, p, U):
         if not active.any():
             break
 
-        # Futility stopping
+        # Futility stopping (continue only if x >= x_min)
         x_min = x_min_to_continue.get(look_n, None)
         if x_min is None:
-            # never continue -> everyone stops (if still active)
             idx = np.where(active)[0]
             if idx.size > 0:
                 stopped[idx] = True
@@ -236,6 +239,7 @@ def simulate_design(design, p, U):
         "stop_dist": stop_dist
     }
 
+
 def shortlist_designs(param_grid, n_sims_small, seed, U=None):
     """
     Screen designs quickly using small simulation with common random numbers U.
@@ -257,6 +261,7 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
         a0 = g["a0"]; b0 = g["b0"]
         p0 = g["p0"]; p1 = g["p1"]
         theta_final = g["theta_final"]; c_futility = g["c_futility"]
+        theta_interim = g.get("theta_interim", theta_final)
         allow_early = g["allow_early_success"]
 
         s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
@@ -266,13 +271,12 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
 
         x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks, p0, theta_final, c_futility)
 
-        # NOTE: include p1 so deep-dive can reference it safely
+        # include theta_interim and p1 so deep-dive can reference them safely
         design = dict(
             N_total=N, looks=looks, a0=a0, b0=b0, p0=p0,
-            theta_final=theta_final, c_futility=c_futility,
-            allow_early_success=allow_early,
-            s_min_final=s_min,
-            x_min_to_continue_by_look=x_min_to_continue,
+            theta_final=theta_final, theta_interim=theta_interim,
+            c_futility=c_futility, allow_early_success=allow_early,
+            s_min_final=s_min, x_min_to_continue_by_look=x_min_to_continue,
             p1=p1
         )
 
@@ -284,6 +288,7 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
             "N_total": N,
             "looks": looks,
             "theta_final": theta_final,
+            "theta_interim": theta_interim,
             "c_futility": c_futility,
             "allow_early_success": allow_early,
             "Type I error @ p0": res_p0["reject_rate"],
@@ -299,6 +304,7 @@ def shortlist_designs(param_grid, n_sims_small, seed, U=None):
     df = pd.DataFrame(rows)
     return df, designs_built
 
+
 # ----------------------------
 # Plotting helper (Plotly or fallback)
 # ----------------------------
@@ -311,6 +317,7 @@ def plot_lines(df, x, y, title):
         st.subheader(title)
         chart_df = df[[x, y]].set_index(x)
         st.line_chart(chart_df)
+
 
 # ----------------------------
 # Streamlit UI
@@ -328,9 +335,9 @@ with st.expander("Assumptions & Notes", expanded=False):
 - **Final decision**: declare success if P(p > p₀ | data) ≥ θ_final.
 - **Interim futility**: stop if predictive probability of final success (PPoS) < c_futility.
 - **Predictive probability** is computed **exactly** under Beta–Binomial predictive distribution.
-- Optional **early success**: stop early if P(p > p₀ | data) ≥ θ_final at an interim.
-- Rapid **screening** uses small simulations with **common random numbers** to compare many designs cheaply.
-- **Deep dive**: run larger simulations on selected candidates for precise operating characteristics.
+- **Early success at interims**: if enabled, stop early if P(p > p₀ | data) ≥ **θ_interim** (which can differ from θ_final).
+- Rapid **screening** uses small simulations with **common random numbers**.
+- **Deep dive**: larger simulations on selected candidates for precise operating characteristics.
         """
     )
 
@@ -340,58 +347,123 @@ col_sb1, col_sb2 = st.sidebar.columns(2)
 with col_sb1:
     p0 = st.number_input("Null rate p0", min_value=0.0, max_value=1.0, value=0.20, step=0.01, format="%.2f")
     a0 = st.number_input("Prior a₀", min_value=0.0, value=1.0, step=0.5)
-    theta_final = st.number_input("θ_final (posterior threshold)", min_value=0.5, max_value=0.999, value=0.95, step=0.01, format="%.3f")
+    theta_final = st.number_input("θ_final (posterior threshold at final)", min_value=0.5, max_value=0.999, value=0.95, step=0.01, format="%.3f")
 with col_sb2:
     p1 = st.number_input("Target rate p1", min_value=0.0, max_value=1.0, value=0.40, step=0.01, format="%.2f")
     b0 = st.number_input("Prior b₀", min_value=0.0, value=1.0, step=0.5)
     c_futility = st.number_input("c_futility (PPoS futility cutoff)", min_value=0.0, max_value=0.5, value=0.05, step=0.01, format="%.3f")
 
 allow_early_success = st.sidebar.checkbox("Allow early success at interims", value=False)
+theta_interim = st.sidebar.number_input(
+    "θ_interim (posterior threshold at interims)",
+    min_value=0.5, max_value=0.999, value=float(theta_final), step=0.01, format="%.3f",
+    help="Used only if 'Allow early success' is checked."
+)
 
-st.sidebar.subheader("Screening Grid")
-N_min, N_max = st.sidebar.slider("Total N range", min_value=10, max_value=200, value=(30, 90), step=1)
-N_step = st.sidebar.number_input("N step", min_value=1, max_value=20, value=5, step=1)
-looks_choice = st.sidebar.selectbox(
-    "Interim look scheme",
+# ---- Wider interim look options ----
+st.sidebar.subheader("Interim Look Schedule")
+
+looks_mode = st.sidebar.selectbox(
+    "Choose interim look mode",
     options=[
         "None (final only)",
-        "1 interim at 50%",
-        "2 interims at 33% & 67%"
+        "Equal-spaced (k looks)",
+        "Custom percentages",
+        "Custom absolute Ns"
     ],
     index=1
 )
 
-n_sims_small = st.sidebar.number_input("Screening sims per design", min_value=100, max_value=100000, value=5000, step=500)
+k_looks = None
+perc_str = None
+ns_str = None
+if looks_mode == "Equal-spaced (k looks)":
+    k_looks = st.sidebar.slider("Number of interims (k)", min_value=1, max_value=8, value=2, step=1,
+                                help="Interims at ~i/(k+1) of N, e.g., k=2 → ~33% and ~67%.")
+elif looks_mode == "Custom percentages":
+    perc_str = st.sidebar.text_input("Interim percentages (comma-separated)", value="33,67",
+                                     help="Example: 25,50,75")
+elif looks_mode == "Custom absolute Ns":
+    ns_str = st.sidebar.text_input("Interim Ns (comma-separated)", value="",
+                                   help="Example: 20,40 (must be < N)")
+
+# Screening controls
+st.sidebar.subheader("Screening Grid")
+N_min, N_max = st.sidebar.slider("Total N range", min_value=10, max_value=400, value=(30, 120), step=1)
+N_step = st.sidebar.number_input("N step", min_value=1, max_value=50, value=5, step=1)
+
+n_sims_small = st.sidebar.number_input("Screening sims per design", min_value=100, max_value=200000, value=5000, step=500)
 alpha_max = st.sidebar.number_input("Max Type I error (α) allowed", min_value=0.0, max_value=0.5, value=0.10, step=0.01, format="%.2f")
 power_min = st.sidebar.number_input("Min Power at p1", min_value=0.0, max_value=1.0, value=0.80, step=0.01, format="%.2f")
 seed = st.sidebar.number_input("Random seed", min_value=1, value=2026, step=1)
 
+
 # Build candidate grid
 Ns = list(range(N_min, N_max + 1, N_step))
-def look_schedule(N, scheme):
-    if scheme == "None (final only)":
+
+def parse_percent_list(s):
+    if not s:
+        return []
+    vals = []
+    for tok in s.split(","):
+        tok = tok.strip().replace("%", "")
+        if tok == "":
+            continue
+        try:
+            v = float(tok) / 100.0
+            if np.isfinite(v):
+                vals.append(v)
+        except Exception:
+            pass
+    return vals
+
+def parse_n_list(s):
+    if not s:
+        return []
+    vals = []
+    for tok in s.split(","):
+        tok = tok.strip()
+        if tok == "":
+            continue
+        try:
+            v = int(round(float(tok)))
+            vals.append(v)
+        except Exception:
+            pass
+    return vals
+
+def look_schedule(N, mode, k_looks=None, perc_str=None, ns_str=None):
+    if mode == "None (final only)":
         looks = []
-    elif scheme == "1 interim at 50%":
-        looks = [int(np.floor(0.5 * N))]
-    elif scheme == "2 interims at 33% & 67%":
-        looks = [int(np.floor(0.33 * N)), int(np.floor(0.67 * N))]
-        looks = sorted(list({min(max(1, l), N - 1) for l in looks if 0 < l < N}))
+    elif mode == "Equal-spaced (k looks)":
+        k = int(k_looks or 1)
+        # Interims at roughly i/(k+1) * N (i=1..k)
+        looks = [int(np.floor(i * N / (k + 1))) for i in range(1, k + 1)]
+    elif mode == "Custom percentages":
+        fracs = parse_percent_list(perc_str or "")
+        looks = [int(np.floor(f * N)) for f in fracs]
+    elif mode == "Custom absolute Ns":
+        ns = parse_n_list(ns_str or "")
+        looks = ns
     else:
         looks = []
-    looks = [l for l in looks if l < N]
-    return sorted(list(dict.fromkeys(looks)))
+    # Clean up: 1..N-1, unique, sorted
+    looks = [int(min(max(1, l), N - 1)) for l in looks if 0 < l < N]
+    looks = sorted(list(dict.fromkeys(looks)))
+    return looks
 
 param_grid = []
 for N in Ns:
-    looks = look_schedule(N, looks_choice)
+    looks = look_schedule(N, looks_mode, k_looks=k_looks, perc_str=perc_str, ns_str=ns_str)
     param_grid.append({
         "N_total": N,
         "looks": looks,
         "a0": a0,
         "b0": b0,
         "p0": p0,
-        "p1": p1,  # ensure p1 is present in grid items
+        "p1": p1,
         "theta_final": theta_final,
+        "theta_interim": float(theta_interim),
         "c_futility": c_futility,
         "allow_early_success": allow_early_success
     })
@@ -443,8 +515,9 @@ else:
 
     if chosen is not None:
         st.write("**Chosen design**")
-        show_cols = ["N_total", "looks", "theta_final", "c_futility", "allow_early_success",
-                     "Type I error @ p0", "Power @ p1", "ESS @ p0", "ESS @ p1", "s_min_final"]
+        show_cols = ["N_total", "looks", "theta_final", "theta_interim", "c_futility",
+                     "allow_early_success", "Type I error @ p0", "Power @ p1",
+                     "ESS @ p0", "ESS @ p1", "s_min_final"]
         st.json({k: (int(chosen[k]) if isinstance(chosen[k], (np.integer,)) else chosen.get(k, None)) for k in show_cols})
         st.caption("Interim continue thresholds (x ≥ x_min to continue):")
         st.write(chosen["x_min_to_continue"])
@@ -509,11 +582,16 @@ else:
                 null_p0=float(p0_used),
                 target_p1=float(p1_used),
                 theta_final=float(design["theta_final"]),
+                theta_interim=float(design.get("theta_interim", design["theta_final"])),
                 c_futility=float(design["c_futility"]),
                 allow_early_success=bool(design["allow_early_success"]),
                 final_success_min_successes=int(design["s_min_final"]),
                 interim_continue_thresholds={int(k): (None if v is None else int(v)) for k, v in design["x_min_to_continue_by_look"].items()},
-                notes="Continue at interim n if current successes x >= threshold; else stop for futility."
+                notes=(
+                    "Early success at interim n if P(p>p0|data) ≥ θ_interim. "
+                    "Continue if current successes x ≥ interim threshold; else stop for futility. "
+                    "Final success if P(p>p0|final data) ≥ θ_final."
+                )
             )
             st.code(repr(export), language="python")
 
@@ -528,22 +606,13 @@ st.markdown(
   For fixed \(N\), this gives a **minimum total successes** \(s_{\min}\) at the final look, found via binary search.
 
 - **Predictive probability of success (PPoS)** at interim \(n\) with \(x\) successes:  
-  Let \(m = N - n\) remaining. With posterior \(p \mid x \sim \text{Beta}(a_0+x, b_0+n-x)\),  
-  the predictive distribution for future successes \(Y\) is **Beta–Binomial**: \(Y \sim \text{BB}(m; a_0+x, b_0+n-x)\).  
-  If \(s_{\min}\) is the final boundary, we need \(Y \ge s_{\min} - x\).  
-  Thus  
-  \[
-  \mathrm{PPoS} = \Pr(Y \ge s_{\min}-x) = \sum_{y = s_{\min}-x}^{m} \text{BB}(y; m, a_0+x, b_0+n-x).
-  \]
-  We compare this to \(c_{\text{futility}}\) to decide whether to continue or stop at interim.
+  Let \(m = N - n\) remain. With posterior \(p \mid x \sim \text{Beta}(a_0+x, b_0+n-x)\),  
+  the predictive distribution for future successes \(Y\) is **Beta–Binomial**.  
+  If \(s_{\min}\) is the final boundary, we need \(Y \ge s_{\min}-x\).  
+  Thus \(\mathrm{PPoS} = \Pr(Y \ge s_{\min}-x)\), compared to \(c_{\text{futility}}\).
 
-- **Simulation**: We employ **common random numbers** to evaluate multiple parameter points with shared uniform matrices, improving precision for comparisons without increasing runtime.
-
-- **Screening**: We:
-  1) compute \(s_{\min}\) and interim **x-min continue thresholds** exactly;  
-  2) run a **small simulation** for \(\alpha\), power, and ESS to shortlist designs;  
-  3) then only run **large simulations** for the top candidates.
+- **Early success at interims** uses \(\theta_{\text{interim}}\), which can be set different from \(\theta_{\text{final}}\).
 """
 )
 
-st.caption("Tip: You can adapt this to co-primary endpoints or add safety monitoring by duplicating the machinery for a toxicity rate with its own thresholds.")
+st.caption("Tip: Consider θ_interim ≥ θ_final if you want conservative early success while preserving final sensitivity.")
