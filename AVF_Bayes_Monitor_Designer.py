@@ -4,11 +4,9 @@
 # calibration to Type I error target, fast vectorized calibration, human-friendly tables,
 # and a targeted "Re-evaluate shortlisted designs" panel.
 # =============================================================================
-
 import time
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -28,28 +26,25 @@ DEFAULTS = {
     "p1": 0.40,
     "a_e": 1.0,
     "b_e": 1.0,
-    "gamma_e": 0.95,          # used when calibration = Off or Single-γe mode
-    "psi_fut": 0.05,          # predictive futility threshold
+    "gamma_e": 0.95,  # used when calibration = Off or Single-γe mode
+    "psi_fut": 0.05,  # predictive futility threshold
     "enable_safety": True,
     "qmax": 0.30,
     "q1": 0.15,
     "a_s": 1.0,
     "b_s": 1.0,
     "gamma_s": 0.90,
-
     # Grid
     "N_min": 30,
     "N_max": 120,
     "K_min": 0,
     "K_max": 4,
-
     # Targets
     "alpha_target": 0.10,
     "power_target": 0.80,
     "N_budget": 80,
-
     # Simulation
-    "n_sim": 1,               # quick-scan by default
+    "n_sim": 1,  # quick-scan by default
     "seed": 12345,
 }
 
@@ -72,9 +67,8 @@ class Design:
     psi_fut: float
     gamma_s: Optional[float]
     # Efficacy thresholds:
-    gamma_e: Optional[float] = None                  # single threshold (legacy)
-    gamma_e_vector: Optional[List[float]] = None     # per-look thresholds
-
+    gamma_e: Optional[float] = None  # single threshold (legacy)
+    gamma_e_vector: Optional[List[float]] = None  # per-look thresholds
 
 @dataclass
 class OperatingCharacteristics:
@@ -157,6 +151,7 @@ def compute_boundaries(design: Design) -> Dict[int, Dict[str, Optional[int]]]:
         t_safety_min = None
         if design.qmax is not None and design.gamma_s is not None:
             t_safety_min = safety_stop_threshold(n, design.qmax, design.a_s, design.b_s, design.gamma_s)
+
         bounds[n] = {"r_success_min": r_success_min, "t_safety_min": t_safety_min, "r_star_final": r_star_final}
     return bounds
 
@@ -175,7 +170,6 @@ def simulate_one_trial(
     N = design.N
     responses = rng.binomial(1, true_p, N)
     tox = rng.binomial(1, true_q, N) if (true_q is not None) else np.zeros(N, dtype=int)
-
     looks_used = 0
     for n in design.look_schedule:
         r = int(np.sum(responses[:n]))
@@ -235,7 +229,6 @@ def evaluate_design(
     if design.qmax is not None and design.q1 is not None:
         res_q1 = [simulate_one_trial(design, design.p1, design.q1, bounds, rng, skip_futility) for _ in range(n_sim)]
         safety_stop_prob_q1 = float(np.mean([sf for (_, _, sf, _) in res_q1]))
-
         res_qmax = [simulate_one_trial(design, design.p1, design.qmax, bounds, rng, skip_futility) for _ in range(n_sim)]
         safety_stop_prob_qmax = float(np.mean([sf for (_, _, sf, _) in res_qmax]))
 
@@ -259,9 +252,13 @@ def vectorized_alpha_under_p0(
     design: Design, n_sim: int, seed: int, skip_futility: bool = True
 ) -> float:
     """
-    Fast approximate α estimation under p0 (and q1 for safety).
-    Uses vectorized arrays; futility can be skipped for speed (conservative for calibration).
+    Fast α estimation under p0 (and q1 for safety).
+    If skip_futility is False, fall back to exact simulator to respect futility stops.
     """
+    if not skip_futility:
+        oc = evaluate_design(design, n_sim=n_sim, seed=seed, skip_futility=False)
+        return float(oc.alpha)
+
     rng = np.random.default_rng(seed)
     N = design.N
     looks = design.look_schedule
@@ -276,7 +273,6 @@ def vectorized_alpha_under_p0(
     tox = None
     if design.q1 is not None and design.qmax is not None and design.gamma_s is not None:
         tox = rng.binomial(1, design.q1, size=(n_sim, N))
-
     cum_r = np.cumsum(resp, axis=1).astype(int)
     cum_t = np.cumsum(tox, axis=1).astype(int) if tox is not None else None
 
@@ -299,7 +295,7 @@ def vectorized_alpha_under_p0(
         success[got_success] = True
         active[got_success] = False
 
-        # Futility skipped during calibration for speed
+        # (Futility is intentionally skipped in vectorized fast mode)
         if n == N:
             break
 
@@ -378,8 +374,8 @@ def cached_boundaries_for_design(
 def perlook_gamma_vector_from_final(gamma_final: float, L: int, phi: float) -> List[float]:
     """
     Construct per-look posterior thresholds:
-        gamma_l = 1 - (1 - gamma_final) * s_l
-        with s_l = (l/L)^phi, l = 1..L (final l=L gives s_L=1 => gamma_L=gamma_final).
+    gamma_l = 1 - (1 - gamma_final) * s_l
+    with s_l = (l/L)^phi, l = 1..L (final l=L gives s_L=1 => gamma_L=gamma_final).
     phi >= 1 makes early looks stricter (O'Brien-Fleming-like as phi grows).
     """
     idx = np.arange(1, L + 1, dtype=float)
@@ -396,33 +392,65 @@ def cached_calibrate_single_gamma(
     g_low: float = 0.50, g_high: float = 0.999, tol_alpha: float = 0.005, max_iter: int = 14,
     fast_mode: bool = True, skip_futility_during_cal: bool = True
 ) -> float:
-    """Bisection on a single posterior threshold gamma_e to achieve alpha <= target."""
-    def alpha_at_gamma(gamma: float) -> float:
-        if fast_mode:
+    """
+    Calibrate a single posterior success threshold γₑ to control α.
+    Returns the minimal γₑ such that α ≤ target (within tol).
+    If fast_mode or skip_futility_during_cal is True, performs a small exact refinement around the fast solution.
+    """
+    def alpha_at_gamma(gamma: float, fast: bool = True) -> float:
+        if fast:
             d = Design(N, K, list(look_tuple), a_e, b_e, a_s, b_s, p0, p1, qmax, q1, psi_fut, gamma_s, gamma_e=gamma)
-            return vectorized_alpha_under_p0(d, n_sim=n_sim_cal, seed=seed + int(gamma * 1e6) % 1000000,
-                                             skip_futility=skip_futility_during_cal)
-        oc = cached_evaluate_single(N, K, look_tuple, a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
-                                    gamma, psi_fut, gamma_s, n_sim_cal, seed + int(gamma*1e6)%1000000,
-                                    skip_futility_during_cal)
+            if not skip_futility_during_cal:
+                oc = evaluate_design(d, n_sim=n_sim_cal, seed=seed + int(gamma*1e6)%1000000, skip_futility=False)
+                return float(oc.alpha)
+            return vectorized_alpha_under_p0(
+                d, n_sim=n_sim_cal,
+                seed=seed + int(gamma * 1e6) % 1000000,
+                skip_futility=True
+            )
+        # exact
+        oc = cached_evaluate_single(
+            N, K, look_tuple, a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
+            gamma, psi_fut, gamma_s, n_sim_cal,
+            seed + int(gamma*1e6)%1000000,
+            skip_futility=False
+        )
         return float(oc["alpha"])
 
     lo, hi = g_low, g_high
-    if alpha_at_gamma(hi) <= alpha_target + tol_alpha:
-        return hi
+    a_lo = alpha_at_gamma(lo, fast=fast_mode)
+    a_hi = alpha_at_gamma(hi, fast=fast_mode)
 
-    gamma_star = hi
-    for _ in range(max_iter):
-        mid = 0.5 * (lo + hi)
-        a_mid = alpha_at_gamma(mid)
-        if a_mid <= alpha_target + tol_alpha:
-            gamma_star = mid
-            hi = mid
-        else:
-            lo = mid
-        if abs(hi - lo) < 1e-3:
-            break
-    return float(gamma_star)
+    if a_lo <= alpha_target + tol_alpha:
+        gamma_fast = float(lo)
+    elif a_hi > alpha_target + tol_alpha:
+        gamma_fast = float(hi)
+    else:
+        # Bisection to minimal γ that satisfies α
+        for _ in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            a_mid = alpha_at_gamma(mid, fast=fast_mode)
+            if a_mid <= alpha_target + tol_alpha:
+                hi = mid
+            else:
+                lo = mid
+            if abs(hi - lo) < 1e-3:
+                break
+        gamma_fast = float(hi)
+
+    # Exact refinement around the fast solution if needed
+    if fast_mode or skip_futility_during_cal:
+        window = 0.03
+        grid = np.linspace(max(g_low, gamma_fast - window), min(g_high, gamma_fast + window), 7)
+        feasible = []
+        for g in grid:
+            a = alpha_at_gamma(float(g), fast=False)
+            feasible.append((g, a))
+        # Choose minimal γ with α ≤ target+tol; if none, keep gamma_fast
+        good = [g for (g, a) in feasible if a <= alpha_target + tol_alpha]
+        if len(good) > 0:
+            return float(min(good))
+    return float(gamma_fast)
 
 @st.cache_data(show_spinner=True)
 def cached_calibrate_perlook_gamma(
@@ -435,40 +463,72 @@ def cached_calibrate_perlook_gamma(
     fast_mode: bool = True, skip_futility_during_cal: bool = True
 ) -> Tuple[float, Tuple[float, ...]]:
     """
-    Calibrate per-look thresholds by bisection on gamma_final, gamma_vec derived via phi.
-    Returns (gamma_final_star, gamma_vec_star).
+    Calibrate per-look thresholds by bisection on γ_final; γ vector derived via φ.
+    Returns (γ_final*, γ_vec*), with γ_final* being the minimal value that controls α (within tol).
+    Performs an exact refinement around the fast solution when fast_mode or skip_futility_during_cal is True.
     """
     L = len(look_tuple)
 
-    def alpha_at_gamma_final(gamma_final: float) -> float:
+    def alpha_at_gamma_final(gamma_final: float, fast: bool = True) -> float:
         gamma_vec = tuple(perlook_gamma_vector_from_final(gamma_final, L, phi))
-        if fast_mode:
+        if fast:
             d = Design(N, K, list(look_tuple), a_e, b_e, a_s, b_s, p0, p1, qmax, q1, psi_fut, gamma_s,
                        gamma_e=None, gamma_e_vector=list(gamma_vec))
-            return vectorized_alpha_under_p0(d, n_sim=n_sim_cal, seed=seed + int(gamma_final*1e6)%1000000,
-                                             skip_futility=skip_futility_during_cal)
-        oc = cached_evaluate_vector(N, K, look_tuple, a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
-                                    gamma_vec, psi_fut, gamma_s, n_sim_cal,
-                                    seed + int(gamma_final*1e6)%1000000, skip_futility_during_cal)
+            if not skip_futility_during_cal:
+                oc = evaluate_design(d, n_sim=n_sim_cal, seed=seed + int(gamma_final*1e6)%1000000, skip_futility=False)
+                return float(oc.alpha)
+            return vectorized_alpha_under_p0(
+                d, n_sim=n_sim_cal,
+                seed=seed + int(gamma_final*1e6) % 1000000,
+                skip_futility=True
+            )
+        # exact
+        oc = cached_evaluate_vector(
+            N, K, look_tuple, a_e, b_e, a_s, b_s, p0, p1, qmax, q1,
+            tuple(perlook_gamma_vector_from_final(gamma_final, L, phi)),
+            psi_fut, gamma_s, n_sim_cal,
+            seed + int(gamma_final*1e6)%1000000,
+            skip_futility=False
+        )
         return float(oc["alpha"])
 
     lo, hi = g_low, g_high
-    if alpha_at_gamma_final(hi) <= alpha_target + tol_alpha:
-        return hi, tuple(perlook_gamma_vector_from_final(hi, L, phi))
+    a_lo = alpha_at_gamma_final(lo, fast=fast_mode)
+    a_hi = alpha_at_gamma_final(hi, fast=fast_mode)
 
-    gamma_star = hi
-    for _ in range(max_iter):
-        mid = 0.5 * (lo + hi)
-        a_mid = alpha_at_gamma_final(mid)
-        if a_mid <= alpha_target + tol_alpha:
-            gamma_star = mid
-            hi = mid
-        else:
-            lo = mid
-        if abs(hi - lo) < 1e-3:
-            break
+    if a_lo <= alpha_target + tol_alpha:
+        gamma_fast = float(lo)
+        gamma_vec_fast = tuple(perlook_gamma_vector_from_final(gamma_fast, L, phi))
+    elif a_hi > alpha_target + tol_alpha:
+        gamma_fast = float(hi)
+        gamma_vec_fast = tuple(perlook_gamma_vector_from_final(gamma_fast, L, phi))
+    else:
+        # Bisection to minimal γ_final that satisfies α
+        for _ in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            a_mid = alpha_at_gamma_final(mid, fast=fast_mode)
+            if a_mid <= alpha_target + tol_alpha:
+                hi = mid
+            else:
+                lo = mid
+            if abs(hi - lo) < 1e-3:
+                break
+        gamma_fast = float(hi)
+        gamma_vec_fast = tuple(perlook_gamma_vector_from_final(gamma_fast, L, phi))
 
-    return float(gamma_star), tuple(perlook_gamma_vector_from_final(float(gamma_star), L, phi))
+    # Exact refinement around the fast solution if needed
+    if fast_mode or skip_futility_during_cal:
+        window = 0.03
+        grid = np.linspace(max(g_low, gamma_fast - window), min(g_high, gamma_fast + window), 7)
+        best_gamma = None
+        for g in grid:
+            a = alpha_at_gamma_final(float(g), fast=False)
+            if a <= alpha_target + tol_alpha:
+                best_gamma = g if best_gamma is None else min(best_gamma, g)
+        if best_gamma is not None:
+            return float(best_gamma), tuple(perlook_gamma_vector_from_final(float(best_gamma), L, phi))
+
+    return float(gamma_fast), gamma_vec_fast
 
 # -----------------------------------------------------------------------------
 # Grid search (supports Off / Single-γe / Per-look-γe modes)
@@ -481,13 +541,12 @@ def cached_grid_search(
     n_sim, seed,
     alpha_target, power_target, N_budget,
     require_alpha_for_high_power,
-    cal_mode: str,            # "off" | "single" | "per_look"
+    cal_mode: str,  # "off" \ "single" \ "per_look"
     cal_n_sim: int,
-    phi: float,               # used only in per_look mode
+    phi: float,  # used only in per_look mode
     fast_mode: bool,
     skip_fut_cal: bool
 ) -> pd.DataFrame:
-
     rows = []
     for N in range(N_min, N_max + 1):
         for K in range(K_min, K_max + 1):
@@ -515,7 +574,7 @@ def cached_grid_search(
                 gamma_used = gamma_final_star
                 gamma_vec = gamma_vec_star
 
-            # Evaluate with chosen thresholds (using futility as configured)
+            # Evaluate with chosen thresholds (using futility in evaluation)
             if gamma_vec is not None:
                 oc = cached_evaluate_vector(
                     N, K, tuple(looks),
@@ -566,16 +625,21 @@ def cached_grid_search(
     if not feasible.empty:
         smallest = feasible.sort_values(["N", "K_interims", "ESS_p1"]).head(3)
         sweet = feasible.sort_values(["ESS_p1", "N", "alpha"]).head(3)
-        df.loc[smallest.index, "selection"] += "|smallest_N"
-        df.loc[sweet.index, "selection"] += "|sweet_spot"
+        df.loc[smallest.index, "selection"] += "\nsmallest_N"
+        df.loc[sweet.index, "selection"] += "\nsweet_spot"
 
+    # Revised "High power" tagging: prefer designs meeting the power target within N_budget
     if N_budget is not None and N_budget > 0:
         under = df[df["N"] <= N_budget]
         if require_alpha_for_high_power:
             under = under[under["meets_alpha"]]
-        if not under.empty:
-            best = under.sort_values(["power", "ESS_p1"], ascending=[False, True]).head(3)
-            df.loc[best.index, "selection"] += "|high_power"
+        # Prefer those that meet power target; fallback to the best under budget if none
+        high_power_pool = under[under["power"] >= power_target]
+        if high_power_pool.empty:
+            high_power_pool = under
+        if not high_power_pool.empty:
+            best = high_power_pool.sort_values(["power", "ESS_p1"], ascending=[False, True]).head(3)
+            df.loc[best.index, "selection"] += "\nhigh_power"
 
     return df
 
@@ -584,7 +648,6 @@ def cached_grid_search(
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("Inputs")
-
     if st.button("Reset UI & clear cache"):
         st.cache_data.clear()
         st.session_state.clear()
@@ -592,13 +655,10 @@ with st.sidebar:
         st.stop()
 
     st.markdown("⚡ *Quick-Scan Mode Enabled (n_sim defaults to 1)*")
-
     st.number_input("Null efficacy rate p₀", 0.0, 1.0, DEFAULTS["p0"], 0.01, key="p0")
     st.number_input("Expected efficacy rate p₁", 0.0, 1.0, DEFAULTS["p1"], 0.01, key="p1")
-
     st.number_input("Efficacy prior alpha aₑ", 0.0, 100.0, DEFAULTS["a_e"], 0.1, key="a_e")
     st.number_input("Efficacy prior beta bₑ", 0.0, 100.0, DEFAULTS["b_e"], 0.1, key="b_e")
-
     st.number_input("Predictive futility threshold ψ", 0.0, 0.5, DEFAULTS["psi_fut"], 0.01, key="psi_fut")
 
     st.divider()
@@ -626,11 +686,9 @@ with st.sidebar:
     st.number_input("Max Type I error α target", 0.0, 0.5, DEFAULTS["alpha_target"], 0.01, key="alpha_target")
     st.number_input("Min Power target", 0.0, 1.0, DEFAULTS["power_target"], 0.01, key="power_target")
     st.number_input("N budget (optional)", 0, 5000, DEFAULTS["N_budget"], 1, key="N_budget")
-
     require_alpha_for_high_power = st.checkbox(
         "Require α constraint for 'High power' recommendations", value=True
     )
-
     # Evaluation sims (after calibration)
     st.number_input(
         "Monte Carlo replicates (n_sim)",
@@ -654,11 +712,9 @@ with st.sidebar:
     cal_n_sim = st.number_input("Calibration n_sim (per bisection step)", 100, 200000, 1000, 100)
     fast_mode = st.checkbox("Use vectorized fast calibration (recommended)", value=True)
     skip_fut_cal = st.checkbox("Skip futility during calibration (faster; conservative)", value=True)
-
     phi = st.number_input("Per-look stringency φ (>=1: early stricter)", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
 
     show_only_feasible = st.checkbox("Show only designs meeting α & power targets", value=False)
-
     run_btn = st.button("Run grid search", type="primary")
 
 # -----------------------------------------------------------------------------
@@ -669,23 +725,22 @@ st.title("Bayesian Single‑Arm Monitoring Study Designer")
 with st.expander("📋 Workflow Guide (click to expand)", expanded=False):
     st.markdown("""
 **Recommended workflow**
-1. **Quick scan**: Keep `n_sim = 1–100` and a modest grid (e.g., N=30–80, K=0–2) to map the space quickly.  
-2. **Choose calibration**:  
-   - *Single γₑ*: same threshold at all looks, calibrated to hit α target.  
-   - *Per‑look γₑ vector*: early looks stricter (set φ≈3), calibrated to hit α target overall.  
-3. **Calibrate**: Use Calibration `n_sim = 500–2000` with *fast calibration ON* and *skip futility* (faster).  
-4. **Review**: Toggle **“Show only designs meeting α & power”** to filter to feasible designs.  
-5. **Re‑evaluate shortlist**: Use the **“Re‑evaluate shortlisted designs”** panel with `n_sim = 2000–5000` to get stable α/power for your top picks (thresholds held fixed).  
+1. **Quick scan**: Keep `n_sim = 1–100` and a modest grid (e.g., N=30–80, K=0–2) to map the space quickly.
+2. **Choose calibration**:
+   - *Single γₑ*: same threshold at all looks, calibrated to hit α target.
+   - *Per‑look γₑ vector*: early looks stricter (set φ≈3), calibrated to hit α target overall.
+3. **Calibrate**: Use Calibration `n_sim = 500–2000` with *fast calibration ON* and *skip futility* (faster).
+4. **Review**: Toggle **“Show only designs meeting α & power”** to filter to feasible designs.
+5. **Re‑evaluate shortlist**: Use the **“Re‑evaluate shortlisted designs”** panel with `n_sim = 2000–5000` to get stable α/power for your top picks (thresholds held fixed).
 6. **Finalize**: Choose the design balancing α control, power, and average sample size; export CSV for records (optional: add a PDF exporter later).
 """)
-
 st.info(
     "Use **Per-look γₑ vector** to make early interims stricter and keep overall α under control. "
     "Calibrate with a modest n_sim (e.g., 500–2000), then re-evaluate shortlisted designs with larger n_sim."
 )
 st.markdown("---")
 
-# ---------- Helpers for plain-language tables ----------
+# ---- Helpers for plain-language tables ----
 def _fmt_looks(looks):
     if looks is None or (isinstance(looks, float) and np.isnan(looks)):
         return "—"
@@ -721,7 +776,6 @@ def _fmt_r_by_look(r_by_look):
 def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
     """Build a human-friendly table for display."""
     df = df_src.copy()
-
     # High-level design
     df["Max patients (N)"] = df["N"]
     df["Interim checks (K)"] = df["K_interims"]
@@ -736,7 +790,6 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
         if gu is None or (isinstance(gu, float) and np.isnan(gu)):
             return "—"
         return f"{float(gu):.3f}"
-
     df["Success threshold(s) γₑ"] = df.apply(_gamma_text_row, axis=1)
 
     # Integer boundaries
@@ -766,11 +819,11 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
 
     # Optional safety columns if available
     if "safety_stop_q1" in df:
-        df["P(stop for safety | q₁)"] = df["safety_stop_q1"].map(
+        df["P(stop for safety \n q₁)"] = df["safety_stop_q1"].map(
             lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
         )
     if "safety_stop_qmax" in df:
-        df["P(stop for safety | q_max)"] = df["safety_stop_qmax"].map(
+        df["P(stop for safety \n q_max)"] = df["safety_stop_qmax"].map(
             lambda x: "—" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{float(x):.3f}"
         )
 
@@ -783,12 +836,11 @@ def _make_plain_table(df_src: pd.DataFrame) -> pd.DataFrame:
         "Avg patients if p = p₁","Avg patients if p = p₀","Avg checks if p = p₁"
     ]
     # Append safety columns if present
-    if "P(stop for safety | q₁)" in df: cols.append("P(stop for safety | q₁)")
-    if "P(stop for safety | q_max)" in df: cols.append("P(stop for safety | q_max)")
-
+    if "P(stop for safety \n q₁)" in df: cols.append("P(stop for safety \n q₁)")
+    if "P(stop for safety \n q_max)" in df: cols.append("P(stop for safety \n q_max)")
     return df[cols]
 
-# ----- Helpers to re-evaluate a single design with fixed thresholds -----
+# ---- Helpers to re-evaluate a single design with fixed thresholds ----
 def _reval_one_row(row: pd.Series, n_sim_big: int, seed_base: int) -> Dict:
     """
     Re-evaluate a single design row from df with larger n_sim, holding thresholds fixed.
@@ -807,7 +859,6 @@ def _reval_one_row(row: pd.Series, n_sim_big: int, seed_base: int) -> Dict:
     q1 = st.session_state.get("q1")
     psi_fut = float(st.session_state["psi_fut"])
     gamma_s = st.session_state.get("gamma_s")
-
     seed = int(seed_base + 9973*N + 37*K + n_sim_big)
 
     # If row has a per-look vector, evaluate with that vector; otherwise single γe
@@ -903,7 +954,6 @@ if run_btn:
     # SE / 95% CI
     def binom_se(p: float, n: int) -> float:
         return float(np.sqrt(max(p * (1 - p), 0.0) / max(n, 1)))
-
     n_used = int(st.session_state["n_sim_v2"])
     df["alpha_se"] = df["alpha"].apply(lambda p: binom_se(float(p), n_used))
     df["power_se"] = df["power"].apply(lambda p: binom_se(float(p), n_used))
@@ -915,7 +965,6 @@ if run_btn:
 
     # -------------------- Summary of Designs (Plain Language) --------------------
     st.subheader("Summary of Designs")
-
     plain_summary = _make_plain_table(df_view)
     st.dataframe(plain_summary, use_container_width=True)
 
@@ -931,10 +980,10 @@ if run_btn:
 - **Power**: Chance of correctly declaring success when the true rate is **p₁**.
 - **Avg patients if p = p₁ / p₀**: Expected sample size under **p₁** / **p₀**.
 - **Avg checks if p = p₁**: Average number of looks used when the true rate is **p₁**.
-- **P(stop for safety | q₁ / q_max)** (if shown): Probability of stopping early for safety under the given toxicity rate.
+- **P(stop for safety \n q₁ / q_max)** (if shown): Probability of stopping early for safety under the given toxicity rate.
 """)
 
-    # -------------------- Recommended Designs (Plain Language) -------------------
+    # -------------------- Recommended Designs (Plain Language) --------------------
     st.subheader("Recommended Designs")
 
     def _show_recs(df_src: pd.DataFrame, tag: str, title: str):
@@ -956,10 +1005,10 @@ if run_btn:
     _show_recs(df, "high_power", "High Power (under N budget)")
     _show_recs(df, "sweet_spot", "Sweet Spot (min Avg patients if p = p₁)")
 
-    # -------------------- Download + Chart --------------------
+    # ------------------------------ Download + Chart -----------------------------
     st.download_button("Download CSV", df.to_csv(index=False).encode(), "bayes_monitor_designs.csv")
-
     st.markdown("---")
+
     import altair as alt
     chart = (
         alt.Chart(df)
@@ -974,15 +1023,14 @@ if run_btn:
     )
     st.altair_chart(chart, use_container_width=True)
 
-    # -------------------- Re-evaluate shortlisted designs (targeted, fixed thresholds) --------------------
+    # ---- Re-evaluate shortlisted designs (targeted, fixed thresholds) ----
     with st.expander("🔁 Re‑evaluate shortlisted designs (fixed thresholds)"):
         st.markdown(
             "Pick designs to re‑simulate with a larger `n_sim`. "
             "This holds the calibrated thresholds fixed so you can measure α/power precisely."
         )
-
         # Defaults: all recommended + (optionally) the top 5 feasible by power
-        default_idx = list(df[df["selection"].str.contains("smallest_N|high_power|sweet_spot", na=False)].index)
+        default_idx = list(df[df["selection"].str.contains("smallest_N\nhigh_power\nsweet_spot", na=False)].index)
         if len(default_idx) == 0:
             default_idx = list(df.sort_values(["is_feasible","power","ESS_p1"], ascending=[False, False, True]).head(5).index)
 
@@ -992,7 +1040,6 @@ if run_btn:
             default=default_idx,
             help="Select rows from the table above by their index."
         )
-
         n_sim_big = st.number_input("n_sim for re‑evaluation", min_value=1000, max_value=200000, value=5000, step=500)
         seed_big = st.number_input("Base seed for re‑evaluation", min_value=0, max_value=9999999, value=20260129, step=1)
 
@@ -1006,31 +1053,30 @@ if run_btn:
                         rows.append(_reval_one_row(df.loc[ridx], int(n_sim_big), int(seed_big)))
                     re_df = pd.DataFrame(rows)
                     re_df = _add_uncertainty_columns(re_df, int(n_sim_big))
+                    st.success("Re‑evaluation complete.")
 
-                st.success("Re‑evaluation complete.")
-                # Show in plain language
-                re_view = re_df.copy()
-                re_view["When we check (patients enrolled)"] = re_view["looks"].apply(_fmt_looks)
-                re_view["Success threshold(s) γₑ"] = np.where(
-                    re_view.get("gamma_e_vector").notna() if "gamma_e_vector" in re_view else False,
-                    re_view.get("gamma_e_vector", None).apply(_fmt_gamma_vec),
-                    re_view.get("gamma_e_used", None).apply(lambda g: "—" if g is None or (isinstance(g, float) and np.isnan(g)) else f"{float(g):.3f}")
-                )
-                re_view = re_view[[
-                    "N","K_interims","When we check (patients enrolled)","Success threshold(s) γₑ",
-                    "alpha","alpha_95ci","power","power_95ci","ESS_p1","ESS_p0","avg_looks_p1"
-                ]].rename(columns={
-                    "N":"Max patients (N)",
-                    "K_interims":"Interim checks (K)",
-                    "ESS_p1":"Avg patients if p = p₁",
-                    "ESS_p0":"Avg patients if p = p₀",
-                    "alpha":"Type I error (α)",
-                    "power":"Power"
-                })
-                st.dataframe(re_view, use_container_width=True)
-
-                st.download_button(
-                    "Download re‑evaluation (CSV)",
-                    re_df.to_csv(index=False).encode(),
-                    file_name="reevaluated_designs.csv"
-                )
+                    # Show in plain language
+                    re_view = re_df.copy()
+                    re_view["When we check (patients enrolled)"] = re_view["looks"].apply(_fmt_looks)
+                    re_view["Success threshold(s) γₑ"] = np.where(
+                        re_view.get("gamma_e_vector").notna() if "gamma_e_vector" in re_view else False,
+                        re_view.get("gamma_e_vector", None).apply(_fmt_gamma_vec),
+                        re_view.get("gamma_e_used", None).apply(lambda g: "—" if g is None or (isinstance(g, float) and np.isnan(g)) else f"{float(g):.3f}")
+                    )
+                    re_view = re_view[[
+                        "N","K_interims","When we check (patients enrolled)","Success threshold(s) γₑ",
+                        "alpha","alpha_95ci","power","power_95ci","ESS_p1","ESS_p0","avg_looks_p1"
+                    ]].rename(columns={
+                        "N":"Max patients (N)",
+                        "K_interims":"Interim checks (K)",
+                        "ESS_p1":"Avg patients if p = p₁",
+                        "ESS_p0":"Avg patients if p = p₀",
+                        "alpha":"Type I error (α)",
+                        "power":"Power"
+                    })
+                    st.dataframe(re_view, use_container_width=True)
+                    st.download_button(
+                        "Download re‑evaluation (CSV)",
+                        re_df.to_csv(index=False).encode(),
+                        file_name="reevaluated_designs.csv"
+                    )
