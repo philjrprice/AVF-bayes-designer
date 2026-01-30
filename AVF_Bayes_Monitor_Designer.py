@@ -1,11 +1,8 @@
-# AVF_Bayes_Monitor_Designer_runin_safety_v3_1.py
+# AVF_Bayes_Monitor_Designer_runin_safety_v3_1_2.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1 enhancements:
-#  • Tuner++ with configurable bounds (defaults: c_futility in [0.02,0.25]; θ_interim in [θ_final-0.15, θ_final])
-#  • Fixed "Apply tuned thresholds to sidebar" (forces widget update + rerun)
-#  • OC Explorer always shows labeled heatmap + cleaner table & tooltips
-#  • Automated interpretation of OC grid + warnings (short + extended)
-#  • UI reorder: (1) Screener → (2) Compare → (3) Deep Dive → (4) Tuner → (5) OC → (6) Export
+# v3.1.2 fixes:
+#  • Safe Automated Interpretation (no max/min on empty lists; no multiline f-strings)
+#  • Same features as v3.1: Tuner++ with bounds; fixed Apply-to-sidebar; OC heatmap; exports; UI order
 
 from __future__ import annotations
 import io
@@ -33,7 +30,7 @@ try:
 except Exception:
     _HAS_PLOTLY = False
 
-SCHEMA_VERSION = "v3_1_bounds_tuner_oc_heatmap_interpret"
+SCHEMA_VERSION = "v3_1_2_bounds_tuner_oc_heatmap_interpret_fix"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                 ║
@@ -500,7 +497,6 @@ def tune_theta_final_bisect(
     tol: float = 0.005,
     max_iter: int = 22,
 ) -> Optional[float]:
-    """Find θ_final so that Type I @ p0 ≈ alpha_target (efficacy-only sims)."""
     rng = np.random.default_rng(seed)
     U = rng.uniform(size=(n_sims, N))
 
@@ -552,7 +548,6 @@ def joint_search_theta_interim_cf_with_bounds(
     coarse_steps: Tuple[float, float] = (0.02, 0.02),
     refine_steps: Tuple[float, float] = (0.01, 0.01),
 ) -> Optional[Dict]:
-    """Search (θ_interim, c_futility) within bounds, coarse→refine, return best."""
     rng = np.random.default_rng(seed)
     U = rng.uniform(size=(n_sims, N))
 
@@ -577,7 +572,6 @@ def joint_search_theta_interim_cf_with_bounds(
             return dict(theta_interim=ti, c_futility=cf, r0=r0, r1=r1, objective=obj)
         return None
 
-    # Coarse grid in bounds
     ti_vals = np.arange(max(0.5, ti_min), min(0.999, ti_max) + 1e-9, coarse_steps[0])
     cf_vals = np.arange(max(0.0, cf_min), min(0.5, cf_max) + 1e-9, coarse_steps[1])
 
@@ -592,7 +586,6 @@ def joint_search_theta_interim_cf_with_bounds(
     if best is None:
         return None
 
-    # Refine around best
     ti0, cf0 = best["theta_interim"], best["c_futility"]
     ti_vals_ref = np.clip(np.arange(ti0 - 2*refine_steps[0], ti0 + 2*refine_steps[0] + 1e-9, refine_steps[0]), 0.5, 0.999)
     cf_vals_ref = np.clip(np.arange(cf0 - 2*refine_steps[1], cf0 + 2*refine_steps[1] + 1e-9, refine_steps[1]), 0.0, 0.5)
@@ -612,9 +605,9 @@ def joint_search_theta_interim_cf_with_bounds(
 # ║ STREAMLIT UI — Header & Sidebar                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1")
-st.caption("Split efficacy/safety schedules & run‑ins, Tuner with bounds, OC heatmap + automated interpretation, PDF/CSV/JSON export.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.2", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.2")
+st.caption("Split efficacy/safety schedules & run‑ins, Tuner with bounds, OC heatmap + automated interpretation (fixed), PDF/CSV/JSON export.")
 
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
@@ -866,13 +859,11 @@ else:
         st.session_state["deep_results"] = dict(res_p0_qgood=res_p0_qgood, res_p1_qgood=res_p1_qgood, res_p1_qbad=res_p1_qbad)
         st.session_state["deep_design"] = design_sel
 
-        # Show metrics + MC SE bands
         def se_p(p):
             return se_prop(p, n_sims_deep)
         cols = st.columns(6 if enable_safety else 5)
         t1 = res_p0_qgood['reject_rate']; cols[0].metric("Type I @ p₀,q_good", f"{t1:.3f}", f"±{1.96*se_p(t1):.3f}")
         pwr = res_p1_qgood['reject_rate']; cols[1].metric("Power @ p₁,q_good", f"{pwr:.3f}", f"±{1.96*se_p(pwr):.3f}")
-        # ESS CI via stop-dist
         sd = res_p1_qgood['stop_dist']
         if isinstance(sd, pd.DataFrame) and not sd.empty:
             Nvals = sd['N_stop'].to_numpy(); probs = sd['Probability'].to_numpy()
@@ -904,19 +895,16 @@ with st.expander("Open Threshold Tuner++", expanded=False):
     st.markdown("**Bounds** (you can set your own; below are recommended defaults)")
     colB1, colB2 = st.columns(2)
     with colB1:
-        # θ_interim bounds with tooltip
         ti_min_default = max(0.5, float(st.session_state.get('theta_final', theta_final)) - 0.15)
         ti_max_default = float(st.session_state.get('theta_final', theta_final))
         ti_min = st.number_input("θ_interim min", 0.5, 0.999, ti_min_default, 0.01, format="%.3f", key='ti_min', help="Interim threshold is often ≤ final by 0.05–0.15 in Phase II.")
         ti_max = st.number_input("θ_interim max", 0.5, 0.999, ti_max_default, 0.01, format="%.3f", key='ti_max', help="Often set ≤ θ_final to avoid overly stringent interim claims.")
     with colB2:
-        # c_futility bounds with tooltip
         cf_min = st.number_input("c_futility min", 0.0, 0.5, 0.02, 0.01, format="%.3f", key='cf_min', help="Typical futility PPoS bounds in Phase II are ~0.05–0.25.")
         cf_max = st.number_input("c_futility max", 0.0, 0.5, 0.25, 0.01, format="%.3f", key='cf_max', help="Upper end beyond ~0.25 may be operationally aggressive.")
 
     if st.button("Run Tuner++", key='run_tuner'):
         looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
-        # Stage 1: bisection on θ_final
         theta_final_star = tune_theta_final_bisect(st.session_state.get('N_select', 60), looks_eff_tune, a0, b0, p0, p1, allow_early_success, st.session_state.get('c_futility', c_futility), st.session_state.get('theta_interim', theta_interim), run_in_eff, alpha_target, n_sims_tuner, seed_tuner)
         if theta_final_star is None:
             st.error("Could not find a feasible θ_final that meets the α target. Try relaxing target or increasing N.")
@@ -941,14 +929,12 @@ with st.expander("Open Threshold Tuner++", expanded=False):
                     'ESS @ p0': r0['ess'],
                     'ESS @ p1': r1['ess'],
                 })
-                # Apply to sidebar: update session_state keys then rerun to refresh widgets
                 if st.button("Apply tuned thresholds to sidebar", key='apply_tuned'):
                     st.session_state['theta_final'] = float(theta_final_star)
                     st.session_state['theta_interim'] = float(best['theta_interim'])
                     st.session_state['c_futility'] = float(best['c_futility'])
                     st.success("Applied tuned θ_final, θ_interim, c_futility to sidebar.")
                     st.rerun()
-                # Save table row for export
                 st.session_state['tuner_df'] = pd.DataFrame([{
                     'theta_final': float(theta_final_star),
                     'theta_interim': float(best['theta_interim']),
@@ -995,7 +981,6 @@ with st.expander("Open OC Explorer", expanded=True):
             df_grid = pd.DataFrame(oc_rows)
             st.session_state['oc_grid_df'] = df_grid
 
-            # Display tidy table
             nice = df_grid.copy()
             nice.rename(columns={
                 'reject_rate': 'Pr(declare efficacy)',
@@ -1007,7 +992,6 @@ with st.expander("Open OC Explorer", expanded=True):
             nice = nice.sort_values(['q','p']).reset_index(drop=True)
             st.dataframe(nice)
 
-            # Heatmap (always shown) — label axes + colorbar
             if _HAS_PLOTLY:
                 piv = df_grid.pivot(index='q', columns='p', values='reject_rate')
                 fig = px.imshow(
@@ -1021,25 +1005,20 @@ with st.expander("Open OC Explorer", expanded=True):
                 fig.update_yaxes(title_text='Toxicity rate q')
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Automated Interpretation + Warnings
             st.write("#### Automated Interpretation & Design Diagnostics")
             Ntot = design_sel['N_total']
             pow_target = st.session_state.get('power_min', 0.80)
-            saf_warn_thr = 0.25  # safety stop rate threshold for warning
+            saf_warn_thr = 0.25
 
-            # Regions summaries
-            # (i) Power region at fixed toxicity levels (for each q, which p reach target)
             grp = df_grid.groupby('q').apply(lambda g: (g['reject_rate'] >= pow_target).sum()/len(g))
-            robust_qs = grp[grp >= 0.6].index.tolist()  # at least 60% of p-grid meets power
+            robust_qs = grp[grp >= 0.6].index.tolist()
             fragile_qs = grp[grp < 0.6].index.tolist()
 
-            # (ii) Safety prevalence
             saf_grp = df_grid.groupby('q')['safety_stop_any'].mean()
             high_safety_qs = saf_grp[saf_grp > saf_warn_thr].index.tolist()
 
-            # (iii) ESS stability
             ess_mean = df_grid.groupby('p')['ess'].mean()
-            ess_spike = (ess_mean > 0.9 * Ntot).sum() / len(ess_mean) > 0.3  # if >30% of p require ~full N
+            ess_spike = (ess_mean > 0.9 * Ntot).sum() / len(ess_mean) > 0.3
 
             bullets = []
             if robust_qs:
@@ -1055,7 +1034,6 @@ with st.expander("Open OC Explorer", expanded=True):
             for b in bullets:
                 st.write("• "+b)
 
-            # Warnings box
             warn_msgs = []
             if fragile_qs and min(fragile_qs) <= (q_max_g if 'q_max_g' in locals() else max(qs)):
                 warn_msgs.append("Power falls below target for many p at moderate q levels.")
@@ -1067,11 +1045,18 @@ with st.expander("Open OC Explorer", expanded=True):
                 st.warning("\n".join(["⚠ "+m for m in warn_msgs]))
 
             with st.expander("Extended interpretation (details)"):
-                st.markdown(
-                    f"**Robust region (indicative):** q ≤ {max(robust_qs):.2f} if any; **Fragile region:** q ≥ {min(fragile_qs):.2f} if any.\n\n"
-                    f"**Safety:** Above q≈{(min(high_safety_qs) if high_safety_qs else q_max_g):.2f}, safety stops become common.\n\n"
-                    f"**ESS:** {'Large portions of the grid require near‑max N.' if ess_spike else 'ESS stays moderate for many scenarios.'}"
+                # Build safe texts without calling max/min on empty lists
+                robust_text = (f"q ≤ {max(robust_qs):.2f}" if len(robust_qs) > 0 else "no robust q-levels")
+                fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs) > 0 else "no fragile q-levels")
+                safety_q = (min(high_safety_qs) if len(high_safety_qs) > 0 else q_max_g)
+                ess_txt = ('Large portions of the grid require near‑max N.' if ess_spike else 'ESS stays moderate for many scenarios.')
+                body = (
+                    "**Robust region (indicative):** " + robust_text + "; "
+                    "**Fragile region:** " + fragile_text + ".\n\n"
+                    "**Safety:** Above q≈" + f"{safety_q:.2f}" + ", safety stops become common.\n\n"
+                    "**ESS:** " + ess_txt
                 )
+                st.markdown(body)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ PDF EXPORT HELPERS                                                       ║
@@ -1091,7 +1076,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.drawString(x0, y, text)
         y -= dy
 
-    line("Bayesian Single-Arm Design – Summary (v3.1)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.2)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1149,7 +1134,7 @@ export_bundle = {
     "oc_grid": None if 'oc_grid_df' not in st.session_state else st.session_state['oc_grid_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_2.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1172,10 +1157,10 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
     if 'oc_grid_df' in st.session_state:
         zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_2_csv.zip", mime="application/zip")
 
 # PDF
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None), st.session_state.get('tuner_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_2.pdf", mime="application/pdf")
