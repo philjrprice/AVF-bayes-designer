@@ -850,6 +850,87 @@ else:
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ TUNER CORE (θ_final bisection + (θ_interim, c_futility) grid search)    ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+def tune_theta_final_bisect(N, looks_eff, a0, b0, p0, p1,
+                            allow_early_success, c_futility,
+                            theta_interim, run_in_eff,
+                            alpha_target, n_sims, seed,
+                            tol=0.002, max_iter=22, U=None):
+    import numpy as np
+    if U is None:
+        rng = np.random.default_rng(seed)
+        U = rng.uniform(size=(n_sims, N))
+    lo = max(0.50, float(theta_interim)); hi = 0.999
+    def type1_given(theta_final: float) -> float:
+        s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
+        if s_min is None:
+            return 0.0
+        x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, c_futility)
+        design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
+                      theta_final=theta_final, theta_interim=theta_interim, c_futility=c_futility,
+                      allow_early_success=allow_early_success, s_min_final=s_min,
+                      x_min_to_continue_by_look_eff=x_min, run_in_eff=run_in_eff)
+        return float(simulate_design_eff_only(design, p0, U[:, :N])['reject_rate'])
+    f_lo, f_hi = type1_given(lo), type1_given(hi)
+    if not (f_lo >= alpha_target and f_hi <= alpha_target):
+        return None
+    last_mid = lo
+    for _ in range(max_iter):
+        mid = 0.5*(lo+hi); f_mid = type1_given(mid); last_mid = mid
+        if abs(f_mid - alpha_target) < tol:
+            return float(mid)
+        if f_mid > alpha_target:
+            lo = mid
+        else:
+            hi = mid
+    return float(last_mid)
+
+
+def joint_search_theta_interim_cf_with_bounds(
+        N, looks_eff, a0, b0, p0, p1,
+        theta_final, allow_early_success, run_in_eff,
+        objective, alpha_cap, power_floor, n_sims, seed,
+        ti_min, ti_max, cf_min, cf_max,
+        ti_steps=8, cf_steps=8, U=None):
+    import numpy as np
+    if U is None:
+        rng = np.random.default_rng(seed)
+        U = rng.uniform(size=(n_sims, N))
+    TI_vals = np.linspace(float(ti_min), float(ti_max), int(max(2, ti_steps)))
+    CF_vals = np.linspace(float(cf_min), float(cf_max), int(max(2, cf_steps)))
+    best = None
+    for ti in TI_vals:
+        for cf in CF_vals:
+            s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
+            if s_min is None:
+                continue
+            x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, cf)
+            design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
+                          theta_final=theta_final, theta_interim=float(ti), c_futility=float(cf),
+                          allow_early_success=allow_early_success, s_min_final=s_min,
+                          x_min_to_continue_by_look_eff=x_min, run_in_eff=run_in_eff)
+            r0 = simulate_design_eff_only(design, p0, U[:, :N])
+            r1 = simulate_design_eff_only(design, p1, U[:, :N])
+            if r0['reject_rate'] > alpha_cap or r1['reject_rate'] < power_floor:
+                continue
+            if objective == 'Min ESS @ p0':
+                val = r0['ess']; better = (best is None) or (val < best['val'])
+            elif objective == 'Min ESS @ p1':
+                val = r1['ess']; better = (best is None) or (val < best['val'])
+            elif objective == 'Max Power @ p1':
+                val = r1['reject_rate']; better = (best is None) or (val > best['val'])
+            elif objective == 'Max Early stops @ p0':
+                val = r0['early_stop_rate']; better = (best is None) or (val > best['val'])
+            else:
+                continue
+            if better:
+                best = dict(val=float(val), theta_interim=float(ti), c_futility=float(cf), r0=r0, r1=r1, objective=objective)
+    return best
+
 # ║ 4) Threshold Tuner++ (with bounds)                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -875,10 +956,21 @@ with st.expander("Open Threshold Tuner++", expanded=False):
     with colB2:
         cf_min = st.number_input("c_futility min", 0.0, 0.5, 0.02, 0.01, format="%.3f", key='cf_min', help="Typical futility PPoS bounds in Phase II are ~0.05–0.25.")
         cf_max = st.number_input("c_futility max", 0.0, 0.5, 0.25, 0.01, format="%.3f", key='cf_max', help="Upper end beyond ~0.25 may be operationally aggressive.")
+        ti_steps = st.number_input("θ_interim grid points", 3, 25, 8, 1, key='ti_steps', help="Increase for a finer search; reduces speed.")
+        cf_steps = st.number_input("c_futility grid points", 3, 25, 8, 1, key='cf_steps', help="Increase for a finer search; reduces speed.")
 
     if st.button("Run Tuner++", key='run_tuner'):
+        rng_tune = np.random.default_rng(seed_tuner)
+        U_tune = rng_tune.uniform(size=(n_sims_tuner, st.session_state.get('N_select', 60)))
         looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
-        theta_final_star = tune_theta_final_bisect(st.session_state.get('N_select', 60), looks_eff_tune, a0, b0, p0, p1, allow_early_success, st.session_state.get('c_futility', c_futility), st.session_state.get('theta_interim', theta_interim), run_in_eff, alpha_target, n_sims_tuner, seed_tuner)
+        theta_final_star = tune_theta_final_bisect(
+            N=st.session_state.get('N_select', 60),
+            looks_eff=looks_eff_tune, a0=a0, b0=b0, p0=p0, p1=p1,
+            allow_early_success=allow_early_success,
+            c_futility=st.session_state.get('c_futility', c_futility),
+            theta_interim=st.session_state.get('theta_interim', theta_interim),
+            run_in_eff=run_in_eff, alpha_target=alpha_target,
+            n_sims=n_sims_tuner, seed=seed_tuner, U=U_tune)
         if theta_final_star is None:
             st.error("Could not find a feasible θ_final that meets the α target. Try relaxing the target or increasing N.")
         else:
@@ -888,6 +980,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
                 theta_final=theta_final_star, allow_early_success=allow_early_success, run_in_eff=run_in_eff,
                 objective=objective, alpha_cap=alpha_cap, power_floor=power_floor, n_sims=n_sims_tuner,
                 seed=seed_tuner, ti_min=ti_min, ti_max=ti_max, cf_min=cf_min, cf_max=cf_max,
+                  ti_steps=st.session_state.get('ti_steps', 8), cf_steps=st.session_state.get('cf_steps', 8), U=U_tune,
             )
             if best is None:
                 st.warning("No (θ_interim, c_futility) pair within bounds met the constraints.")
