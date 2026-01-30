@@ -552,6 +552,11 @@ if enable_safety:
         b_t0 = st.number_input("Safety prior b_t0", 0.0, None, 9.0, 0.5, key='b_t0', help="Increase a_t0+b_t0 for a stronger safety prior (e.g., Beta(1,9) → mean≈0.10).")
         theta_tox = st.number_input("Safety stop threshold (θ_tox)", 0.5, 0.999, 0.90, 0.01, format="%.3f", key='theta_tox',
                                     help="Stop when P(q>q_max | data) ≥ θ_tox at interims or final.")
+    with st.sidebar.expander("About your safety prior"):
+        if (a_t0 is not None) and (b_t0 is not None) and (a_t0 + b_t0) > 0:
+            st.write(f"Prior mean = **{a_t0/(a_t0+b_t0):.3f}**, prior ESS ≈ **{a_t0+b_t0:.1f}**.")
+        else:
+            st.write("Prior mean undefined (a_t0+b_t0=0). Consider Beta(1,9) or similar.")
 else:
     a_t0 = b_t0 = q_max = theta_tox = None
 
