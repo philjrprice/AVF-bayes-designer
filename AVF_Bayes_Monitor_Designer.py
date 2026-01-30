@@ -518,11 +518,26 @@ st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint)")
 st.caption("Design single‑arm trials with Bayesian interim monitoring for **efficacy** and optional **safety**. Plain‑language UI, rigorous math.")
 
 with st.expander("What this tool does (in simple terms)"):
-    robust_text = (f"q ≤ {max(robust_qs):.2f}" if len(robust_qs)>0 else "no q-levels achieved robust power")
-fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs)>0 else "no clearly fragile q-levels")
-st.markdown(f"**Robust region (indicative):** {robust_text}; **Fragile region:** {fragile_text}.
 
-"):**
+# Safe construction of robust/fragile summaries
+robust_text = (
+    f"q ≤ {max(robust_qs):.2f}"
+    if len(robust_qs) > 0 else
+    "no q-levels achieved robust power"
+)
+
+fragile_text = (
+    f"q ≥ {min(fragile_qs):.2f}"
+    if len(fragile_qs) > 0 else
+    "no clearly fragile q-levels"
+)
+
+# Safe markdown (no multiline f-strings)
+st.markdown(
+    "**Robust region (indicative):** " + robust_text +
+    "  **Fragile region:** " + fragile_text + "."
+)
+
 - **Binary endpoint** with Beta prior.
 - **Final success** if P(p>p₀|data) ≥ θ_final.
 - **Futility** at interims if **PPoS** < c_futility.
@@ -1119,3 +1134,4 @@ st.markdown(f"**Robust region (indicative):** {robust_text}; **Fragile region:**
 """
 )
 st.caption("Tip: Use stricter θ_interim and/or larger c_futility for more early stopping; adjust safety θ_tox and q_max to match DSMB preferences.")
+
