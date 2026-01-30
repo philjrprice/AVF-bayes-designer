@@ -520,30 +520,30 @@ st.caption("Design single‑arm trials with Bayesian interim monitoring for **ef
 with st.expander("What this tool does (in simple terms)"):
 
 # Safe construction of robust/fragile summaries
-robust_text = (
-    f"q ≤ {max(robust_qs):.2f}"
-    if len(robust_qs) > 0 else
-    "no q-levels achieved robust power"
+    robust_text = (
+        f"q ≤ {max(robust_qs):.2f}"
+        if len(robust_qs) > 0 else
+        "no q-levels achieved robust power"
 )
 
-fragile_text = (
-    f"q ≥ {min(fragile_qs):.2f}"
-    if len(fragile_qs) > 0 else
-    "no clearly fragile q-levels"
+    fragile_text = (
+        f"q ≥ {min(fragile_qs):.2f}"
+        if len(fragile_qs) > 0 else
+        "no clearly fragile q-levels"
 )
 
 # Safe markdown (no multiline f-strings)
-st.markdown(
-    "**Robust region (indicative):** " + robust_text +
-    "  **Fragile region:** " + fragile_text + "."
+    st.markdown(
+        "**Robust region (indicative):** " + robust_text +
+        "  **Fragile region:** " + fragile_text + "."
 )
 
 
-st.markdown("""
-- **Final success** if P(p>p₀|data) ≥ θ_final.  
-- **Futility** if PPoS < c_futility.  
-- **Early success** if P(p>p₀|data) ≥ θ_interim.
-""")
+    st.markdown("""
+    - **Final success** if P(p>p₀|data) ≥ θ_final.  
+    - **Futility** if PPoS < c_futility.  
+    - **Early success** if P(p>p₀|data) ≥ θ_interim.
+    """)
 
 # ── Sidebar: inputs ─────────────────────────────────────────────────────────
 
@@ -1133,5 +1133,6 @@ st.markdown(f"**Robust region (indicative):** {robust_text}; **Fragile region:**
 """
 )
 st.caption("Tip: Use stricter θ_interim and/or larger c_futility for more early stopping; adjust safety θ_tox and q_max to match DSMB preferences.")
+
 
 
