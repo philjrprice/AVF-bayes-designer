@@ -1,8 +1,9 @@
-# AVF_Bayes_Monitor_Designer_runin_safety_v3_1_2.py
+# AVF_Bayes_Monitor_Designer_runin_safety_v3_1_3.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.2 fixes:
-#  • Safe Automated Interpretation (no max/min on empty lists; no multiline f-strings)
-#  • Same features as v3.1: Tuner++ with bounds; fixed Apply-to-sidebar; OC heatmap; exports; UI order
+# v3.1.3 UX upgrades:
+#  • Plain-language labels and richer help tooltips across the app
+#  • Friendlier “Chosen Design Summary” panel (clear bullets + decision rules)
+#  • Keeps v3.1.2 safety fixes for OC interpretation and robust strings
 
 from __future__ import annotations
 import io
@@ -30,7 +31,7 @@ try:
 except Exception:
     _HAS_PLOTLY = False
 
-SCHEMA_VERSION = "v3_1_2_bounds_tuner_oc_heatmap_interpret_fix"
+SCHEMA_VERSION = "v3_1_3_tooltips_summary_ux"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                 ║
@@ -477,220 +478,116 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
     return df, designs_built
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ TUNER: Bisection θ_final + Joint (θ_interim, c_futility) with bounds     ║
+# ║ STREAMLIT UI — Header & Sidebar (with richer tooltips)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def tune_theta_final_bisect(
-    N: int,
-    looks_eff: List[int],
-    a0: float,
-    b0: float,
-    p0: float,
-    p1: float,
-    allow_early_success: bool,
-    c_fut: float,
-    theta_interim: float,
-    run_in_eff: int,
-    alpha_target: float,
-    n_sims: int,
-    seed: int,
-    tol: float = 0.005,
-    max_iter: int = 22,
-) -> Optional[float]:
-    rng = np.random.default_rng(seed)
-    U = rng.uniform(size=(n_sims, N))
-
-    lo, hi = 0.50, 0.999
-    best = None
-    for _ in range(max_iter):
-        mid = (lo + hi) / 2
-        s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, mid)
-        if s_min is None:
-            hi = mid
-            continue
-        x_min_map = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, mid, c_fut)
-        design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0,
-                      theta_final=mid, theta_interim=float(theta_interim),
-                      c_futility=c_fut, allow_early_success=allow_early_success,
-                      s_min_final=s_min, x_min_to_continue_by_look_eff=x_min_map,
-                      run_in_eff=run_in_eff)
-        r0 = simulate_design_eff_only(design, p0, U)
-        diff = r0["reject_rate"] - alpha_target
-        best = (mid, r0["reject_rate"]) if best is None or abs(diff) < abs(best[1] - alpha_target) else best
-        if abs(diff) <= tol:
-            return mid
-        if diff > 0:
-            lo = mid
-        else:
-            hi = mid
-    return best[0] if best else None
-
-
-def joint_search_theta_interim_cf_with_bounds(
-    N: int,
-    looks_eff: List[int],
-    a0: float,
-    b0: float,
-    p0: float,
-    p1: float,
-    theta_final: float,
-    allow_early_success: bool,
-    run_in_eff: int,
-    objective: str,
-    alpha_cap: float,
-    power_floor: float,
-    n_sims: int,
-    seed: int,
-    ti_min: float,
-    ti_max: float,
-    cf_min: float,
-    cf_max: float,
-    coarse_steps: Tuple[float, float] = (0.02, 0.02),
-    refine_steps: Tuple[float, float] = (0.01, 0.01),
-) -> Optional[Dict]:
-    rng = np.random.default_rng(seed)
-    U = rng.uniform(size=(n_sims, N))
-
-    def eval_pair(ti, cf):
-        s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
-        if s_min is None:
-            return None
-        x_min_map = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, cf)
-        design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0,
-                      theta_final=theta_final, theta_interim=float(ti), c_futility=cf,
-                      allow_early_success=allow_early_success, s_min_final=s_min,
-                      x_min_to_continue_by_look_eff=x_min_map, run_in_eff=run_in_eff)
-        r0 = simulate_design_eff_only(design, p0, U)
-        r1 = simulate_design_eff_only(design, p1, U)
-        if r0["reject_rate"] <= alpha_cap and r1["reject_rate"] >= power_floor:
-            obj = {
-                "Min ESS @ p0": r0["ess"],
-                "Min ESS @ p1": r1["ess"],
-                "Max Power @ p1": -r1["reject_rate"],
-                "Max Early stops @ p0": -r0["early_stop_rate"],
-            }[objective]
-            return dict(theta_interim=ti, c_futility=cf, r0=r0, r1=r1, objective=obj)
-        return None
-
-    ti_vals = np.arange(max(0.5, ti_min), min(0.999, ti_max) + 1e-9, coarse_steps[0])
-    cf_vals = np.arange(max(0.0, cf_min), min(0.5, cf_max) + 1e-9, coarse_steps[1])
-
-    best = None
-    for ti in ti_vals:
-        for cf in cf_vals:
-            cand = eval_pair(ti, cf)
-            if cand is None:
-                continue
-            if (best is None) or (cand["objective"] < best["objective"]):
-                best = cand
-    if best is None:
-        return None
-
-    ti0, cf0 = best["theta_interim"], best["c_futility"]
-    ti_vals_ref = np.clip(np.arange(ti0 - 2*refine_steps[0], ti0 + 2*refine_steps[0] + 1e-9, refine_steps[0]), 0.5, 0.999)
-    cf_vals_ref = np.clip(np.arange(cf0 - 2*refine_steps[1], cf0 + 2*refine_steps[1] + 1e-9, refine_steps[1]), 0.0, 0.5)
-    ti_vals_ref = ti_vals_ref[(ti_vals_ref >= ti_min) & (ti_vals_ref <= ti_max)]
-    cf_vals_ref = cf_vals_ref[(cf_vals_ref >= cf_min) & (cf_vals_ref <= cf_max)]
-
-    for ti in ti_vals_ref:
-        for cf in cf_vals_ref:
-            cand = eval_pair(ti, cf)
-            if cand is None:
-                continue
-            if (cand["objective"] < best["objective"]):
-                best = cand
-    return best
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ STREAMLIT UI — Header & Sidebar                                         ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.2", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.2")
-st.caption("Split efficacy/safety schedules & run‑ins, Tuner with bounds, OC heatmap + automated interpretation (fixed), PDF/CSV/JSON export.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.3", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.3")
+st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.")
 
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
-        "Run‑in is treated as Look #1; all run‑in patients count in interim and final analyses.\n\n"
-        "**Tuner++** lets you set bounds for \(\theta_{interim}\) and \(c_{futility}\).\n\n"
-        "The **OC Explorer** always shows a labeled heatmap and an automated interpretation across \((p,q)\) scenarios."
-    )
+        "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.\n\n"
+        "• **You set** prior beliefs, thresholds, and when to look at the data.\n"
+        "• The **Screener** tries many maximum sample sizes (N) and filters by α/power.\n"
+        "• The **Deep Dive** runs precise joint simulations (benefit + safety).\n"
+        "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.")
 
-# Sidebar — Efficacy
-st.sidebar.header("1) Efficacy targets")
+# Sidebar — Efficacy (plainer labels + help)
+st.sidebar.header("1) Efficacy target and prior")
 col1, col2 = st.sidebar.columns(2)
 with col1:
-    p0 = st.number_input("Null rate (p₀)", 0.0, 1.0, 0.20, 0.01, format="%.2f", key='p0')
-    a0 = st.number_input("Prior a₀ (eff)", 0.0, None, 1.0, 0.5, key='a0')
+    p0 = st.number_input("Null response rate (p₀)", 0.0, 1.0, 0.20, 0.01, format="%.2f", key='p0',
+                          help="The highest response rate that you would still consider not clinically worthwhile.")
+    a0 = st.number_input("Prior a₀ (efficacy)", 0.0, None, 1.0, 0.5, key='a0',
+                          help="Beta(a₀,b₀) prior for response. Increase a₀+b₀ for a stronger prior.")
     theta_final_default = 0.95 if 'theta_final' not in st.session_state else float(st.session_state['theta_final'])
-    theta_final = st.number_input("θ_final", 0.5, 0.999, theta_final_default, 0.01, format="%.3f", key='theta_final')
+    theta_final = st.number_input("Final success threshold (θ_final)", 0.5, 0.999, theta_final_default, 0.01, format="%.3f", key='theta_final',
+                                  help="At the final look, declare success if P(p>p₀ | all data) ≥ θ_final.")
 with col2:
-    p1 = st.number_input("Target rate (p₁)", 0.0, 1.0, 0.40, 0.01, format="%.2f", key='p1')
-    b0 = st.number_input("Prior b₀ (eff)", 0.0, None, 1.0, 0.5, key='b0')
+    p1 = st.number_input("Target (promising) response rate (p₁)", 0.0, 1.0, 0.40, 0.01, format="%.2f", key='p1',
+                          help="A response rate you would be happy to see. Power is evaluated here.")
+    b0 = st.number_input("Prior b₀ (efficacy)", 0.0, None, 1.0, 0.5, key='b0',
+                          help="Beta(a₀,b₀) prior for response. Prior mean=a₀/(a₀+b₀); ESS≈a₀+b₀.")
     c_futility_default = 0.05 if 'c_futility' not in st.session_state else float(st.session_state['c_futility'])
-    c_futility = st.number_input("c_futility (PPoS)", 0.0, 0.5, c_futility_default, 0.01, format="%.3f", key='c_futility')
+    c_futility = st.number_input("Futility cutoff (PPoS)", 0.0, 0.5, c_futility_default, 0.01, format="%.3f", key='c_futility',
+                                  help="At interim looks, stop for futility if Predictive Probability of **final** success < this value.")
 
-with st.sidebar.expander("Prior notes"):
+with st.sidebar.expander("About your efficacy prior"):
     if (a0 + b0) > 0:
-        st.write(f"Prior mean={a0/(a0+b0):.3f}; ESS≈{a0+b0:.1f}")
+        st.write(f"Prior mean = **{a0/(a0+b0):.3f}**, prior ESS ≈ **{a0+b0:.1f}**.")
     else:
-        st.write("Use Beta(1,1) for uninformative prior.")
+        st.write("Prior mean undefined (a₀+b₀=0). Consider Beta(1,1).")
 
-allow_early_success = st.sidebar.checkbox("Allow early success?", value=st.session_state.get('allow_early_success', False), key='allow_early_success')
+allow_early_success = st.sidebar.checkbox("Allow early success at interim looks?", value=st.session_state.get('allow_early_success', False), key='allow_early_success',
+                                          help="If checked, you may stop early for success when the posterior reaches θ_interim.")
 
-# Set θ_interim default tied to θ_final
 if 'theta_interim' not in st.session_state:
     st.session_state['theta_interim'] = float(theta_final)
 
-theta_interim = st.sidebar.number_input("θ_interim", 0.5, 0.999, float(st.session_state['theta_interim']), 0.01, format="%.3f", key='theta_interim')
+theta_interim = st.sidebar.number_input("Interim success threshold (θ_interim)", 0.5, 0.999, float(st.session_state['theta_interim']), 0.01, format="%.3f", key='theta_interim',
+                                        help="Often set near θ_final to avoid overly optimistic early claims.")
 
-# Sidebar — Safety
-st.sidebar.header("2) Safety monitoring")
-enable_safety = st.sidebar.checkbox("Enable safety?", True, key='enable_safety')
+# Sidebar — Safety (plainer labels + help)
+st.sidebar.header("2) Optional safety monitoring")
+enable_safety = st.sidebar.checkbox("Enable safety monitoring?", True, key='enable_safety', help="Monitor serious adverse events (SAE) with a Beta prior; stop if SAE rate likely exceeds q_max.")
 if enable_safety:
     c1, c2 = st.sidebar.columns(2)
     with c1:
-        a_t0 = st.number_input("Safety a_t0", 0.0, None, 1.0, 0.5, key='a_t0')
-        q_max = st.number_input("q_max", 0.0, 1.0, 0.15, 0.01, format="%.2f", key='q_max')
+        a_t0 = st.number_input("Safety prior a_t0", 0.0, None, 1.0, 0.5, key='a_t0',
+                               help="Beta(a_t0,b_t0) prior for SAE rate.")
+        q_max = st.number_input("Max acceptable SAE rate (q_max)", 0.0, 1.0, 0.15, 0.01, format="%.2f", key='q_max',
+                                help="If the SAE rate is likely above q_max, the trial stops for safety.")
     with c2:
-        b_t0 = st.number_input("Safety b_t0", 0.0, None, 9.0, 0.5, key='b_t0')
-        theta_tox = st.number_input("θ_tox", 0.5, 0.999, 0.90, 0.01, format="%.3f", key='theta_tox')
+        b_t0 = st.number_input("Safety prior b_t0", 0.0, None, 9.0, 0.5, key='b_t0', help="Increase a_t0+b_t0 for a stronger safety prior (e.g., Beta(1,9) → mean≈0.10).")
+        theta_tox = st.number_input("Safety stop threshold (θ_tox)", 0.5, 0.999, 0.90, 0.01, format="%.3f", key='theta_tox',
+                                    help="Stop when P(q>q_max | data) ≥ θ_tox at interims or final.")
 else:
     a_t0 = b_t0 = q_max = theta_tox = None
 
-# Sidebar — Look schedules
-st.sidebar.header("3) Efficacy look schedule")
-run_in_eff = st.sidebar.number_input("Run‑in eff", 0, 400, 0, 1, key='run_in_eff')
-looks_eff_mode_label = st.sidebar.selectbox("Efficacy look timing", ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"], index=1, key='eff_mode')
+# Sidebar — Look schedules (helped)
+st.sidebar.header("3) When to check the data (look schedule)")
+run_in_eff = st.sidebar.number_input("Run‑in for efficacy (patients enrolled before first look)", 0, 400, 0, 1, key='run_in_eff',
+                                     help="Patients enrolled before the first efficacy look; they count for all decisions.")
+looks_eff_mode_label = st.sidebar.selectbox(
+    "Efficacy look timing",
+    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"],
+    index=1, key='eff_mode',
+    help="Choose how to place efficacy interim looks.")
 
 k_looks_eff = perc_eff_str = ns_eff_str = None
 if looks_eff_mode_label == "Equal‑spaced (choose total looks incl. run‑in)":
-    k_looks_eff = st.sidebar.slider("Total efficacy looks (incl. run‑in)", 1, 8, 2, 1, key='k_eff')
+    k_looks_eff = st.sidebar.slider("Total efficacy looks (including run‑in)", 1, 8, 2, 1, key='k_eff',
+                                    help="For example, 2 looks → roughly at 1/3 and 2/3 of the maximum N.")
 elif looks_eff_mode_label == "Custom percentages of remaining":
-    perc_eff_str = st.sidebar.text_input("Efficacy % of remaining", "33,67", key='perc_eff')
+    perc_eff_str = st.sidebar.text_input("Efficacy look percentages (comma)", "33,67", key='perc_eff',
+                                         help="Example: 25,50,75 (percent of the planned maximum N)")
 elif looks_eff_mode_label == "Custom absolute Ns":
-    ns_eff_str = st.sidebar.text_input("Efficacy Ns (comma)", "", key='ns_eff')
+    ns_eff_str = st.sidebar.text_input("Efficacy look sample sizes N (comma)", "", key='ns_eff',
+                                       help="Example: 20,40 (each must be less than the maximum N)")
 
 st.sidebar.header("4) Safety look schedule")
-run_in_saf = st.sidebar.number_input("Run‑in safety", 0, 400, 0, 1, key='run_in_saf')
-looks_saf_mode_label = st.sidebar.selectbox("Safety look timing", ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"], index=1, key='saf_mode')
+run_in_saf = st.sidebar.number_input("Run‑in for safety", 0, 400, 0, 1, key='run_in_saf', help="Patients enrolled before the first safety look; they count for safety decisions.")
+looks_saf_mode_label = st.sidebar.selectbox("Safety look timing",
+    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"], index=1, key='saf_mode',
+    help="Choose how to place safety interim looks.")
 
 k_looks_saf = perc_saf_str = ns_saf_str = None
 if looks_saf_mode_label == "Equal‑spaced (choose total looks incl. run‑in)":
-    k_looks_saf = st.sidebar.slider("Total safety looks (incl. run‑in)", 1, 8, 2, 1, key='k_saf')
+    k_looks_saf = st.sidebar.slider("Total safety looks (including run‑in)", 1, 8, 2, 1, key='k_saf')
 elif looks_saf_mode_label == "Custom percentages of remaining":
-    perc_saf_str = st.sidebar.text_input("Safety % of remaining", "33,67", key='perc_saf')
+    perc_saf_str = st.sidebar.text_input("Safety look percentages (comma)", "33,67", key='perc_saf')
 elif looks_saf_mode_label == "Custom absolute Ns":
-    ns_saf_str = st.sidebar.text_input("Safety Ns (comma)", "", key='ns_saf')
+    ns_saf_str = st.sidebar.text_input("Safety look sample sizes N (comma)", "", key='ns_saf')
 
-# Sidebar — Screener settings
-st.sidebar.header("5) Screener settings")
-N_min, N_max = st.sidebar.slider("N range", 10, 400, (30, 120), 1, key='Nrange')
-N_step = st.sidebar.number_input("N step", 1, 50, 5, 1, key='Nstep')
-n_sims_small = st.sidebar.number_input("Sims/design", 100, 200000, 5000, 500, key='sims_small')
-alpha_max = st.sidebar.number_input("Max α", 0.0, 0.5, 0.10, 0.01, format="%.2f", key='alpha_max')
-power_min = st.sidebar.number_input("Min power", 0.0, 1.0, 0.80, 0.01, format="%.2f", key='power_min')
-seed = st.sidebar.number_input("Seed", 1, None, 2026, 1, key='seed')
+# Sidebar — Screener settings (helped)
+st.sidebar.header("5) Rapid Screener")
+N_min, N_max = st.sidebar.slider("Range of maximum N values to test", 10, 400, (30, 120), 1, key='Nrange', help="We'll scan this range to find feasible, efficient designs.")
+N_step = st.sidebar.number_input("Step between N values", 1, 50, 5, 1, key='Nstep', help="Larger steps scan fewer N values (faster).")
+n_sims_small = st.sidebar.number_input("Simulations per design (screening)", 100, 200000, 5000, 500, key='sims_small', help="Higher = more precision; the Deep Dive is where precision matters most.")
+alpha_max = st.sidebar.number_input("Max Type I error (α) allowed", 0.0, 0.5, 0.10, 0.01, format="%.2f", key='alpha_max', help="Keep only designs with false‑positive rate ≤ this.")
+power_min = st.sidebar.number_input("Min power at p₁", 0.0, 1.0, 0.80, 0.01, format="%.2f", key='power_min', help="Keep only designs with success rate at p₁ ≥ this.")
+seed = st.sidebar.number_input("Random seed", 1, None, 2026, 1, key='seed', help="Controls reproducibility.")
 
 # Build candidate grid for Screener
 Ns = list(range(N_min, N_max + 1, N_step))
@@ -703,7 +600,7 @@ for N in Ns:
                            run_in_eff=int(run_in_eff)))
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 1) Rapid Screener (efficacy-only)                                       ║
+# ║ 1) Rapid Screener (efficacy‑only)                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 @st.cache_data(show_spinner=False)
@@ -721,24 +618,24 @@ df_screen, designs_built = _screen(param_grid, n_sims_small, seed, SCHEMA_VERSIO
 
 st.write("### 1) Rapid Screener (efficacy‑only)")
 if df_screen.empty:
-    st.warning("No viable designs found. Consider adjusting θ_final or increasing N.")
+    st.warning("No viable designs found. Try relaxing θ_final or increasing N.")
 else:
     df_ok = df_screen[(df_screen["Type I error @ p0"] <= alpha_max) & (df_screen["Power @ p1"] >= power_min)].copy()
     cols = ["N_total", "run_in_eff", "looks_eff", "theta_final", "c_futility", "Type I error @ p0", "Power @ p1", "ESS @ p0", "Early stop @ p0 (any)"]
     table_df = df_ok if not df_ok.empty else df_screen
-    st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True))
+    st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True), use_container_width=True)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 2) Compare multiple Ns (moved before Deep Dive)                         ║
+# ║ 2) Compare multiple Ns (joint with safety)                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.write("### 2) Compare multiple Ns (deep‑dive, joint with safety)")
+st.write("### 2) Compare multiple N values (deep‑dive, joint with safety)")
 with st.expander("Open compare panel", expanded=False):
-    ns_str_compare = st.text_input("Enter Ns (comma)", "60,70,80", key='cmp_ns_str')
-    n_sims_compare = st.number_input("Sims/design (compare)", 5000, 400000, 80000, 5000, key='cmp_sims')
-    seed_compare = st.number_input("Seed (compare)", 1, None, seed + 2, 1, key='cmp_seed')
-    q_good_cmp = st.number_input("q_good (compare)", 0.0, 1.0, 0.10, 0.01, key='cmp_qgood')
-    q_bad_cmp = st.number_input("q_bad (compare)", 0.0, 1.0, 0.20, 0.01, key='cmp_qbad')
+    ns_str_compare = st.text_input("Enter N values (comma)", "60,70,80", key='cmp_ns_str', help="We'll construct designs with the SAME rule settings you set above.")
+    n_sims_compare = st.number_input("Simulations per design (compare run)", 5000, 400000, 80000, 5000, key='cmp_sims')
+    seed_compare = st.number_input("Random seed (compare run)", 1, None, seed + 2, 1, key='cmp_seed')
+    q_good_cmp = st.number_input("q_good (typical/benign toxicity)", 0.0, 1.0, 0.10, 0.01, key='cmp_qgood')
+    q_bad_cmp = st.number_input("q_bad (concerning/high toxicity)", 0.0, 1.0, 0.20, 0.01, key='cmp_qbad')
 
     def _build_eff(N):
         return build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
@@ -756,7 +653,7 @@ with st.expander("Open compare panel", expanded=False):
                     pass
         Ns_cmp = [n for n in Ns_cmp if n >= 5]
         if not Ns_cmp:
-            st.warning("Enter valid integers for N.")
+            st.warning("Please enter one or more valid integers for N.")
         else:
             rng = np.random.default_rng(seed_compare)
             rows = []
@@ -788,10 +685,10 @@ with st.expander("Open compare panel", expanded=False):
                                     "Early safety @p1": r_p1.get("saf_early_rate", 0.0),
                                     "Safety stop @p1,q_bad (any stage)": r_p1_bad.get("safety_stop_prob", 0.0)}))
             if not rows:
-                st.warning("No feasible N produced.")
+                st.warning("None of the N values produced a feasible final rule. Try relaxing θ_final or adjusting looks.")
             else:
                 df_cmp = pd.DataFrame(rows).sort_values("N").reset_index(drop=True)
-                st.dataframe(df_cmp)
+                st.dataframe(df_cmp, use_container_width=True)
                 st.session_state['compare_df'] = df_cmp
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -799,7 +696,8 @@ with st.expander("Open compare panel", expanded=False):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 3) Deep Dive (joint efficacy + safety)")
-N_select = st.number_input("Enter N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select')
+N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select',
+                           help="Choose an N from your screening range (or adjacent values) to inspect in detail.")
 looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
 looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str)
 
@@ -817,39 +715,53 @@ else:
     if enable_safety:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
 
-    with st.expander("Chosen Design Summary", expanded=False):
-        st.write({
-            "N_total": design_sel["N_total"],
-            "looks_eff": design_sel["looks_eff"],
-            "looks_saf": design_sel.get("looks_saf", []),
-            "run_in_eff": design_sel.get("run_in_eff", 0),
-            "run_in_saf": design_sel.get("run_in_saf", 0),
-            "theta_final": design_sel["theta_final"],
-            "theta_interim": design_sel["theta_interim"],
-            "c_futility": design_sel["c_futility"],
-            "s_min_final": design_sel["s_min_final"],
-        })
-        st.caption("Interim continue thresholds (need ≥ x cures to continue):")
+    # Friendlier design summary panel
+    with st.expander("Chosen Design Summary (plain language)", expanded=True):
+        eff_looks_txt = ("none (final only)" if len(design_sel["looks_eff"]) == 0 else ", ".join(str(x) for x in design_sel["looks_eff"]))
+        saf_looks_txt = ("none (final only)" if len(design_sel.get("looks_saf", [])) == 0 else ", ".join(str(x) for x in design_sel.get("looks_saf", [])))
+        st.markdown("**Design snapshot**")
+        st.markdown("• **Planned maximum participants (N):** " + str(design_sel["N_total"]))
+        st.markdown("• **Run‑in (eff/saf):** " + f"{design_sel.get('run_in_eff',0)} / {design_sel.get('run_in_saf',0)}")
+        st.markdown("• **Interim looks — efficacy:** " + eff_looks_txt)
+        st.markdown("• **Interim looks — safety:** " + saf_looks_txt)
+        st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
+        if enable_safety:
+            st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
+        st.markdown("• **Null/Target response (p₀ / p₁):** " + f"{p0:.2f} / {p1:.2f}")
+        st.markdown("• **Key thresholds:** " + f"θ_final={design_sel['theta_final']:.3f}, θ_interim={design_sel['theta_interim']:.3f}, c_futility={design_sel['c_futility']:.3f}")
+        if enable_safety:
+            st.markdown("• **Safety thresholds:** " + f"q_max={q_max:.2f}, θ_tox={theta_tox:.3f}")
+        st.markdown("• **Final rule (minimum successes needed):** " + f"s_min_final={design_sel['s_min_final']}")
+
+        st.markdown("**Decision rules in plain English**")
+        st.markdown("- **Final success:** Declare success at the end if P(p>p₀ | all data) ≥ θ_final (equivalently, need at least s_min_final responders).")
+        st.markdown("- **Futility (interim):** If the predictive probability of final success is below c_futility, stop for futility.")
+        if allow_early_success:
+            st.markdown("- **Early success (interim):** If P(p>p₀ | current data) ≥ θ_interim, stop early for success.")
+        if enable_safety:
+            st.markdown("- **Safety:** If P(q>q_max | data) ≥ θ_tox at any look (or final), stop for safety.")
+
+        st.caption("Interim continue thresholds (must have at least x responders to continue at each efficacy look):")
         st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_eff"], orient="index", columns=["x ≥ to continue"]))
 
     st.write("#### Deep‑dive simulation settings")
     colD1, colD2, colD3 = st.columns(3)
     with colD1:
-        n_sims_deep = st.number_input("Sims (deep dive)", 2000, 800000, 150000, 5000, key='deep_sims')
+        n_sims_deep = st.number_input("Simulations to run (deep dive)", 2000, 800000, 150000, 5000, key='deep_sims', help="More simulations → tighter precision; slower.")
     with colD2:
-        seed_deep = st.number_input("Seed (deep)", 1, None, seed + 1, 1, key='deep_seed')
+        seed_deep = st.number_input("Random seed (deep dive)", 1, None, seed + 1, 1, key='deep_seed', help="Change to re-simulate independently.")
     with colD3:
-        show_ci = st.checkbox("Show 95% CI bands", value=True, key='deep_ci')
+        show_ci = st.checkbox("Show 95% CI bands on metrics", value=True, key='deep_ci')
 
     colQ1, colQ2, colQ3 = st.columns(3)
     with colQ1:
-        q_good = st.number_input("q_good", 0.0, 1.0, 0.10, 0.01, key='q_good')
+        q_good = st.number_input("q_good (typical/benign toxicity)", 0.0, 1.0, 0.10, 0.01, key='q_good')
     with colQ2:
-        q_bad = st.number_input("q_bad", 0.0, 1.0, 0.20, 0.01, key='q_bad')
+        q_bad = st.number_input("q_bad (concerning/high toxicity)", 0.0, 1.0, 0.20, 0.01, key='q_bad')
     with colQ3:
-        q_for_OC = st.number_input("q for OC curves", 0.0, 1.0, 0.10, 0.01, key='q_for_oc')
+        q_for_OC = st.number_input("q used for OC/ESS curves", 0.0, 1.0, 0.10, 0.01, key='q_for_oc')
 
-    if st.button("Run DEEP‑DIVE (eff + safety)", key='run_deep'):
+    if st.button("Run DEEP‑DIVE (efficacy + safety)", key='run_deep'):
         rng = np.random.default_rng(seed_deep)
         Ueff = rng.uniform(size=(n_sims_deep, design_sel["N_total"]))
         Utox = rng.uniform(size=(n_sims_deep, design_sel["N_total"]))
@@ -862,37 +774,37 @@ else:
         def se_p(p):
             return se_prop(p, n_sims_deep)
         cols = st.columns(6 if enable_safety else 5)
-        t1 = res_p0_qgood['reject_rate']; cols[0].metric("Type I @ p₀,q_good", f"{t1:.3f}", f"±{1.96*se_p(t1):.3f}")
-        pwr = res_p1_qgood['reject_rate']; cols[1].metric("Power @ p₁,q_good", f"{pwr:.3f}", f"±{1.96*se_p(pwr):.3f}")
+        t1 = res_p0_qgood['reject_rate']; cols[0].metric("Type I @ p₀, q_good", f"{t1:.3f}", f"±{1.96*se_p(t1):.3f}" if show_ci else None)
+        pwr = res_p1_qgood['reject_rate']; cols[1].metric("Power @ p₁, q_good", f"{pwr:.3f}", f"±{1.96*se_p(pwr):.3f}" if show_ci else None)
         sd = res_p1_qgood['stop_dist']
         if isinstance(sd, pd.DataFrame) and not sd.empty:
             Nvals = sd['N_stop'].to_numpy(); probs = sd['Probability'].to_numpy()
             meanN = (Nvals*probs).sum(); varN = ((Nvals-meanN)**2*probs).sum(); seN = math.sqrt(varN/max(1,n_sims_deep))
         else:
             seN = 0.0
-        cols[3].metric("ESS @ p₁,q_good", f"{res_p1_qgood['ess']:.1f}", f"±{1.96*seN:.1f}")
-        cols[2].metric("ESS @ p₀,q_good", f"{res_p0_qgood['ess']:.1f}")
-        estop = res_p1_qgood['early_stop_rate']; cols[4].metric("Early stop @ p₁ (any)", f"{estop:.3f}", f"±{1.96*se_p(estop):.3f}")
+        cols[3].metric("ESS @ p₁, q_good", f"{res_p1_qgood['ess']:.1f}", f"±{1.96*seN:.1f}" if show_ci else None)
+        cols[2].metric("ESS @ p₀, q_good", f"{res_p0_qgood['ess']:.1f}")
+        estop = res_p1_qgood['early_stop_rate']; cols[4].metric("Early stop (any) @ p₁", f"{estop:.3f}", f"±{1.96*se_p(estop):.3f}" if show_ci else None)
         if enable_safety:
-            sprob = res_p1_qbad['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁,q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}")
+            sprob = res_p1_qbad['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁, q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}" if show_ci else None)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 4) Threshold Tuner++ with configurable bounds                           ║
+# ║ 4) Threshold Tuner++ (with bounds)                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 4) Threshold Tuner++ (with bounds)")
 with st.expander("Open Threshold Tuner++", expanded=False):
     colT1, colT2 = st.columns(2)
     with colT1:
-        n_sims_tuner = st.number_input("Sims per eval", 2000, 200000, 40000, 2000, key='tuner_sims')
-        seed_tuner = st.number_input("Seed (tuner)", 1, None, st.session_state.get('seed', 2026)+3, 1, key='tuner_seed')
+        n_sims_tuner = st.number_input("Simulations per evaluation", 2000, 200000, 40000, 2000, key='tuner_sims')
+        seed_tuner = st.number_input("Random seed (tuner)", 1, None, st.session_state.get('seed', 2026)+3, 1, key='tuner_seed')
         alpha_target = st.number_input("Target α at p₀ (for θ_final bisection)", 0.0, 0.5, st.session_state.get('alpha_max', 0.10), 0.01, format="%.2f", key='tuner_alpha_target')
     with colT2:
         objective = st.selectbox("Optimize for", ["Min ESS @ p0", "Min ESS @ p1", "Max Power @ p1", "Max Early stops @ p0"], index=0, key='tuner_objective')
-        power_floor = st.number_input("Constraint: min power", 0.0, 1.0, st.session_state.get('power_min', 0.80), 0.01, format="%.2f", key='tuner_power_floor')
-        alpha_cap = st.number_input("Constraint: max α", 0.0, 0.5, st.session_state.get('alpha_max', 0.10), 0.01, format="%.2f", key='tuner_alpha_cap')
+        power_floor = st.number_input("Constraint: minimum power", 0.0, 1.0, st.session_state.get('power_min', 0.80), 0.01, format="%.2f", key='tuner_power_floor')
+        alpha_cap = st.number_input("Constraint: maximum α", 0.0, 0.5, st.session_state.get('alpha_max', 0.10), 0.01, format="%.2f", key='tuner_alpha_cap')
 
-    st.markdown("**Bounds** (you can set your own; below are recommended defaults)")
+    st.markdown("**Bounds** (defaults are typical) — adjust if needed")
     colB1, colB2 = st.columns(2)
     with colB1:
         ti_min_default = max(0.5, float(st.session_state.get('theta_final', theta_final)) - 0.15)
@@ -907,7 +819,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
         looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
         theta_final_star = tune_theta_final_bisect(st.session_state.get('N_select', 60), looks_eff_tune, a0, b0, p0, p1, allow_early_success, st.session_state.get('c_futility', c_futility), st.session_state.get('theta_interim', theta_interim), run_in_eff, alpha_target, n_sims_tuner, seed_tuner)
         if theta_final_star is None:
-            st.error("Could not find a feasible θ_final that meets the α target. Try relaxing target or increasing N.")
+            st.error("Could not find a feasible θ_final that meets the α target. Try relaxing the target or increasing N.")
         else:
             st.success(f"Bisection θ_final ≈ {theta_final_star:.3f}")
             best = joint_search_theta_interim_cf_with_bounds(
@@ -917,7 +829,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
                 seed=seed_tuner, ti_min=ti_min, ti_max=ti_max, cf_min=cf_min, cf_max=cf_max,
             )
             if best is None:
-                st.warning("No (θ_interim, c_futility) pair within bounds met constraints.")
+                st.warning("No (θ_interim, c_futility) pair within bounds met the constraints.")
             else:
                 r0, r1 = best['r0'], best['r1']
                 st.write({
@@ -933,7 +845,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
                     st.session_state['theta_final'] = float(theta_final_star)
                     st.session_state['theta_interim'] = float(best['theta_interim'])
                     st.session_state['c_futility'] = float(best['c_futility'])
-                    st.success("Applied tuned θ_final, θ_interim, c_futility to sidebar.")
+                    st.success("Applied tuned θ_final, θ_interim, c_futility to the sidebar.")
                     st.rerun()
                 st.session_state['tuner_df'] = pd.DataFrame([{
                     'theta_final': float(theta_final_star),
@@ -955,15 +867,15 @@ with st.expander("Open OC Explorer", expanded=True):
         design_sel = st.session_state['deep_design']
         colO1, colO2 = st.columns(2)
         with colO1:
-            p_min = st.number_input("p_min", 0.0, 1.0, max(0.0, st.session_state.get('p0', p0)-0.20), 0.01, key='oc_pmin')
-            p_max = st.number_input("p_max", 0.0, 1.0, min(1.0, st.session_state.get('p1', p1)+0.25), 0.01, key='oc_pmax')
-            p_points = st.slider("# p points", 3, 25, 9, 1, key='oc_ppoints')
+            p_min = st.number_input("Grid: p_min", 0.0, 1.0, max(0.0, st.session_state.get('p0', p0)-0.20), 0.01, key='oc_pmin', help="Start of efficacy (p) grid.")
+            p_max = st.number_input("Grid: p_max", 0.0, 1.0, min(1.0, st.session_state.get('p1', p1)+0.25), 0.01, key='oc_pmax', help="End of efficacy (p) grid.")
+            p_points = st.slider("Number of p points", 3, 25, 9, 1, key='oc_ppoints')
         with colO2:
-            q_min = st.number_input("q_min", 0.0, 1.0, max(0.0, (st.session_state.get('q_max', 0.10) or 0.10)-0.10), 0.01, key='oc_qmin')
-            q_max_g = st.number_input("q_max (grid)", 0.0, 1.0, min(1.0, (st.session_state.get('q_max', 0.10) or 0.10)+0.20), 0.01, key='oc_qmax')
-            q_points = st.slider("# q points", 3, 25, 7, 1, key='oc_qpoints')
-        n_sims_oc = st.number_input("Sims per cell", 2000, 200000, 50000, 2000, key='oc_sims')
-        seed_oc = st.number_input("Seed (OC)", 1, None, st.session_state.get('seed', 2026)+4, 1, key='oc_seed')
+            q_min = st.number_input("Grid: q_min", 0.0, 1.0, max(0.0, (st.session_state.get('q_max', 0.10) or 0.10)-0.10), 0.01, key='oc_qmin', help="Start of toxicity (q) grid.")
+            q_max_g = st.number_input("Grid: q_max", 0.0, 1.0, min(1.0, (st.session_state.get('q_max', 0.10) or 0.10)+0.20), 0.01, key='oc_qmax', help="End of toxicity (q) grid.")
+            q_points = st.slider("Number of q points", 3, 25, 7, 1, key='oc_qpoints')
+        n_sims_oc = st.number_input("Simulations per cell", 2000, 200000, 50000, 2000, key='oc_sims', help="Higher = more precise but slower.")
+        seed_oc = st.number_input("Random seed (OC)", 1, None, st.session_state.get('seed', 2026)+4, 1, key='oc_seed')
 
         if st.button("Run OC Explorer", key='run_oc'):
             rng = np.random.default_rng(seed_oc)
@@ -990,7 +902,7 @@ with st.expander("Open OC Explorer", expanded=True):
             }, inplace=True)
             nice = nice[['p','q','Pr(declare efficacy)','ESS','Pr(safety stop)','Pr(early stop any)']]
             nice = nice.sort_values(['q','p']).reset_index(drop=True)
-            st.dataframe(nice)
+            st.dataframe(nice, use_container_width=True)
 
             if _HAS_PLOTLY:
                 piv = df_grid.pivot(index='q', columns='p', values='reject_rate')
@@ -1045,7 +957,6 @@ with st.expander("Open OC Explorer", expanded=True):
                 st.warning("\n".join(["⚠ "+m for m in warn_msgs]))
 
             with st.expander("Extended interpretation (details)"):
-                # Build safe texts without calling max/min on empty lists
                 robust_text = (f"q ≤ {max(robust_qs):.2f}" if len(robust_qs) > 0 else "no robust q-levels")
                 fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs) > 0 else "no fragile q-levels")
                 safety_q = (min(high_safety_qs) if len(high_safety_qs) > 0 else q_max_g)
@@ -1076,7 +987,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.drawString(x0, y, text)
         y -= dy
 
-    line("Bayesian Single-Arm Design – Summary (v3.1.2)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.3)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1121,7 +1032,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
     return buf.getvalue()
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 6) Export options                                                        ║
+# ║ 6) Export settings and results (JSON / CSVs / PDF)                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 6) Export settings and results (JSON / CSVs / PDF)")
@@ -1134,7 +1045,7 @@ export_bundle = {
     "oc_grid": None if 'oc_grid_df' not in st.session_state else st.session_state['oc_grid_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_2.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_3.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1157,10 +1068,9 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
     if 'oc_grid_df' in st.session_state:
         zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_2_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_3_csv.zip", mime="application/zip")
 
-# PDF
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None), st.session_state.get('tuner_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_2.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_3.pdf", mime="application/pdf")
