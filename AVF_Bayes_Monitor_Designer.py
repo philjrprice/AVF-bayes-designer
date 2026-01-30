@@ -540,9 +540,9 @@ with st.expander("What this tool does (in simple terms)"):
 
 
     st.markdown("""
-    - **Final success** if P(p>p₀|data) ≥ θ_final.  
-    - **Futility** if PPoS < c_futility.  
-    - **Early success** if P(p>p₀|data) ≥ θ_interim.
+# - **Final success** if P(p>p₀|data) ≥ θ_final.  
+# - **Futility** if PPoS < c_futility.  
+# - **Early success** if P(p>p₀|data) ≥ θ_interim.
     """)
 
 # ── Sidebar: inputs ─────────────────────────────────────────────────────────
@@ -1122,17 +1122,16 @@ fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs)>0 else "no cle
 st.markdown(f"**Robust region (indicative):** {robust_text}; **Fragile region:** {fragile_text}.
 
 ")** – Highest response rate you'd still call unacceptable.  
-- **p₁ (target rate)** – A response rate worth declaring success if supported by the data.  
-- **θ_final** – Posterior threshold at the final look: success if P(p>p₀|data) ≥ θ_final.  
-- **θ_interim** – Posterior threshold to allow early success at interims (optional; often ≥ θ_final).  
-- **PPoS** – Predictive Probability of Success: chance (over future data) the study will meet the final rule.  
-- **c_futility** – At interims, stop if PPoS < c_futility.  
-- **Safety rule** – Stop if P(q>q_max|data) ≥ θ_tox, where q is the SAE rate.  
-- **ESS (Expected Sample Size)** – Average number of patients enrolled before stopping.  
-- **Early stop / success / futility / safety** – Fractions of trials that stop at an interim for the indicated reason.
+# - **p₁ (target rate)** – A response rate worth declaring success if supported by the data.  
+# - **θ_final** – Posterior threshold at the final look: success if P(p>p₀|data) ≥ θ_final.  
+# - **θ_interim** – Posterior threshold to allow early success at interims (optional; often ≥ θ_final).  
+# - **PPoS** – Predictive Probability of Success: chance (over future data) the study will meet the final rule.  
+# - **c_futility** – At interims, stop if PPoS < c_futility.  
+# - **Safety rule** – Stop if P(q>q_max|data) ≥ θ_tox, where q is the SAE rate.  
+# - **ESS (Expected Sample Size)** – Average number of patients enrolled before stopping.  
+# - **Early stop / success / futility / safety** – Fractions of trials that stop at an interim for the indicated reason.
 """
 )
 st.caption("Tip: Use stricter θ_interim and/or larger c_futility for more early stopping; adjust safety θ_tox and q_max to match DSMB preferences.")
-
 
 
