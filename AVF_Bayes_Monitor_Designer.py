@@ -538,13 +538,12 @@ st.markdown(
     "  **Fragile region:** " + fragile_text + "."
 )
 
-- **Binary endpoint** with Beta prior.
-- **Final success** if P(p>p₀|data) ≥ θ_final.
-- **Futility** at interims if **PPoS** < c_futility.
-- **Early success** at interims if P(p>p₀|data) ≥ θ_interim (optional).
-- **Safety** (optional): stop if P(q>q_max|data) ≥ θ_tox at interims/final.
-        """
-    )
+
+st.markdown("""
+- **Final success** if P(p>p₀|data) ≥ θ_final.  
+- **Futility** if PPoS < c_futility.  
+- **Early success** if P(p>p₀|data) ≥ θ_interim.
+""")
 
 # ── Sidebar: inputs ─────────────────────────────────────────────────────────
 
@@ -1134,4 +1133,5 @@ st.markdown(f"**Robust region (indicative):** {robust_text}; **Fragile region:**
 """
 )
 st.caption("Tip: Use stricter θ_interim and/or larger c_futility for more early stopping; adjust safety θ_tox and q_max to match DSMB preferences.")
+
 
