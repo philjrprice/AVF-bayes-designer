@@ -1,6 +1,6 @@
 # AVF_Bayes_Monitor_Designer_runin_safety_v3_1_3.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.3 UX upgrades:
+# v3.1.4 UX upgrades:
 #  • Plain-language labels and richer help tooltips across the app
 #  • Friendlier “Chosen Design Summary” panel (clear bullets + decision rules)
 #  • Keeps v3.1.2 safety fixes for OC interpretation and robust strings
@@ -31,7 +31,7 @@ try:
 except Exception:
     _HAS_PLOTLY = False
 
-SCHEMA_VERSION = "v3_1_3_tooltips_summary_ux"
+SCHEMA_VERSION = "v3_1_4_everyN_stops_charts"
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                 ║
@@ -128,7 +128,7 @@ def parse_n_list(s: str) -> List[int]:
                     pass
     return vals
 
-def build_looks_with_runin(N: int, run_in: int, mode_label: str, k_total: Optional[int] = None, perc_str: Optional[str] = None, ns_str: Optional[str] = None) -> List[int]:
+def build_looks_with_runin(N: int, run_in: int, mode_label: str, k_total: Optional[int] = None, perc_str: Optional[str] = None, ns_str: Optional[str] = None, step_every: Optional[int] = None) -> List[int]:
     looks: List[int] = []
     run_in = int(max(0, min(run_in, N - 1)))
     if run_in > 0:
@@ -158,6 +158,16 @@ def build_looks_with_runin(N: int, run_in: int, mode_label: str, k_total: Option
                 pass
             if run_in < n_i < N:
                 looks.append(int(n_i))
+    elif mode_label == "Look every N after run-in":
+        step = int(step_every or 0)
+        if step > 0 and (N - run_in) > 0:
+            k = 1
+            while True:
+                n_i = run_in + k*step
+                if n_i >= N:
+                    break
+                looks.append(int(n_i))
+                k += 1
 
     looks = [int(x) for x in looks if 0 < x < N]
     looks = sorted(list(dict.fromkeys(looks)))
@@ -481,8 +491,8 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar (with richer tooltips)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.3", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.3")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.4", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.4")
 st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.")
 
 with st.expander("What this tool does (in simple terms)"):
@@ -569,16 +579,18 @@ elif looks_eff_mode_label == "Custom absolute Ns":
 st.sidebar.header("4) Safety look schedule")
 run_in_saf = st.sidebar.number_input("Run‑in for safety", 0, 400, 0, 1, key='run_in_saf', help="Patients enrolled before the first safety look; they count for safety decisions.")
 looks_saf_mode_label = st.sidebar.selectbox("Safety look timing",
-    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"], index=1, key='saf_mode',
+    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns", "Look every N after run-in"], index=1, key='saf_mode',
     help="Choose how to place safety interim looks.")
 
-k_looks_saf = perc_saf_str = ns_saf_str = None
+k_looks_saf = perc_saf_str = ns_saf_str = step_saf = None
 if looks_saf_mode_label == "Equal‑spaced (choose total looks incl. run‑in)":
     k_looks_saf = st.sidebar.slider("Total safety looks (including run‑in)", 1, 8, 2, 1, key='k_saf')
 elif looks_saf_mode_label == "Custom percentages of remaining":
     perc_saf_str = st.sidebar.text_input("Safety look percentages (comma)", "33,67", key='perc_saf')
 elif looks_saf_mode_label == "Custom absolute Ns":
     ns_saf_str = st.sidebar.text_input("Safety look sample sizes N (comma)", "", key='ns_saf')
+elif looks_saf_mode_label == "Look every N after run-in":
+    step_saf = st.sidebar.number_input("Look every N participants (after safety run-in)", 1, 400, 10, 1, key='step_saf', help="First safety look is after the run-in; then look every N participants. Final analysis still occurs at max N.")
 
 # Sidebar — Screener settings (helped)
 st.sidebar.header("5) Rapid Screener")
@@ -640,7 +652,7 @@ with st.expander("Open compare panel", expanded=False):
     def _build_eff(N):
         return build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
     def _build_saf(N):
-        return build_looks_with_runin(N, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str)
+        return build_looks_with_runin(N, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf)
 
     if st.button("Run compare", key='run_compare'):
         Ns_cmp = []
@@ -690,6 +702,18 @@ with st.expander("Open compare panel", expanded=False):
                 df_cmp = pd.DataFrame(rows).sort_values("N").reset_index(drop=True)
                 st.dataframe(df_cmp, use_container_width=True)
                 st.session_state['compare_df'] = df_cmp
+        # Stop-reason chart across input N values
+        if _HAS_PLOTLY and not df_cmp.empty:
+            fig_cmp = go.Figure()
+            fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early succ @p1'], name='Early success @p1,q_good')
+            fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early fut @p1'], name='Early futility @p1,q_good')
+            if 'Early safety @p1' in df_cmp.columns:
+                fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early safety @p1'], name='Early safety @p1,q_good')
+            if 'Safety stop @p1,q_bad (any stage)' in df_cmp.columns:
+                fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Safety stop @p1,q_bad (any stage)'], name='Safety stop (any) @p1,q_bad')
+            fig_cmp.update_layout(barmode='group', title='Stop proportions by reason vs N', xaxis_title='N', yaxis_title='Proportion')
+            st.plotly_chart(fig_cmp, use_container_width=True)
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 3) Deep Dive (joint efficacy + safety)                                   ║
@@ -699,7 +723,7 @@ st.write("### 3) Deep Dive (joint efficacy + safety)")
 N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select',
                            help="Choose an N from your screening range (or adjacent values) to inspect in detail.")
 looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
-looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str)
+looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf)
 
 s_min_sel = min_successes_for_posterior_threshold(a0, b0, N_select, p0, theta_final)
 if s_min_sel is None:
@@ -787,6 +811,43 @@ else:
         estop = res_p1_qgood['early_stop_rate']; cols[4].metric("Early stop (any) @ p₁", f"{estop:.3f}", f"±{1.96*se_p(estop):.3f}" if show_ci else None)
         if enable_safety:
             sprob = res_p1_qbad['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁, q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}" if show_ci else None)
+        # Stop-reason breakdown chart for p1,q_good (plus safety any at q_bad)
+        if _HAS_PLOTLY:
+            bars_x = ['Early success (p1,q_good)', 'Early futility (p1,q_good)']
+            bars_y = [res_p1_qgood.get('eff_early_succ_rate', 0.0), res_p1_qgood.get('eff_early_fut_rate', 0.0)]
+            if enable_safety:
+                bars_x.append('Early safety (p1,q_good)')
+                bars_y.append(res_p1_qgood.get('saf_early_rate', 0.0))
+            fig_dd = go.Figure([go.Bar(x=bars_x, y=bars_y, name='Early stops')])
+            if enable_safety:
+                fig_dd.add_bar(x=['Safety stop (any) @p1,q_bad'], y=[res_p1_qbad.get('safety_stop_prob', 0.0)], name='Safety (any) @q_bad')
+            fig_dd.update_layout(barmode='group', title='Deep-dive: stop proportions by reason', yaxis_title='Proportion')
+            st.plotly_chart(fig_dd, use_container_width=True)
+
+        # Per-look stop tables (proportions at each efficacy/safety look) for p1,q_good
+        try:
+            eff_looks = design_sel.get('looks_eff', [])
+            saf_looks = design_sel.get('looks_saf', [])
+            succ_by_look = res_p1_qgood.get('eff_early_succ_by_look', [])
+            fut_by_look  = res_p1_qgood.get('eff_early_fut_by_look', [])
+            if eff_looks and (succ_by_look or fut_by_look):
+                df_eff_looks = pd.DataFrame({
+                    'Look N': eff_looks,
+                    'Early success': list(succ_by_look)[:len(eff_looks)],
+                    'Early futility': list(fut_by_look)[:len(eff_looks)],
+                })
+                st.caption('Proportion of early stops at each *efficacy* look (p1,q_good)')
+                st.dataframe(df_eff_looks, use_container_width=True)
+            if enable_safety:
+                saf_by_look = res_p1_qgood.get('saf_by_look', [])
+                if saf_looks and saf_by_look:
+                    labels = [str(n) for n in saf_looks] + ['Final'] if len(saf_by_look)==len(saf_looks)+1 else [str(n) for n in saf_looks[:len(saf_by_look)]]
+                    df_saf_looks = pd.DataFrame({'Safety look': labels, 'Safety stops': list(saf_by_look)[:len(labels)]})
+                    st.caption('Proportion of safety stops at each *safety* look (p1,q_good)')
+                    st.dataframe(df_saf_looks, use_container_width=True)
+        except Exception:
+            pass
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 4) Threshold Tuner++ (with bounds)                                       ║
@@ -987,7 +1048,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.drawString(x0, y, text)
         y -= dy
 
-    line("Bayesian Single-Arm Design – Summary (v3.1.3)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.4)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
