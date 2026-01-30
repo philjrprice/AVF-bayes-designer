@@ -1,4 +1,4 @@
-# app.py
+# AVF_Bayes_Monitor_Designer.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
 # Rapid screener + deep-dive simulation WITH optional safety monitoring
 #
@@ -7,6 +7,7 @@
 #   • Early-stop breakdown in Deep-dive (success / futility / safety) with by-look arrays
 #   • Stacked by-look charts (Plotly if available; Streamlit fallback)
 #   • Compare panel to evaluate multiple Ns side-by-side under joint (efficacy+safety) simulation
+#   • Robust cache invalidation + safe column selection to prevent KeyError after updates
 #   • Extensive tooltips and comments throughout
 #
 # Author: M365 Copilot for Phil
@@ -29,6 +30,12 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cache schema version: bump this string whenever you change screening columns.
+# This forces Streamlit's cache to refresh stale dataframes after updates.
+# ──────────────────────────────────────────────────────────────────────────────
+SCHEMA_VERSION = "screen_v2_earlystop"  # bump if you edit screening columns again
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -146,7 +153,7 @@ def simulate_design(design: Dict, p: float, U: np.ndarray) -> Dict:
     success = np.zeros(n_sims, dtype=bool)
     final_n = np.zeros(n_sims, dtype=np.int32)
 
-    # Per-look counts and reason-specific counts (new)
+    # Per-look counts and reason-specific counts
     stop_by_look_counts = np.zeros(len(looks), dtype=np.int64)
     early_succ_by_look = np.zeros(len(looks), dtype=np.int64)
     early_fut_by_look  = np.zeros(len(looks), dtype=np.int64)
@@ -262,7 +269,7 @@ def simulate_design_with_safety(
     success = np.zeros(n_sims, dtype=bool)
     final_n = np.zeros(n_sims, dtype=np.int32)
 
-    # New: reason-specific by-look counts
+    # Reason-specific by-look counts
     early_succ_by_look = np.zeros(len(looks), dtype=np.int64)
     early_fut_by_look  = np.zeros(len(looks), dtype=np.int64)
     safety_by_look     = np.zeros(len(looks) + 1, dtype=np.int64)  # include slot [-1] for final safety stops
@@ -375,7 +382,7 @@ def simulate_design_with_safety(
         "ess": float(ess),
         "safety_stop_prob": float(any_safety_rate),
         "stop_dist": stop_dist,
-        # New: reason/by-look outputs
+        # Reason/by-look outputs
         "early_succ_by_look": (early_succ_by_look / n_sims).tolist(),
         "early_fut_by_look":  (early_fut_by_look  / n_sims).tolist(),
         "safety_by_look":     (safety_by_look     / n_sims).tolist(),
@@ -393,7 +400,7 @@ def simulate_design_with_safety(
 def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: Optional[np.ndarray] = None):
     """
     Screen many candidate designs quickly (efficacy-only).
-    Now also records early-stop metrics at p0 for quick comparisons.
+    Records early-stop metrics at p0 for quick comparisons.
     """
     rng = np.random.default_rng(seed)
     if U is None:
@@ -751,6 +758,11 @@ for N in Ns:
         "allow_early_success": allow_early_success
     })
 
+# ── Helper: safe column selection to avoid KeyError on cached DF schema changes ──
+def _safe_cols(df: pd.DataFrame, cols: List[str]) -> List[str]:
+    """Return only the columns that actually exist in df (avoid KeyError)."""
+    return [c for c in cols if c in df.columns]
+
 # ── Rapid Screener ──────────────────────────────────────────────────────────
 
 st.write("### 1) Rapid Screener")
@@ -760,14 +772,19 @@ st.caption(
 )
 
 @st.cache_data(show_spinner=False)
-def _screen(param_grid, n_sims_small, seed):
+def _screen(param_grid, n_sims_small, seed, schema_version: str):
+    """
+    Cached screening function.
+    schema_version is a dummy key we pass to force cache invalidation after schema changes.
+    """
     rng = np.random.default_rng(seed)
     Nmax = max([g["N_total"] for g in param_grid])
     U = rng.uniform(size=(n_sims_small, Nmax))
     df, designs = shortlist_designs(param_grid, n_sims_small, seed, U)
+    _ = schema_version  # make the version a dependency
     return df, designs
 
-df_screen, designs_built = _screen(param_grid, n_sims_small, seed)
+df_screen, designs_built = _screen(param_grid, n_sims_small, seed, SCHEMA_VERSION)
 
 if df_screen.empty:
     st.warning("No viable designs found (final rule may be impossible). Try relaxing θ_final or expanding N.")
@@ -777,23 +794,23 @@ else:
         (df_screen["Power @ p1"] >= power_min)
     ].copy()
 
+    cols_to_show = [
+        "N_total", "looks", "theta_final", "c_futility",
+        "Type I error @ p0", "Power @ p1", "ESS @ p0",
+        "Early stop @ p0 (any)", "Early success @ p0", "Early futility @ p0"
+    ]
+
     if df_ok.empty:
         st.info("No designs met both α and power. Showing the full screening table instead (for inspection).")
-        cols_to_show = [
-            "N_total", "looks", "theta_final", "c_futility",
-            "Type I error @ p0", "Power @ p1", "ESS @ p0",
-            "Early stop @ p0 (any)", "Early success @ p0", "Early futility @ p0"
-        ]
-        st.dataframe(df_screen[cols_to_show].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True))
+        st.dataframe(
+            df_screen[_safe_cols(df_screen, cols_to_show)]
+            .sort_values(["ESS @ p0", "N_total"])
+            .reset_index(drop=True)
+        )
         df_to_select_from = df_screen.sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True)
     else:
         df_ranked = df_ok.sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True)
-        cols_to_show = [
-            "N_total", "looks", "theta_final", "c_futility",
-            "Type I error @ p0", "Power @ p1", "ESS @ p0",
-            "Early stop @ p0 (any)", "Early success @ p0", "Early futility @ p0"
-        ]
-        st.dataframe(df_ranked[cols_to_show].head(15))
+        st.dataframe(df_ranked[_safe_cols(df_ranked, cols_to_show)].head(15))
         st.success(f"Found {len(df_ok)} candidates that meet your criteria. Showing top 15 ranked by low ESS @ p₀.")
         df_to_select_from = df_ranked
 
