@@ -199,37 +199,38 @@ def ess_se_from_stopdist(df_stop: pd.DataFrame, n: int) -> float:
 def simulate_design_eff_only(design: Dict, p: float, U: np.ndarray) -> Dict:
     N = design["N_total"]
     looks_eff = design["looks_eff"]
+    looks_fut = design.get("looks_fut", looks_eff)
     run_in_eff = design.get("run_in_eff", 0)
     a0 = design["a0"]; b0 = design["b0"]
     p0 = design["p0"]; theta_final = design["theta_final"]
     theta_interim = design.get("theta_interim", theta_final)
     allow_early = design["allow_early_success"]
     s_min_final = design["s_min_final"]
-    x_min_to_continue = design["x_min_to_continue_by_look_eff"]
+    x_min_to_continue = design["x_min_to_continue_by_look_fut"]
 
     n_sims = U.shape[0]
     X = (U[:, :N] < p).astype(np.int16)
-
     cum_x = np.zeros(n_sims, dtype=np.int32)
     n_curr = 0
     active = np.ones(n_sims, dtype=bool)
     success = np.zeros(n_sims, dtype=bool)
     final_n = np.zeros(n_sims, dtype=np.int32)
 
-    early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64)
-    early_fut_by_look = np.zeros(len(looks_eff), dtype=np.int64)
+    eff_early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64)
+    fut_early_by_look = np.zeros(len(looks_fut), dtype=np.int64)
 
     if run_in_eff > 0:
         cum_x[active] += np.sum(X[active, :run_in_eff], axis=1)
         n_curr = run_in_eff
 
-    for li, look_n in enumerate(looks_eff):
-        add = look_n - n_curr
-        if add > 0:
-            cum_x[active] += np.sum(X[active, n_curr:look_n], axis=1)
-            n_curr = look_n
+    events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_fut) + [N])))
 
-        if allow_early and active.any():
+    for ev in events:
+        if ev > n_curr and active.any():
+            cum_x[active] += np.sum(X[active, n_curr:ev], axis=1)
+            n_curr = ev
+
+        if ev in looks_eff and allow_early and active.any():
             a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr)
             post_probs = 1.0 - beta.cdf(p0, a_post, b_post)
             early_succ = (post_probs >= theta_interim)
@@ -239,27 +240,30 @@ def simulate_design_eff_only(design: Dict, p: float, U: np.ndarray) -> Dict:
                 success[idx] = True
                 final_n[idx] = n_curr
                 active[idx] = False
-                early_succ_by_look[li] += early_succ.sum()
+                li_e = looks_eff.index(ev)
+                eff_early_succ_by_look[li_e] += early_succ.sum()
             if not active.any():
                 break
 
-        x_min = x_min_to_continue.get(look_n, None)
-        if x_min is None:
-            idx = np.where(active)[0]
-            if idx.size > 0:
-                final_n[idx] = n_curr
-                active[idx] = False
-                early_fut_by_look[li] += idx.size
-        else:
-            need_continue = cum_x[active] >= x_min
-            idx_all = np.where(active)[0]
-            idx_stop = idx_all[~need_continue]
-            if idx_stop.size > 0:
-                final_n[idx_stop] = n_curr
-                active[idx_stop] = False
-                early_fut_by_look[li] += idx_stop.size
-        if not active.any():
-            break
+        if ev in looks_fut and active.any():
+            x_min = x_min_to_continue.get(ev, None)
+            li_f = looks_fut.index(ev)
+            if x_min is None:
+                idx = np.where(active)[0]
+                if idx.size > 0:
+                    final_n[idx] = n_curr
+                    active[idx] = False
+                    fut_early_by_look[li_f] += idx.size
+            else:
+                need_continue = cum_x[active] >= x_min
+                idx_all = np.where(active)[0]
+                idx_stop = idx_all[~need_continue]
+                if idx_stop.size > 0:
+                    final_n[idx_stop] = n_curr
+                    active[idx_stop] = False
+                    fut_early_by_look[li_f] += idx_stop.size
+            if not active.any():
+                break
 
     if active.any():
         add = N - n_curr
@@ -273,23 +277,22 @@ def simulate_design_eff_only(design: Dict, p: float, U: np.ndarray) -> Dict:
 
     reject_rate = success.mean()
     ess = final_n.mean()
-    early_succ_rate = early_succ_by_look.sum() / n_sims
-    early_fut_rate = early_fut_by_look.sum() / n_sims
+    early_succ_rate = eff_early_succ_by_look.sum() / n_sims
+    early_fut_rate = fut_early_by_look.sum() / n_sims
     early_stop_rate = early_succ_rate + early_fut_rate
-
     unique_ns, counts = np.unique(final_n, return_counts=True)
     stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop")
+
     return {
         "reject_rate": float(reject_rate),
         "ess": float(ess),
         "stop_dist": stop_dist,
-        "early_succ_by_look_eff": (early_succ_by_look / n_sims).tolist(),
-        "early_fut_by_look_eff": (early_fut_by_look / n_sims).tolist(),
-        "early_succ_rate": float(early_succ_rate),
-        "early_fut_rate": float(early_fut_rate),
+        "early_succ_by_look_eff": (eff_early_succ_by_look / n_sims).tolist(),
+        "early_fut_by_look_eff": (fut_early_by_look / n_sims).tolist(),
+        "eff_early_succ_rate": float(early_succ_rate),
+        "eff_early_fut_rate": float(early_fut_rate),
         "early_stop_rate": float(early_stop_rate),
     }
-
 
 def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.ndarray, U_tox: np.ndarray) -> Dict:
     N = design["N_total"]
@@ -300,7 +303,7 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
     theta_interim = design.get("theta_interim", theta_final)
     allow_early = design["allow_early_success"]
     s_min_final = design["s_min_final"]
-    x_min_to_continue = design["x_min_to_continue_by_look_eff"]
+    x_min_to_continue = design["x_min_to_continue_by_look_fut"]
     tox = design.get("safety", None)
 
     n_sims = U_eff.shape[0]
@@ -444,6 +447,7 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
     for g in param_grid:
         N = g["N_total"]
         looks_eff = g["looks_eff"]
+        looks_fut = g.get("looks_fut", looks_eff)
         a0 = g["a0"]; b0 = g["b0"]
         p0 = g["p0"]; p1 = g["p1"]
         theta_final = g["theta_final"]; c_futility = g["c_futility"]
@@ -453,12 +457,12 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
         s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
         if s_min is None:
             continue
-        x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, c_futility)
+        x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, c_futility)
         design = dict(
             N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0,
             theta_final=theta_final, theta_interim=theta_interim,
             c_futility=c_futility, allow_early_success=allow_early,
-            s_min_final=s_min, x_min_to_continue_by_look_eff=x_min_to_continue,
+            s_min_final=s_min, x_min_to_continue_by_look_fut=x_min_to_continue,
             p1=p1, run_in_eff=g.get("run_in_eff", 0)
         )
         res_p0 = simulate_design_eff_only(design, p0, U[:, :N])
@@ -597,6 +601,39 @@ elif looks_saf_mode_label == "Custom absolute Ns":
 elif looks_saf_mode_label == "Look every N after run-in":
     step_saf = st.sidebar.number_input("Look every N participants (after safety run-in)", 1, 400, 10, 1, key='step_saf', help="First safety look is after the run-in; then look every N participants. Final analysis still occurs at max N.")
 
+
+# Sidebar — Futility look schedule (new)
+st.sidebar.header("4b) Futility look schedule")
+use_fut_same = st.sidebar.checkbox(
+    "Use same schedule as efficacy? (default)",
+    True,
+    key='fut_same',
+    help="If checked, futility looks occur at the same Ns as efficacy looks (backward-compatible). Uncheck to customize a separate futility schedule.")
+if use_fut_same:
+    run_in_fut = int(st.session_state.get('run_in_eff', run_in_eff))
+    looks_fut_mode_label = "Same as efficacy"
+    k_looks_fut = perc_fut_str = ns_fut_str = step_fut = None
+else:
+    run_in_fut = st.sidebar.number_input(
+        "Run‑in for futility",
+        0, 400, int(st.session_state.get('run_in_eff', run_in_eff)), 1, key='run_in_fut',
+        help="Patients enrolled before the first futility look; they count for futility decisions.")
+    looks_fut_mode_label = st.sidebar.selectbox(
+        "Futility look timing",
+        ["Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns", "Look every N after run‑in"],
+        index=1, key='fut_mode',
+        help="Choose how to place futility interim looks.")
+    k_looks_fut = perc_fut_str = ns_fut_str = step_fut = None
+    if looks_fut_mode_label == "Equal‑spaced (choose total looks incl. run‑in)":
+        k_looks_fut = st.sidebar.slider("Total futility looks (including run‑in)", 1, 8, 2, 1, key='k_fut')
+    elif looks_fut_mode_label == "Custom percentages of remaining":
+        perc_fut_str = st.sidebar.text_input("Futility look percentages (comma)", "33,67", key='perc_fut')
+    elif looks_fut_mode_label == "Custom absolute Ns":
+        ns_fut_str = st.sidebar.text_input("Futility look sample sizes N (comma)", "", key='ns_fut')
+    elif looks_fut_mode_label == "Look every N after run‑in":
+        step_fut = st.sidebar.number_input("Look every N participants (after futility run‑in)", 1, 400, 10, 1, key='step_fut',
+                                           help="First futility look is after the run‑in; then look every N participants. Final analysis still occurs at max N.")
+
 # Sidebar — Screener settings (helped)
 st.sidebar.header("5) Rapid Screener")
 N_min, N_max = st.sidebar.slider("Range of maximum N values to test", 10, 400, (30, 120), 1, key='Nrange', help="We'll scan this range to find feasible, efficient designs.")
@@ -611,6 +648,7 @@ Ns = list(range(N_min, N_max + 1, N_step))
 param_grid = []
 for N in Ns:
     looks_eff = build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
+    looks_fut = looks_eff if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N, run_in_fut, looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut)
     param_grid.append(dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
                            theta_final=theta_final, theta_interim=float(theta_interim),
                            c_futility=c_futility, allow_early_success=allow_early_success,
@@ -680,12 +718,12 @@ with st.expander("Open compare panel", expanded=False):
                 smin_cmp = min_successes_for_posterior_threshold(a0, b0, Ncmp, p0, theta_final)
                 if smin_cmp is None:
                     continue
-                x_min_cmp = compute_interim_futility_cutoffs(a0, b0, Ncmp, looks_eff_cmp, p0, theta_final, c_futility)
+                x_min_cmp = compute_interim_futility_cutoffs(a0, b0, Ncmp, looks_fut_cmp, p0, theta_final, c_futility)
                 design_cmp = dict(N_total=Ncmp, looks_eff=looks_eff_cmp, looks_saf=looks_saf_cmp,
                                   run_in_eff=int(run_in_eff), run_in_saf=int(run_in_saf), a0=a0, b0=b0,
                                   p0=p0, theta_final=theta_final, theta_interim=float(theta_interim),
                                   c_futility=c_futility, allow_early_success=allow_early_success,
-                                  s_min_final=smin_cmp, x_min_to_continue_by_look_eff=x_min_cmp)
+                                  s_min_final=smin_cmp, x_min_to_continue_by_look_fut=x_min_cmp)
                 if enable_safety:
                     design_cmp["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
                 Ueff = rng.uniform(size=(n_sims_compare, Ncmp))
@@ -734,13 +772,15 @@ s_min_sel = min_successes_for_posterior_threshold(a0, b0, N_select, p0, theta_fi
 if s_min_sel is None:
     st.error("Final rule infeasible at this N. Relax θ_final / adjust prior / increase N.")
 else:
-    x_min_to_continue_sel = compute_interim_futility_cutoffs(a0, b0, N_select, looks_eff_sel, p0, theta_final, c_futility)
+    # Build futility looks (same as efficacy by default)
+    looks_fut_sel = looks_eff_sel if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N_select, int(st.session_state.get('run_in_fut', run_in_eff)), looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut)
+    x_min_to_continue_sel = compute_interim_futility_cutoffs(a0, b0, N_select, looks_fut_sel, p0, theta_final, c_futility)
     design_sel = dict(N_total=N_select, a0=a0, b0=b0, p0=p0, p1=p1, theta_final=theta_final,
                       theta_interim=float(theta_interim), c_futility=c_futility,
                       allow_early_success=allow_early_success, s_min_final=s_min_sel,
-                      looks_eff=looks_eff_sel, looks_saf=looks_saf_sel,
+                      looks_eff=looks_eff_sel, looks_saf=looks_saf_sel, looks_fut=looks_fut_sel,
                       run_in_eff=int(run_in_eff), run_in_saf=int(run_in_saf),
-                      x_min_to_continue_by_look_eff=x_min_to_continue_sel)
+                      x_min_to_continue_by_look_fut=x_min_to_continue_sel)
     if enable_safety:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
 
@@ -753,6 +793,8 @@ else:
         st.markdown("• **Run‑in (eff/saf):** " + f"{design_sel.get('run_in_eff',0)} / {design_sel.get('run_in_saf',0)}")
         st.markdown("• **Interim looks — efficacy:** " + eff_looks_txt)
         st.markdown("• **Interim looks — safety:** " + saf_looks_txt)
+        fut_looks_txt = 'same as efficacy' if design_sel.get('looks_fut', []) == design_sel.get('looks_eff', []) else ('none (final only)' if len(design_sel.get('looks_fut', [])) == 0 else ', '.join(str(x) for x in design_sel.get('looks_fut', [])))
+        st.markdown("• **Interim looks — futility:** " + fut_looks_txt)
         st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
         if enable_safety:
             st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
@@ -770,8 +812,8 @@ else:
         if enable_safety:
             st.markdown("- **Safety:** If P(q>q_max | data) ≥ θ_tox at any look (or final), stop for safety.")
 
-        st.caption("Interim continue thresholds (must have at least x responders to continue at each efficacy look):")
-        st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_eff"], orient="index", columns=["x ≥ to continue"]))
+        st.caption("Futility thresholds (x responders needed to CONTINUE at each futility look):")
+        st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_fut"], orient="index", columns=["x ≥ to continue"]))
 
     st.write("#### Deep‑dive simulation settings")
     colD1, colD2, colD3 = st.columns(3)
@@ -829,29 +871,36 @@ else:
             fig_dd.update_layout(barmode='group', title='Deep-dive: stop proportions by reason', yaxis_title='Proportion')
             st.plotly_chart(fig_dd, use_container_width=True)
 
-        # Per-look stop tables (proportions at each efficacy/safety look) for p1,q_good
-        try:
-            eff_looks = design_sel.get('looks_eff', [])
-            saf_looks = design_sel.get('looks_saf', [])
-            succ_by_look = res_p1_qgood.get('eff_early_succ_by_look', [])
-            fut_by_look  = res_p1_qgood.get('eff_early_fut_by_look', [])
-            if eff_looks and (succ_by_look or fut_by_look):
-                df_eff_looks = pd.DataFrame({
-                    'Look N': eff_looks,
-                    'Early success': list(succ_by_look)[:len(eff_looks)],
-                    'Early futility': list(fut_by_look)[:len(eff_looks)],
-                })
-                st.caption('Proportion of early stops at each *efficacy* look (p1,q_good)')
-                st.dataframe(df_eff_looks, use_container_width=True)
-            if enable_safety:
-                saf_by_look = res_p1_qgood.get('saf_by_look', [])
-                if saf_looks and saf_by_look:
-                    labels = [str(n) for n in saf_looks] + ['Final'] if len(saf_by_look)==len(saf_looks)+1 else [str(n) for n in saf_looks[:len(saf_by_look)]]
-                    df_saf_looks = pd.DataFrame({'Safety look': labels, 'Safety stops': list(saf_by_look)[:len(labels)]})
-                    st.caption('Proportion of safety stops at each *safety* look (p1,q_good)')
-                    st.dataframe(df_saf_looks, use_container_width=True)
-        except Exception:
-            pass
+        # Per-look stop tables (proportions at each efficacy/futility/safety look) for p1,q_good
+    try:
+        eff_looks = design_sel.get('looks_eff', [])
+        fut_looks = design_sel.get('looks_fut', eff_looks)
+        saf_looks = design_sel.get('looks_saf', [])
+        succ_by_look = res_p1_qgood.get('eff_early_succ_by_look', [])
+        fut_by_look = res_p1_qgood.get('fut_early_by_look', res_p1_qgood.get('eff_early_fut_by_look', []))
+        if eff_looks and succ_by_look:
+            df_eff_looks = pd.DataFrame({
+                'Efficacy look N': eff_looks,
+                'Early success': list(succ_by_look)[:len(eff_looks)],
+            })
+            st.caption('Proportion of early stops at each *efficacy* look (p1,q_good)')
+            st.dataframe(df_eff_looks, use_container_width=True)
+        if fut_looks and fut_by_look:
+            df_fut_looks = pd.DataFrame({
+                'Futility look N': fut_looks,
+                'Early futility': list(fut_by_look)[:len(fut_looks)],
+            })
+            st.caption('Proportion of early *futility* stops at each futility look (p1,q_good)')
+            st.dataframe(df_fut_looks, use_container_width=True)
+        if enable_safety:
+            saf_by_look = res_p1_qgood.get('saf_by_look', [])
+            if saf_looks and saf_by_look:
+                labels = [str(n) for n in saf_looks] + ['Final'] if len(saf_by_look)==len(saf_looks)+1 else [str(n) for n in saf_looks[:len(saf_by_look)]]
+                df_saf_looks = pd.DataFrame({'Safety look': labels, 'Safety stops': list(saf_by_look)[:len(labels)]})
+                st.caption('Proportion of safety stops at each *safety* look (p1,q_good)')
+                st.dataframe(df_saf_looks, use_container_width=True)
+    except Exception:
+        pass
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -860,7 +909,7 @@ else:
 # ║ TUNER CORE (θ_final bisection + (θ_interim, c_futility) grid search)    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def tune_theta_final_bisect(N, looks_eff, a0, b0, p0, p1,
+def tune_theta_final_bisect(N, looks_eff, looks_fut, a0, b0, p0, p1,
                             allow_early_success, c_futility,
                             theta_interim, run_in_eff,
                             alpha_target, n_sims, seed,
@@ -874,11 +923,11 @@ def tune_theta_final_bisect(N, looks_eff, a0, b0, p0, p1,
         s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
         if s_min is None:
             return 0.0
-        x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, c_futility)
+        x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, c_futility)
         design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
                       theta_final=theta_final, theta_interim=theta_interim, c_futility=c_futility,
                       allow_early_success=allow_early_success, s_min_final=s_min,
-                      x_min_to_continue_by_look_eff=x_min, run_in_eff=run_in_eff)
+                      x_min_to_continue_by_look_fut=x_min, run_in_eff=run_in_eff)
         return float(simulate_design_eff_only(design, p0, U[:, :N])['reject_rate'])
     f_lo, f_hi = type1_given(lo), type1_given(hi)
     if not (f_lo >= alpha_target and f_hi <= alpha_target):
@@ -913,11 +962,11 @@ def joint_search_theta_interim_cf_with_bounds(
             s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
             if s_min is None:
                 continue
-            x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_eff, p0, theta_final, cf)
+            x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, cf)
             design = dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
                           theta_final=theta_final, theta_interim=float(ti), c_futility=float(cf),
                           allow_early_success=allow_early_success, s_min_final=s_min,
-                          x_min_to_continue_by_look_eff=x_min, run_in_eff=run_in_eff)
+                          x_min_to_continue_by_look_fut=x_min, run_in_eff=run_in_eff)
             r0 = simulate_design_eff_only(design, p0, U[:, :N])
             r1 = simulate_design_eff_only(design, p1, U[:, :N])
             if r0['reject_rate'] > alpha_cap or r1['reject_rate'] < power_floor:
@@ -1152,9 +1201,10 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
     if isinstance(design, dict):
         line(f"N_total: {design.get('N_total')}")
         line(f"Efficacy looks: {design.get('looks_eff')}")
+        line(f"Futility looks: {design.get('looks_fut')}")
         if design.get('looks_saf') is not None:
             line(f"Safety looks: {design.get('looks_saf')}")
-        line(f"Run-in (eff/saf): {design.get('run_in_eff',0)} / {design.get('run_in_saf',0)}")
+        line(f"Run-in (eff/saf/fut): {design.get('run_in_eff',0)} / {design.get('run_in_saf',0)} / {design.get('run_in_fut', design.get('run_in_eff',0))}")
         line(f"Efficacy Beta(a0,b0): {design.get('a0')}, {design.get('b0')}")
         if 'safety' in design:
             s = design['safety']
