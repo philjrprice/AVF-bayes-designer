@@ -928,16 +928,16 @@ else:
                     df_curves = pd.DataFrame(rows_c)
                     st.session_state['oc_ess_curves_df'] = df_curves
             _set_flag('expand_curves', True)
-                if _HAS_PLOTLY:
-                    fig = make_subplots(specs=[[{"secondary_y": True}]])
-                    fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
-                    fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
-                    fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
-                    fig.update_yaxes(title_text='ESS', secondary_y=True)
-                    fig.update_xaxes(title_text='Efficacy rate p')
-                    fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
-                    st.plotly_chart(fig, use_container_width=True)
-                    st.dataframe(df_curves, use_container_width=True)
+            if _HAS_PLOTLY:
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
+                fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
+                fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
+                fig.update_yaxes(title_text='ESS', secondary_y=True)
+                fig.update_xaxes(title_text='Efficacy rate p')
+                fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
+                st.plotly_chart(fig, use_container_width=True)
+                st.dataframe(df_curves, use_container_width=True)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 4) OC Explorer (always-on heatmap) + Automated Interpretation            ║
@@ -1130,4 +1130,5 @@ if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
     st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5a.pdf", mime="application/pdf")
+
 
