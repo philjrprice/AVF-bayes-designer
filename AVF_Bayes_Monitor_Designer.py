@@ -25,7 +25,19 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5a_final_looks_occurves"
+SCHEMA_VERSION = "v3_1_5b_persist_occurves"
+
+# --- UI state helpers (keep panels open after a run) ---
+def _get_flag(name: str, default: bool = False) -> bool:
+    import streamlit as st
+    if name not in st.session_state:
+        st.session_state[name] = default
+    return st.session_state[name]
+
+
+def _set_flag(name: str, value: bool = True):
+    import streamlit as st
+    st.session_state[name] = value
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -487,9 +499,9 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5a", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5a")
-st.caption("Shows FINAL evaluation alongside all looks; adds OC/ESS curves (fixed q); futility fixes retained; Threshold Tuner removed.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5b", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5b")
+st.caption("Adds persistent Deep‑Dive/OC‑curve outputs and removes unused Deep‑Dive q; shows FINAL alongside all looks; futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
         "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.\n\n"
@@ -802,7 +814,7 @@ else:
         seed_deep = st.number_input("Random seed (deep dive)", 1, None, seed + 1, 1, key='deep_seed', help="Change to re-simulate independently.")
     with colD3:
         show_ci = st.checkbox("Show 95% CI bands on metrics", value=True, key='deep_ci')
-    colQ1, colQ2, colQ3 = st.columns(3)
+    colQ1, colQ2 = st.columns(2)
     with colQ1:
         q_good = st.number_input("q_good (typical/benign toxicity)", 0.0, 1.0, 0.10, 0.01, key='q_good')
     with colQ2:
@@ -887,7 +899,7 @@ else:
             pass
 
         # --- New: OC/ESS curves vs p at fixed q (q_for_OC) ---
-        with st.expander("OC/ESS curves at fixed q (1‑D slice)", expanded=False):
+        with st.expander("OC/ESS curves at fixed q (1‑D slice)", expanded=_get_flag('expand_curves', False)):
             colC1, colC2, colC3 = st.columns(3)
             with colC1:
                 p_min_curve = st.number_input("p_min (curve)", 0.0, 1.0, max(0.0, p0 - 0.20), 0.01, key='curve_pmin')
@@ -900,7 +912,7 @@ else:
                 n_sims_curve = st.number_input("Simulations per point", 2000, 200000, int(n_sims_deep), 1000, key='curve_sims')
             with colC5:
                 seed_curve = st.number_input("Random seed (curve)", 1, None, int(seed_deep) + 11, 1, key='curve_seed')
-            q_fixed = st.number_input("Fixed q for curves", 0.0, 1.0, float(st.session_state.get('q_for_oc', q_good)), 0.01, key='curve_qfixed')
+            q_fixed = st.number_input("Fixed q for curves", 0.0, 1.0, float(q_good), 0.01, key='curve_qfixed')
             if st.button("Run OC/ESS curves", key='run_curves'):
                 if p_min_curve >= p_max_curve:
                     st.warning("p_min must be < p_max for the curves.")
@@ -915,6 +927,7 @@ else:
                         rows_c.append(dict(p=float(pp), reject_rate=float(r['reject_rate']), ess=float(r['ess'])))
                     df_curves = pd.DataFrame(rows_c)
                     st.session_state['oc_ess_curves_df'] = df_curves
+            _set_flag('expand_curves', True)
                     if _HAS_PLOTLY:
                         fig = make_subplots(specs=[[{"secondary_y": True}]])
                         fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
