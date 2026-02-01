@@ -1,11 +1,7 @@
  
-# AVF_Bayes_Monitor_Designer_final_looks_NO_TUNER.py
+# AVF_Bayes_Monitor_Designer_v3_1_5_OCcurves_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.5: Display all efficacy & safety looks incl. FINAL + remove Threshold Tuner
-# • Displays final evaluation point (N) alongside interim looks in tables & summary
-# • Safety per-look table already had 'Final'; label now shows 'Final (N)'
-# • Removed Tuner++ functions and UI; exports & PDF updated accordingly
-# • Retains futility schedule fixes and compare/deep-dive/OC Explorer features
+# v3.1.5a: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
 from __future__ import annotations
 import io
 import json
@@ -25,10 +21,11 @@ from reportlab.lib.units import cm
 try:
     import plotly.express as px
     import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5_final_looks_no_tuner"
+SCHEMA_VERSION = "v3_1_5a_final_looks_occurves"
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -487,12 +484,12 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
     return df, designs_built
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ STREAMLIT UI — Header & Sidebar (with richer tooltips)                   ║
+# ║ STREAMLIT UI — Header & Sidebar                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5")
-st.caption("Now shows FINAL evaluation alongside all looks. Futility fixes retained; Threshold Tuner removed.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5a", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5a")
+st.caption("Shows FINAL evaluation alongside all looks; adds OC/ESS curves (fixed q); futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
         "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.\n\n"
@@ -774,18 +771,18 @@ else:
     if enable_safety:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
 
-    # Friendlier design summary panel, explicitly list FINAL
+    # Expanded design summary: list all look points including FINAL
     with st.expander("Chosen Design Summary (plain language)", expanded=True):
-        eff_looks_txt = ("none (final only)" if len(design_sel["looks_eff"]) == 0 else ", ".join(str(x) for x in design_sel["looks_eff"]))
-        saf_looks_txt = ("none (final only)" if len(design_sel.get("looks_saf", [])) == 0 else ", ".join(str(x) for x in design_sel.get("looks_saf", [])))
+        Ntot = design_sel['N_total']
+        eff_all = (design_sel["looks_eff"] + [Ntot]) if len(design_sel["looks_eff"])>0 else [Ntot]
+        saf_all = (design_sel.get("looks_saf", []) + [Ntot]) if len(design_sel.get("looks_saf", []))>0 else [Ntot]
+        fut_all = (design_sel.get("looks_fut", []) + [Ntot]) if len(design_sel.get("looks_fut", []))>0 else [Ntot]
         st.markdown("**Design snapshot**")
-        st.markdown("• **Planned maximum participants (N):** " + str(design_sel["N_total"]))
+        st.markdown("• **Planned maximum participants (N):** " + str(Ntot))
         st.markdown("• **Run‑in (eff/saf):** " + f"{design_sel.get('run_in_eff',0)} / {design_sel.get('run_in_saf',0)}")
-        st.markdown("• **Interim looks — efficacy:** " + eff_looks_txt)
-        st.markdown("• **Interim looks — safety:** " + saf_looks_txt)
-        fut_looks_txt = 'same as efficacy' if design_sel.get('looks_fut', []) == design_sel.get('looks_eff', []) else ('none (final only)' if len(design_sel.get('looks_fut', [])) == 0 else ', '.join(str(x) for x in design_sel.get('looks_fut', [])))
-        st.markdown("• **Interim looks — futility:** " + fut_looks_txt)
-        st.markdown("• **Final evaluation (efficacy & safety):** at N = **" + str(design_sel['N_total']) + "** (always evaluated if not stopped earlier)")
+        st.markdown("• **Look points — efficacy (including final):** " + ", ".join(str(x) for x in eff_all))
+        st.markdown("• **Look points — safety (including final):** " + ", ".join(str(x) for x in saf_all))
+        st.markdown("• **Look points — futility (including final):** " + ", ".join(str(x) for x in fut_all) + "  *(no futility decision at final; shown for visibility)*")
         st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
         if enable_safety:
             st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
@@ -864,10 +861,7 @@ else:
             if eff_looks and succ_by_look is not None:
                 eff_labels = [str(n) for n in eff_looks] + [f"Final ({design_sel['N_total']})"]
                 eff_vals = list(succ_by_look)[:len(eff_looks)] + [0.0]
-                df_eff_looks = pd.DataFrame({
-                    'Efficacy evaluation': eff_labels,
-                    'Early success (proportion)': eff_vals,
-                })
+                df_eff_looks = pd.DataFrame({'Efficacy evaluation': eff_labels, 'Early success (proportion)': eff_vals})
                 st.caption('All **efficacy** evaluations (interims + final). Final row shown to indicate evaluation at max N (no early success at final).')
                 st.dataframe(df_eff_looks, use_container_width=True)
 
@@ -891,6 +885,46 @@ else:
                     st.dataframe(df_saf_looks, use_container_width=True)
         except Exception:
             pass
+
+        # --- New: OC/ESS curves vs p at fixed q (q_for_OC) ---
+        with st.expander("OC/ESS curves at fixed q (1‑D slice)", expanded=False):
+            colC1, colC2, colC3 = st.columns(3)
+            with colC1:
+                p_min_curve = st.number_input("p_min (curve)", 0.0, 1.0, max(0.0, p0 - 0.20), 0.01, key='curve_pmin')
+            with colC2:
+                p_max_curve = st.number_input("p_max (curve)", 0.0, 1.0, min(1.0, p1 + 0.20), 0.01, key='curve_pmax')
+            with colC3:
+                p_points_curve = st.slider("Number of p points (curve)", 5, 51, 21, 2, key='curve_ppoints')
+            colC4, colC5 = st.columns(2)
+            with colC4:
+                n_sims_curve = st.number_input("Simulations per point", 2000, 200000, int(n_sims_deep), 1000, key='curve_sims')
+            with colC5:
+                seed_curve = st.number_input("Random seed (curve)", 1, None, int(seed_deep) + 11, 1, key='curve_seed')
+            q_fixed = st.number_input("Fixed q for curves", 0.0, 1.0, float(st.session_state.get('q_for_oc', q_good)), 0.01, key='curve_qfixed')
+            if st.button("Run OC/ESS curves", key='run_curves'):
+                if p_min_curve >= p_max_curve:
+                    st.warning("p_min must be < p_max for the curves.")
+                else:
+                    rngc = np.random.default_rng(seed_curve)
+                    Ueff_c = rngc.uniform(size=(n_sims_curve, design_sel['N_total']))
+                    Utox_c = rngc.uniform(size=(n_sims_curve, design_sel['N_total']))
+                    ps = np.linspace(p_min_curve, p_max_curve, int(p_points_curve))
+                    rows_c = []
+                    for pp in ps:
+                        r = simulate_design_joint(design_sel, p_eff=float(pp), p_tox=float(q_fixed), U_eff=Ueff_c, U_tox=Utox_c)
+                        rows_c.append(dict(p=float(pp), reject_rate=float(r['reject_rate']), ess=float(r['ess'])))
+                    df_curves = pd.DataFrame(rows_c)
+                    st.session_state['oc_ess_curves_df'] = df_curves
+                    if _HAS_PLOTLY:
+                        fig = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
+                        fig.add_trace(go.Scatter(x=df_curves['p'], y=df_curves['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
+                        fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
+                        fig.update_yaxes(title_text='ESS', secondary_y=True)
+                        fig.update_xaxes(title_text='Efficacy rate p')
+                        fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
+                        st.plotly_chart(fig, use_container_width=True)
+                    st.dataframe(df_curves, use_container_width=True)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 4) OC Explorer (always-on heatmap) + Automated Interpretation            ║
@@ -929,24 +963,16 @@ with st.expander("Open OC Explorer", expanded=True):
             df_grid = pd.DataFrame(oc_rows)
             st.session_state['oc_grid_df'] = df_grid
             nice = df_grid.copy()
-            nice.rename(columns={
-                'reject_rate': 'Pr(declare efficacy)',
-                'ess': 'ESS',
-                'safety_stop_any': 'Pr(safety stop)',
-                'early_any': 'Pr(early stop any)'
-            }, inplace=True)
+            nice.rename(columns={'reject_rate': 'Pr(declare efficacy)', 'ess': 'ESS', 'safety_stop_any': 'Pr(safety stop)', 'early_any': 'Pr(early stop any)'}, inplace=True)
             nice = nice[['p','q','Pr(declare efficacy)','ESS','Pr(safety stop)','Pr(early stop any)']]
             nice = nice.sort_values(['q','p']).reset_index(drop=True)
             st.dataframe(nice, use_container_width=True)
             if _HAS_PLOTLY:
                 piv = df_grid.pivot(index='q', columns='p', values='reject_rate')
-                fig = px.imshow(
-                    piv.values,
-                    x=[f"{x:.2f}" for x in piv.columns],
-                    y=[f"{y:.2f}" for y in piv.index],
-                    aspect='auto', origin='lower', color_continuous_scale='Viridis',
-                    labels=dict(color='Probability of declaring efficacy'),
-                    title='Probability of declaring efficacy across (p,q)')
+                fig = px.imshow(piv.values, x=[f"{x:.2f}" for x in piv.columns], y=[f"{y:.2f}" for y in piv.index],
+                                aspect='auto', origin='lower', color_continuous_scale='Viridis',
+                                labels=dict(color='Probability of declaring efficacy'),
+                                title='Probability of declaring efficacy across (p,q)')
                 fig.update_xaxes(title_text='Efficacy rate p')
                 fig.update_yaxes(title_text='Toxicity rate q')
                 st.plotly_chart(fig, use_container_width=True)
@@ -955,9 +981,7 @@ with st.expander("Open OC Explorer", expanded=True):
             Ntot = design_sel['N_total']
             pow_target = st.session_state.get('power_min', 0.80)
             saf_warn_thr = 0.25
-            grp = df_grid.groupby('q').apply(function=lambda g: (g['reject_rate'] >= pow_target).sum()/len(g))
-            # Pandas >=2.1 may warn on groupby.apply; suppress by explicit function=...
-            # Recompute robust/fragile with a safer approach
+            # Removed erroneous groupby(function=...) line that could trigger exceptions
             grp = df_grid.groupby('q')['reject_rate'].apply(lambda s: (s >= pow_target).sum()/len(s))
             robust_qs = grp[grp >= 0.6].index.tolist()
             fragile_qs = grp[grp < 0.6].index.tolist()
@@ -991,12 +1015,10 @@ with st.expander("Open OC Explorer", expanded=True):
                 fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs) > 0 else "no fragile q-levels")
                 safety_q = (min(high_safety_qs) if len(high_safety_qs) > 0 else q_max_g)
                 ess_txt = ('Large portions of the grid require near‑max N.' if ess_spike else 'ESS stays moderate for many scenarios.')
-                body = (
-                    "**Robust region (indicative):** " + robust_text + "; "
-                    "**Fragile region:** " + fragile_text + ".\n\n"
-                    "**Safety:** Above q≈" + f"{safety_q:.2f}" + ", safety stops become common.\n\n"
-                    "**ESS:** " + ess_txt
-                )
+                body = ("**Robust region (indicative):** " + robust_text + "; "
+                        "**Fragile region:** " + fragile_text + ".\n\n"
+                        "**Safety:** Above q≈" + f"{safety_q:.2f}" + ", safety stops become common.\n\n"
+                        "**ESS:** " + ess_txt)
                 st.markdown(body)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1015,15 +1037,15 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
         c.drawString(x0, y, text)
         y -= dy
-    line("Bayesian Single-Arm Design – Summary (v3.1.5)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.5a)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
         line(f"N_total: {design.get('N_total')}")
-        line(f"Efficacy looks: {design.get('looks_eff')}")
-        line(f"Futility looks: {design.get('looks_fut')}")
+        line(f"Look points — efficacy: {design.get('looks_eff')} + [FINAL]")
+        line(f"Look points — futility: {design.get('looks_fut')} + [FINAL]")
         if design.get('looks_saf') is not None:
-            line(f"Safety looks: {design.get('looks_saf')}")
+            line(f"Look points — safety: {design.get('looks_saf')} + [FINAL]")
         line(f"Run-in (eff/saf/fut): {design.get('run_in_eff',0)} / {design.get('run_in_saf',0)} / {design.get('run_in_fut', design.get('run_in_eff',0))}")
         line(f"Final evaluation at N: {design.get('N_total')}")
         line(f"Efficacy Beta(a0,b0): {design.get('a0')}, {design.get('b0')}")
@@ -1063,9 +1085,10 @@ export_bundle = {
     "deep_dive": st.session_state.get('deep_results', None),
     "compare": st.session_state.get('compare_df', None),
     "oc_grid": None if 'oc_grid_df' not in st.session_state else st.session_state['oc_grid_df'].to_dict(orient='list'),
+    "oc_ess_curves": None if 'oc_ess_curves_df' not in st.session_state else st.session_state['oc_ess_curves_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5a.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1085,10 +1108,12 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("compare.csv", st.session_state['compare_df'].to_csv(index=False))
     if 'oc_grid_df' in st.session_state:
         zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
+    if 'oc_ess_curves_df' in st.session_state:
+        zf.writestr("oc_ess_curves.csv", st.session_state['oc_ess_curves_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5a_csv.zip", mime="application/zip")
 
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5a.pdf", mime="application/pdf")
