@@ -574,7 +574,7 @@ looks_eff_mode_label = st.sidebar.selectbox(
     index=1, key='eff_mode',
     help="Choose how to place efficacy interim looks.")
 
-k_looks_eff = perc_eff_str = ns_eff_str = None
+k_looks_eff = perc_eff_str = ns_eff_str = step_eff = None
 if looks_eff_mode_label == "Equal‑spaced (choose total looks incl. run‑in)":
     k_looks_eff = st.sidebar.slider("Total efficacy looks (including run‑in)", 1, 8, 2, 1, key='k_eff',
                                     help="For example, 2 looks → roughly at 1/3 and 2/3 of the maximum N.")
@@ -647,7 +647,7 @@ seed = st.sidebar.number_input("Random seed", 1, None, 2026, 1, key='seed', help
 Ns = list(range(N_min, N_max + 1, N_step))
 param_grid = []
 for N in Ns:
-    looks_eff = build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
+    looks_eff = build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str, step_every=step_eff)
     looks_fut = looks_eff if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N, run_in_fut, looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut)
     param_grid.append(dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1,
                            theta_final=theta_final, theta_interim=float(theta_interim),
@@ -768,7 +768,7 @@ st.write("### 3) Deep Dive (joint efficacy + safety)")
 st.caption("Locks a single design and shows detailed operating characteristics, per-look summaries, and stop reasons.")
 N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select',
                            help="Choose an N from your screening range (or adjacent values) to inspect in detail.")
-looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
+looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str, step_every=step_eff)
 looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf)
 
 s_min_sel = min_successes_for_posterior_threshold(a0, b0, N_select, p0, theta_final)
@@ -800,10 +800,10 @@ else:
         st.markdown("**Design snapshot**")
         st.markdown("• **Planned maximum participants (N):** " + str(design_sel["N_total"]))
         st.markdown("• **Run‑in (eff/saf):** " + f"{design_sel.get('run_in_eff',0)} / {design_sel.get('run_in_saf',0)}")
-        st.markdown("• **Looks — efficacy:** " + (eff_looks_txt + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
-        st.markdown("• **Looks — safety:** " + (saf_looks_txt + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
+        st.markdown('• **Looks — efficacy:** ' + eff_looks_txt + (f", final={design_sel["N_total"]}" if design_sel.get('N_total') not in (None, 0) else ''))
+        st.markdown('• **Looks — safety:** ' + saf_looks_txt + (f", final={design_sel["N_total"]}" if design_sel.get('N_total') not in (None, 0) else ''))
         fut_looks_txt = 'same as efficacy' if design_sel.get('looks_fut', []) == design_sel.get('looks_eff', []) else ('none (final only)' if len(design_sel.get('looks_fut', [])) == 0 else ', '.join(str(x) for x in design_sel.get('looks_fut', [])))
-        st.markdown("• **Looks — futility:** " + (('same as efficacy' if fut_looks_txt=='same as efficacy' else fut_looks_txt) + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
+        st.markdown('• **Looks — futility:** ' + (('same as efficacy' if fut_looks_txt=='same as efficacy' else fut_looks_txt) + (f", final={design_sel["N_total"]}" if design_sel.get('N_total') not in (None, 0) else '')))
         st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
         if enable_safety:
             st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
@@ -1091,7 +1091,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
     if st.button("Run Tuner++", key='run_tuner'):
         rng_tune = np.random.default_rng(seed_tuner)
         U_tune = rng_tune.uniform(size=(n_sims_tuner, st.session_state.get('N_select', 60)))
-        looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
+        looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str), step_every=st.session_state.get('step_eff', step_eff))
         looks_fut_tune = looks_eff_tune if st.session_state.get('fut_same', True) or looks_fut_mode_label == "Same as efficacy" else build_looks_with_runin(st.session_state.get('N_select', 60), int(st.session_state.get('run_in_fut', run_in_fut)), looks_fut_mode_label, k_total=st.session_state.get('k_fut', k_looks_fut), perc_str=st.session_state.get('perc_fut', perc_fut_str), ns_str=st.session_state.get('ns_fut', ns_fut_str), step_every=st.session_state.get('step_fut', step_fut))
         theta_final_star = tune_theta_final_bisect(
             N=st.session_state.get('N_select', 60),
