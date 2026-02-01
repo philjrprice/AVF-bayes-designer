@@ -370,7 +370,7 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
                 if idx.size > 0:
                     final_n[idx] = n_curr
                     active[idx] = False
-                    eff_early_fut_by_look[li_e] += idx.size
+                    fut_early_by_look[li_e] += idx.size
             else:
                 need_continue = cum_x[active] >= x_min
                 idx_all = np.where(active)[0]
@@ -378,7 +378,7 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
                 if idx_stop.size > 0:
                     final_n[idx_stop] = n_curr
                     active[idx_stop] = False
-                    eff_early_fut_by_look[li_e] += idx_stop.size
+                    fut_early_by_look[li_e] += idx_stop.size
             if not active.any():
                 break
 
@@ -426,7 +426,7 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
         "safety_stop_prob": float(any_safety_rate),
         "stop_dist": stop_dist,
         "eff_early_succ_by_look": (eff_early_succ_by_look / n_sims).tolist(),
-        "eff_early_fut_by_look": (fut_early_by_look / n_sims).tolist(),
+        "fut_early_by_look": (fut_early_by_look / n_sims).tolist(),
         "fut_early_by_look": (fut_early_by_look / n_sims).tolist(),
         "saf_by_look": (saf_stop_by_look / n_sims).tolist(),
         "eff_early_succ_rate": float(eff_early_succ_rate),
@@ -955,7 +955,7 @@ else:
         fut_looks = design_sel.get('looks_fut', eff_looks)
         saf_looks = design_sel.get('looks_saf', [])
         succ_by_look = res_p1_qgood.get('eff_early_succ_by_look', [])
-        fut_by_look = res_p1_qgood.get('fut_early_by_look', res_p1_qgood.get('eff_early_fut_by_look', []))
+        fut_by_look = res_p1_qgood.get('fut_early_by_look', res_p1_qgood.get('fut_early_by_look', []))
         if eff_looks and succ_by_look:
             df_eff_looks = pd.DataFrame({
                 'Efficacy look N': eff_looks,
