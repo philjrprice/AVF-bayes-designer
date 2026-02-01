@@ -467,7 +467,7 @@ with st.expander("What this tool does (in simple terms)"):
 
         "• The **Deep Dive** runs precise joint simulations (benefit + safety)."
 
-        "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.)" 
+        "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.") 
 # Sidebar — Efficacy (plainer labels + help) 
 st.sidebar.header("1) Efficacy target and prior") 
 col1, col2 = st.sidebar.columns(2) 
@@ -732,5 +732,6 @@ else:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox) 
     # Summary panel and deep dive UI ... (unchanged from prior, omitted here to save space) 
 # TUNER CORE + OC Explorer + EXPORT sections ... (unchanged; included in full file) 
+
 
 
