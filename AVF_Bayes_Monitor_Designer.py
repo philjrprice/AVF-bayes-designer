@@ -1,7 +1,7 @@
  
 # AVF_Bayes_Monitor_Designer_v3_1_5_OCcurves_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.5i: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
+# v3.1.5j: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
 from __future__ import annotations
 import io
 import json
@@ -25,7 +25,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5i_fullfix"
+SCHEMA_VERSION = "v3_1_5j_compare_literal"
 
 # --- UI state helpers (keep panels open after a run) ---
 def _get_flag(name: str, default: bool = False) -> bool:
@@ -500,8 +500,8 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5i", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5i")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5j", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5j")
 st.caption("Adds persistent Deep‑Dive/OC‑curve outputs and removes unused Deep‑Dive q; shows FINAL alongside all looks; futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
@@ -743,14 +743,14 @@ with st.expander("Open compare panel", expanded=False):
                 r_p0 = simulate_design_joint(design_cmp, p_eff=p0, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox)
                 r_p1 = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox)
                 r_p1_bad = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_bad_cmp, U_eff=Ueff, U_tox=Utox)
-                rows.append(dict(N=Ncmp, looks_eff=looks_eff_cmp, looks_saf=looks_saf_cmp, s_min_final=smin_cmp, 'Efficacy evals (incl. final)': (looks_eff_cmp + [Ncmp]), 'Safety evals (incl. final)': (looks_saf_cmp + [Ncmp]),
+                rows.append({N=Ncmp, looks_eff=looks_eff_cmp, looks_saf=looks_saf_cmp, s_min_final=smin_cmp, 'Efficacy evals (incl. final)': (looks_eff_cmp + [Ncmp]), 'Safety evals (incl. final)': (looks_saf_cmp + [Ncmp]),
                                  **{"Type I @p0,q_good": r_p0["reject_rate"], "Power @p1,q_good": r_p1["reject_rate"],
                                     "ESS @p0": r_p0["ess"], "ESS @p1": r_p1["ess"],
                                     "Early stop (any) @p1": r_p1["early_stop_rate"],
                                     "Early succ @p1": r_p1["eff_early_succ_rate"],
                                     "Early fut @p1": r_p1["eff_early_fut_rate"],
                                     "Early safety @p1": r_p1.get("saf_early_rate", 0.0),
-                                    "Safety stop @p1,q_bad (any stage)": r_p1_bad.get("safety_stop_prob", 0.0)}) )
+                                    "Safety stop @p1,q_bad (any stage)": r_p1_bad.get("safety_stop_prob", 0.0)}} )
             if not rows:
                 st.warning("None of the N values produced a feasible final rule. Try relaxing θ_final or adjusting looks.")
             else:
@@ -994,7 +994,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
         c.drawString(x0, y, text)
         y -= dy
-    line("Bayesian Single-Arm Design – Summary (v3.1.5i)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.5j)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1045,7 +1045,7 @@ export_bundle = {
     "oc_ess_curves": None if 'oc_ess_curves_df' not in st.session_state else st.session_state['oc_ess_curves_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5i.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5j.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1068,11 +1068,11 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
     if 'oc_ess_curves_df' in st.session_state:
         zf.writestr("oc_ess_curves.csv", st.session_state['oc_ess_curves_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5i_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5j_csv.zip", mime="application/zip")
 
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5i.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5j.pdf", mime="application/pdf")
 
 
