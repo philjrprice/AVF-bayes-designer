@@ -465,11 +465,7 @@ This app helps you design a single‑arm trial with interim checks for **benefit
 • The **Deep Dive** runs precise joint simulations (benefit + safety).
 • The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.
 """)
-and filters by α/power.
-" 
-        "• The **Deep Dive** runs precise joint simulations (benefit + safety).
-" 
-        "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.") 
+
 # Sidebar — Efficacy (plainer labels + help) 
 st.sidebar.header("1) Efficacy target and prior") 
 col1, col2 = st.sidebar.columns(2) 
