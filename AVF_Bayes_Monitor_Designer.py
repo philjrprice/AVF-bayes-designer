@@ -25,7 +25,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5b_persist_occurves"
+SCHEMA_VERSION = "v3_1_5c_screener_finalcol"
 
 # --- UI state helpers (keep panels open after a run) ---
 def _get_flag(name: str, default: bool = False) -> bool:
@@ -674,7 +674,16 @@ else:
     df_ok = df_screen[(df_screen["Type I error @ p0"] <= alpha_max) & (df_screen["Power @ p1"] >= power_min)].copy()
     cols = ["N_total", "run_in_eff", "Efficacy evals (incl. final)", "theta_final", "c_futility", "Type I error @ p0", "Power @ p1", "ESS @ p0", "Early stop @ p0 (any)"]
     table_df = df_ok if not df_ok.empty else df_screen
-    st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True), use_container_width=True)
+    # Backward-compat: synthesize column if absent (old caches)
+    if 'Efficacy evals (incl. final)' not in table_df.columns and 'looks_eff' in table_df.columns and 'N_total' in table_df.columns:
+        try:
+            table_df = table_df.copy()
+            table_df['Efficacy evals (incl. final)'] = table_df.apply(lambda r: list(r['looks_eff']) + [int(r['N_total'])], axis=1)
+        except Exception:
+            table_df = table_df.copy()
+            table_df['Efficacy evals (incl. final)'] = table_df['looks_eff']
+
+st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True), use_container_width=True)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 2) Compare multiple Ns (joint with safety)                                ║
