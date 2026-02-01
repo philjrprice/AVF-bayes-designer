@@ -4,3 +4,4 @@ scipy
 pandas
 plotly
 reportlab
+matlab.pyplot
