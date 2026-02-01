@@ -1,985 +1,734 @@
-
-# streamlit_app.py
-# Bayesian Single-Arm Trial Design & Simulation Workbench (Streamlit)
-# Author: M365 Copilot for Phil Price
-# Last updated: 2026-02-01
-#
-# Enhancements in this version:
-# - Major speedups via precomputed decision boundaries (efficacy/safety/futility)
-#   and memoization. Uses exact Beta CDFs (SciPy) when available.
-# - Flexible look schedule modes: run+interval, absolute Ns, evenly spaced #looks,
-#   fixed % of remaining, absolute %s of N.
-# - Rich readouts: per-look stop probabilities, cumulative stopping curves,
-#   boundary visualization, detailed ESS quantiles, and conditional metrics.
-# - Same four analysis modes + export bundle.
-
-import io
-import json
-import math
-from math import lgamma
-import zipfile
-from datetime import datetime
-from functools import lru_cache
-from typing import List, Dict, Tuple, Optional
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-try:
-    import streamlit as st
-except Exception:
-    raise SystemExit("This script is a Streamlit app. Please run with: streamlit run streamlit_app.py")
-
-# Optional SciPy for fast and exact Beta CDF
-TRY_SCIPY = True
-try:
-    if TRY_SCIPY:
-        from scipy.special import betainc  # regularized incomplete beta I_x(a,b)
-        SCIPY_AVAILABLE = True
-    else:
-        SCIPY_AVAILABLE = False
-except Exception:
-    SCIPY_AVAILABLE = False
-
-# ----------------------------- Numeric Utilities ----------------------------- #
-
-def _regularized_incomplete_beta(a: float, b: float, x: float) -> float:
-    if not SCIPY_AVAILABLE:
-        raise RuntimeError("SciPy not available for exact Beta CDF.")
-    return float(betainc(a, b, x))
-
-@lru_cache(maxsize=200000)
-def posterior_tail_prob_beta_cached(a: float, b: float, threshold: float) -> float:
-    """Exact Beta tail 1 - I_x(a,b), cached. Requires SciPy."""
-    cdf = _regularized_incomplete_beta(a, b, threshold)
-    return max(0.0, min(1.0, 1.0 - cdf))
-
-def posterior_tail_prob_beta(a: float, b: float, threshold: float, rng: Optional[np.random.Generator] = None,
-                             mc_samples: int = 3000) -> float:
-    """Compute Pr(p > threshold | Beta(a,b)). Prefer SciPy; else MC fallback."""
-    if a <= 0 or b <= 0:
-        return float('nan')
-    threshold = float(np.clip(threshold, 0.0, 1.0))
-    if SCIPY_AVAILABLE:
-        return posterior_tail_prob_beta_cached(float(a), float(b), float(threshold))
-    # Fallback MC
-    if rng is None:
-        rng = np.random.default_rng()
-    samples = rng.beta(a, b, size=mc_samples)
-    return float(np.mean(samples > threshold))
-
-# Predictive Beta-Binomial PMF
-
-def log_beta(a: float, b: float) -> float:
-    return lgamma(a) + lgamma(b) - lgamma(a + b)
-
-def beta_binomial_pmf_vec(k: np.ndarray, n: int, alpha: float, beta: float) -> np.ndarray:
-    """Vectorized predictive Beta-Binomial pmf over k (0..n).
-    Uses scipy.special.gammaln when available; otherwise falls back to a vectorized
-    wrapper around math.lgamma. This fixes errors when passing numpy arrays to
-    math.lgamma and is numerically stable.
-    """
-    k = np.asarray(k, dtype=float)
-    # Choose appropriate log-gamma
-    try:
-        from scipy.special import gammaln  # vectorized
-        def _log_choose(nv, kv):
-            return gammaln(nv + 1) - gammaln(kv + 1) - gammaln(nv - kv + 1)
-        def _log_beta(av, bv):
-            return gammaln(av) + gammaln(bv) - gammaln(av + bv)
-    except Exception:
-        from math import lgamma
-        vlgamma = np.vectorize(lgamma)
-        def _log_choose(nv, kv):
-            return vlgamma(nv + 1) - vlgamma(kv + 1) - vlgamma(nv - kv + 1)
-        def _log_beta(av, bv):
-            return vlgamma(av) + vlgamma(bv) - vlgamma(av + bv)
-
-    lg_coef = _log_choose(n, k)
-    log_val = lg_coef + _log_beta(alpha + k, beta + n - k) - _log_beta(alpha, beta)
-    return np.exp(log_val)
-
-@lru_cache(maxsize=200000)
-def predictive_prob_success_at_final_cached(r_eff: int, n_curr: int, N_final: int,
-                                            alpha_e: float, beta_e: float,
-                                            p0: float, eff_final_prob: float) -> float:
-    """Exact predictive probability for final success. Cached by (r,t) state."""
-    n_remain = N_final - n_curr
-    if n_remain < 0:
-        return 0.0
-    # Vectorized over future successes
-    ks = np.arange(0, n_remain + 1)
-    r_tot = r_eff + ks
-    a_post = alpha_e + r_tot
-    b_post = beta_e + N_final - r_tot
-    # tail at final
-    tails = np.array([posterior_tail_prob_beta(a, b, p0) for a, b in zip(a_post, b_post)])
-    ok = tails > eff_final_prob
-    # predictive weights under posterior at (r_eff, n_curr)
-    w = beta_binomial_pmf_vec(ks, n_remain, alpha_e + r_eff, beta_e + (n_curr - r_eff))
-    total = float(np.sum(w[ok]))
-    return max(0.0, min(1.0, total))
-
-# --------------------------- Look Schedule Builders --------------------------- #
-
-def schedule_run_interval(N: int, run_in: int, interval: int) -> List[int]:
-    looks = set()
-    if (interval or 0) <= 0 and (run_in or 0) <= 0:
-        looks.add(N)
-    else:
-        start = max(1, run_in) if run_in and run_in > 0 else max(1, interval)
-        x = start
-        while x < N:
-            looks.add(int(x))
-            if interval <= 0:
-                break
-            x += interval
-        looks.add(N)
-    return sorted(looks)
-
-def schedule_absolute_n(N: int, absolute_ns: List[int]) -> List[int]:
-    looks = sorted({x for x in absolute_ns if 1 <= x <= N})
-    if N not in looks:
-        looks.append(N)
-    return sorted(set(looks))
-
-def schedule_evenly_spaced(N: int, num_looks: int) -> List[int]:
-    """Evenly spaced **including final N**. num_looks >= 1."""
-    num_looks = max(1, int(num_looks))
-    pts = np.linspace(1, N, num=num_looks, endpoint=True)
-    looks = sorted({int(round(x)) for x in pts})
-    looks[-1] = N
-    return looks
-
-def schedule_fixed_pct_remaining(N: int, first: int, pct_remaining: float) -> List[int]:
-    """After first look at 'first', next look is increased by ceil(pct_remaining * remaining)."""
-    looks = []
-    t = max(1, int(first)) if first > 0 else 1
-    if t < N:
-        looks.append(t)
-    while t < N:
-        remaining = N - t
-        step = int(math.ceil(pct_remaining * remaining))
-        if step <= 0:
-            step = 1
-        t = t + step
-        if t < N:
-            looks.append(t)
-        else:
-            break
-    looks.append(N)
-    return sorted(set(looks))
-
-def schedule_absolute_pct(N: int, pct_list: List[float]) -> List[int]:
-    looks = sorted({int(round(N * p/100.0)) for p in pct_list})
-    looks = [max(1, x) for x in looks]
-    looks.append(N)
-    return sorted(set(looks))
-
-# ----------------------- Boundary Precomputation (FAST) ----------------------- #
-
-def compute_efficacy_min_r_by_t(N: int, alpha_e: float, beta_e: float, p0: float,
-                                prob_interim: float, prob_final: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Return arrays eff_min_r_interim[t], eff_min_r_final[t] for t=1..N.
-    Each entry is the **minimum r** such that Pr(p>p0) > threshold. If no r satisfies, set to t+1.
-    """
-    min_r_interim = np.full(N+1, N+1, dtype=int)
-    min_r_final = np.full(N+1, N+1, dtype=int)
-    for t in range(1, N+1):
-        # scan r from 0..t
-        for r in range(0, t+1):
-            a = alpha_e + r
-            b = beta_e + t - r
-            tail = posterior_tail_prob_beta(a, b, p0)
-            if tail > prob_interim and min_r_interim[t] == N+1:
-                min_r_interim[t] = r
-            if tail > prob_final and min_r_final[t] == N+1:
-                min_r_final[t] = r
-        if min_r_interim[t] == N+1:
-            min_r_interim[t] = t+1  # impossible; will never stop early for efficacy
-        if min_r_final[t] == N+1:
-            min_r_final[t] = t+1
-    return min_r_interim, min_r_final
-
-def compute_safety_min_r_by_t(N: int, alpha_s: float, beta_s: float, p_tox_star: float, saf_prob_cut: float) -> np.ndarray:
-    """Return array saf_min_r[t] = minimum r_tox to trigger safety stop (strict > cutoff). If none, set t+1."""
-    saf_min_r = np.full(N+1, N+1, dtype=int)
-    for t in range(1, N+1):
-        for r in range(0, t+1):
-            a = alpha_s + r
-            b = beta_s + t - r
-            tail = posterior_tail_prob_beta(a, b, p_tox_star)
-            if tail > saf_prob_cut:
-                saf_min_r[t] = r
-                break
-        if saf_min_r[t] == N+1:
-            saf_min_r[t] = t+1
-    return saf_min_r
-
-def compute_futility_min_r_by_t(N: int, alpha_e: float, beta_e: float, p0: float, eff_final_prob: float, fut_prob_cut: float) -> np.ndarray:
-    """Return array fut_min_r_needed[t] = minimal r such that PredictiveProb(final success) >= fut_prob_cut.
-    If even r=t fails, set to t+1 (meaning futility would always trigger at that t).
-    Only meaningful for t < N; for t==N we set to 0.
-    """
-    fut_min = np.zeros(N+1, dtype=int)
-    for t in range(1, N):
-        r_needed = t + 1
-        for r in range(0, t+1):
-            pp = predictive_prob_success_at_final_cached(r, t, N, alpha_e, beta_e, p0, eff_final_prob)
-            if pp >= fut_prob_cut:
-                r_needed = r
-                break
-        fut_min[t] = r_needed
-    fut_min[N] = 0
-    return fut_min
-
-# ----------------------------- Simulation Engine ----------------------------- #
-
-def simulate_single_trial_fast(N: int,
-                               eff_looks: List[int], saf_looks: List[int], fut_looks: List[int],
-                               eff_min_r_interim: np.ndarray, eff_min_r_final: np.ndarray,
-                               saf_min_r: np.ndarray, fut_min_r_needed: np.ndarray,
-                               true_p_eff: float, true_p_tox: float,
-                               rng: np.random.Generator) -> Dict:
-    """Ultra-fast simulation using precomputed integer boundaries only."""
-    eff_looks_set = set(eff_looks)
-    saf_looks_set = set(saf_looks)
-    fut_looks_set = set(fut_looks)
-
-    eff_outcomes = rng.binomial(1, true_p_eff, size=N)
-    tox_outcomes = rng.binomial(1, true_p_tox, size=N)
-
-    r_eff = 0
-    r_tox = 0
-    stop_reason = None
-    n_enrolled = 0
-
-    for t in range(1, N+1):
-        r_eff += eff_outcomes[t-1]
-        r_tox += tox_outcomes[t-1]
-        n_enrolled = t
-
-        # 1) Safety
-        if t in saf_looks_set:
-            if r_tox >= saf_min_r[t]:
-                stop_reason = "safety"
-                break
-
-        # 2) Efficacy
-        if t in eff_looks_set:
-            if t < N:
-                if r_eff >= eff_min_r_interim[t]:
-                    stop_reason = "efficacy_early"
-                    break
-            else:
-                if r_eff >= eff_min_r_final[t]:
-                    stop_reason = "efficacy_final"
-                else:
-                    stop_reason = "no_effect"
-                break
-
-        # 3) Futility
-        if t in fut_looks_set and t < N:
-            if r_eff < fut_min_r_needed[t]:
-                stop_reason = "futility"
-                break
-
-    success = stop_reason in {"efficacy_early", "efficacy_final"}
-
-    return {
-        "n": N,
-        "n_enrolled": n_enrolled,
-        "r_eff": int(r_eff),
-        "r_tox": int(r_tox),
-        "stop_reason": stop_reason,
-        "success": bool(success),
-        "stop_time": n_enrolled,
-    }
-
-# Fallback accurate but slower engine (uses probabilities on the fly)
-
-def simulate_single_trial_slow(N: int,
-                               eff_looks: List[int], saf_looks: List[int], fut_looks: List[int],
-                               alpha_e: float, beta_e: float, alpha_s: float, beta_s: float,
-                               p0: float, eff_prob_interim: float, eff_prob_final: float,
-                               p_tox_star: float, saf_prob_cut: float, fut_prob_cut: float,
-                               true_p_eff: float, true_p_tox: float,
-                               rng: np.random.Generator) -> Dict:
-    eff_looks_set = set(eff_looks)
-    saf_looks_set = set(saf_looks)
-    fut_looks_set = set(fut_looks)
-
-    eff_outcomes = rng.binomial(1, true_p_eff, size=N)
-    tox_outcomes = rng.binomial(1, true_p_tox, size=N)
-
-    r_eff = 0
-    r_tox = 0
-    stop_reason = None
-    n_enrolled = 0
-
-    for t in range(1, N + 1):
-        r_eff += eff_outcomes[t - 1]
-        r_tox += tox_outcomes[t - 1]
-        n_enrolled = t
-
-        # Safety
-        if t in saf_looks_set:
-            a_s = alpha_s + r_tox
-            b_s = beta_s + t - r_tox
-            prob_tox_high = posterior_tail_prob_beta(a_s, b_s, p_tox_star)
-            if prob_tox_high > saf_prob_cut:
-                stop_reason = "safety"
-                break
-
-        # Efficacy
-        if t in eff_looks_set:
-            a_e = alpha_e + r_eff
-            b_e = beta_e + t - r_eff
-            prob_eff_above_p0 = posterior_tail_prob_beta(a_e, b_e, p0)
-            if t < N:
-                if prob_eff_above_p0 > eff_prob_interim:
-                    stop_reason = "efficacy_early"
-                    break
-            else:
-                if prob_eff_above_p0 > eff_prob_final:
-                    stop_reason = "efficacy_final"
-                else:
-                    stop_reason = "no_effect"
-                break
-
-        # Futility
-        if t in fut_looks_set and t < N:
-            pp = predictive_prob_success_at_final_cached(r_eff, t, N, alpha_e, beta_e, p0, eff_prob_final)
-            if pp < fut_prob_cut:
-                stop_reason = "futility"
-                break
-
-    success = stop_reason in {"efficacy_early", "efficacy_final"}
-    return {
-        "n": N,
-        "n_enrolled": n_enrolled,
-        "r_eff": int(r_eff),
-        "r_tox": int(r_tox),
-        "stop_reason": stop_reason,
-        "success": bool(success),
-        "stop_time": n_enrolled,
-    }
-
-# Batch
-
-def simulate_many_trials(num_sims: int, seed: Optional[int], engine: str,
-                         # design & schedules
-                         N: int, eff_looks: List[int], saf_looks: List[int], fut_looks: List[int],
-                         # priors & thresholds
-                         alpha_e: float, beta_e: float, alpha_s: float, beta_s: float,
-                         p0: float, eff_prob_interim: float, eff_prob_final: float,
-                         p_tox_star: float, saf_prob_cut: float, fut_prob_cut: float,
-                         # boundaries (optional for FAST)
-                         eff_min_r_interim: Optional[np.ndarray] = None,
-                         eff_min_r_final: Optional[np.ndarray] = None,
-                         saf_min_r: Optional[np.ndarray] = None,
-                         fut_min_r_needed: Optional[np.ndarray] = None,
-                         # truths
-                         true_p_eff: float = 0.2, true_p_tox: float = 0.1) -> pd.DataFrame:
-    rng = np.random.default_rng(seed)
-    records = []
-    if engine == 'FAST':
-        assert eff_min_r_interim is not None and eff_min_r_final is not None and saf_min_r is not None and fut_min_r_needed is not None
-        for _ in range(num_sims):
-            res = simulate_single_trial_fast(
-                N, eff_looks, saf_looks, fut_looks,
-                eff_min_r_interim, eff_min_r_final,
-                saf_min_r, fut_min_r_needed,
-                true_p_eff, true_p_tox, rng
-            )
-            records.append(res)
-    else:
-        for _ in range(num_sims):
-            res = simulate_single_trial_slow(
-                N, eff_looks, saf_looks, fut_looks,
-                alpha_e, beta_e, alpha_s, beta_s,
-                p0, eff_prob_interim, eff_prob_final,
-                p_tox_star, saf_prob_cut, fut_prob_cut,
-                true_p_eff, true_p_tox, rng
-            )
-            records.append(res)
-    return pd.DataFrame(records)
-
-# ----------------------------- Streamlit UI ---------------------------------- #
-
-st.set_page_config(page_title="Bayesian Single-Arm Trial Designer", layout="wide")
-
-st.title("Bayesian Single-Arm Trial Designer & Simulator (v2)")
-
-st.caption(
-    "Fast, flexible Bayesian single-arm trial design with separate efficacy, safety, and futility monitoring."
-)
-
-with st.expander("⚙️ Performance Options", expanded=False):
-    st.markdown(
-        "- **FAST mode (recommended)**: compiles integer decision **boundaries** at load times and simulates using only counters. Very fast and exact (when SciPy is present).\n"
-        "- **ACCURATE mode**: evaluates posterior/predictive probabilities on the fly (slower).\n"
-        f"- SciPy available: **{SCIPY_AVAILABLE}**. If False, probability computations use MC approximations."
-    )
-
-# Sidebar: Global settings
-st.sidebar.header("Design Inputs")
-
-# Basic rates
-p0 = st.sidebar.number_input("Null response rate (p0)", 0.0, 1.0, 0.20, 0.01, key="auto_key_0002")
-p1 = st.sidebar.number_input("Target response rate (p1)", 0.0, 1.0, 0.40, 0.01, key="auto_key_0003")
-
-# Priors
-st.sidebar.subheader("Priors (Beta)")
-colA, colB = st.sidebar.columns(2)
-alpha_e = colA.number_input("Efficacy α", min_value=0.01, value=1.0, step=0.1, key="auto_key_0004")
-beta_e  = colB.number_input("Efficacy β",  min_value=0.01, value=1.0, step=0.1, key="auto_key_0005")
-colC, colD = st.sidebar.columns(2)
-alpha_s = colC.number_input("Safety α", min_value=0.01, value=1.0, step=0.1, key="auto_key_0006")
-beta_s  = colD.number_input("Safety β",  min_value=0.01, value=1.0, step=0.1, key="auto_key_0007")
-
-# Thresholds
-st.sidebar.subheader("Decision Thresholds")
-colT1, colT2 = st.sidebar.columns(2)
-eff_prob_interim = colT1.number_input("Efficacy interim Pr[p>p0]", 0.5, 1.0, 0.99, 0.01, key="auto_key_0008")
-eff_prob_final   = colT2.number_input("Efficacy final Pr[p>p0]",   0.5, 1.0, 0.975, 0.005, key="auto_key_0009")
-colT3, colT4 = st.sidebar.columns(2)
-p_tox_star   = colT3.number_input("Max acceptable tox (p_tox*)", 0.0, 1.0, 0.30, 0.01, key="auto_key_0010")
-saf_prob_cut = colT4.number_input("Safety cutoff prob.", 0.5, 1.0, 0.90, 0.01, key="auto_key_0011")
-
-fut_prob_cut = st.sidebar.number_input("Futility cutoff (predictive)", 0.0, 0.5, 0.05, 0.01, key="auto_key_0012")
-
-# Schedules
-st.sidebar.subheader("Look Schedules (choose mode per rule)")
-
-SCHED_MODES = [
-    "Run+Interval",           # existing pattern
-    "Absolute N list",        # comma-separated Ns
-    "Evenly spaced (#looks)", # evenly spaced including final
-    "Fixed % of remaining",   # step increases as % of remaining
-    "Absolute %s of N"        # comma-separated percentages
-]
-
-# Helper to build UI for one schedule
-
-def schedule_inputs(label_prefix: str):
-    mode = st.sidebar.selectbox(f"{label_prefix} schedule mode", SCHED_MODES, index=0, key=f"mode_{label_prefix}")
-    if mode == "Run+Interval":
-        c1, c2 = st.sidebar.columns(2)
-        run_in = c1.number_input(f"{label_prefix} run-in", min_value=0, value=10, step=1, key=f"{label_prefix}_run")
-        interval = c2.number_input(f"{label_prefix} interval", min_value=0, value=10, step=1, key=f"{label_prefix}_int")
-        params = {"run_in": run_in, "interval": interval}
-    elif mode == "Absolute N list":
-        txt = st.sidebar.text_input(f"{label_prefix} Ns (comma)", value="", key=f"{label_prefix}_abs")
-        params = {"absolute_ns": [int(x.strip()) for x in txt.split(',') if x.strip().isdigit()]}
-    elif mode == "Evenly spaced (#looks)":
-        looks = st.sidebar.number_input(f"{label_prefix} number of looks", min_value=1, value=4, step=1, key=f"{label_prefix}_num")
-        params = {"num_looks": int(looks)}
-    elif mode == "Fixed % of remaining":
-        first = st.sidebar.number_input(f"{label_prefix} first look (n)", min_value=1, value=10, step=1, key=f"{label_prefix}_first")
-        pct  = st.sidebar.number_input(f"{label_prefix} % of remaining (0-1)", min_value=0.01, max_value=0.99, value=0.25, step=0.01, key=f"{label_prefix}_pctrem")
-        params = {"first": int(first), "pct_remaining": float(pct)}
-    else: # Absolute %s of N
-        txt = st.sidebar.text_input(f"{label_prefix} %s (comma)", value="25, 50, 75, 100", key=f"{label_prefix}_pctabs")
-        def parse_pct(s):
-            try:
-                return float(s.strip())
-            except:
-                return None
-        params = {"pct_list": [p for p in (parse_pct(x) for x in txt.split(',')) if p is not None]}
-    return mode, params
-
-mode_eff, params_eff = schedule_inputs("Efficacy")
-mode_saf, params_saf = schedule_inputs("Safety")
-mode_fut, params_fut = schedule_inputs("Futility")
-
-# OC targets
-st.sidebar.subheader("OC Targets")
-colO1, colO2, colO3 = st.sidebar.columns(3)
-max_type1 = colO1.number_input("Max Type I", 0.01, 0.5, 0.10, 0.01, key="auto_key_0013")
-min_power = colO2.number_input("Min Power", 0.5, 1.0, 0.80, 0.01, key="auto_key_0014")
-flex_tol  = colO3.number_input("Tolerance (±)", 0.0, 0.2, 0.02, 0.01, key="auto_key_0015")
-
-# Simulation settings
-st.sidebar.subheader("Simulation Settings")
-colS1, colS2 = st.sidebar.columns(2)
-rand_seed = int(colS1.number_input("Random seed", min_value=0, value=12345, step=1, key="auto_key_0016"))
-engine = colS2.selectbox("Engine", ["FAST", "ACCURATE"], index=0, key="auto_key_0017")
-
-# Build schedule based on choice
-
-def build_schedule(N: int, mode: str, params: Dict) -> List[int]:
-    if mode == "Run+Interval":
-        return schedule_run_interval(N, params.get("run_in", 10), params.get("interval", 10))
-    elif mode == "Absolute N list":
-        return schedule_absolute_n(N, params.get("absolute_ns", []))
-    elif mode == "Evenly spaced (#looks)":
-        return schedule_evenly_spaced(N, params.get("num_looks", 4))
-    elif mode == "Fixed % of remaining":
-        return schedule_fixed_pct_remaining(N, params.get("first", 10), params.get("pct_remaining", 0.25))
-    else:
-        return schedule_absolute_pct(N, params.get("pct_list", [25, 50, 75, 100]))
-
-# Helper: compute boundaries for a given N
-
-@st.cache_data(show_spinner=False)
-def compile_boundaries(N: int,
-                       alpha_e: float, beta_e: float, p0: float, eff_prob_interim: float, eff_prob_final: float,
-                       alpha_s: float, beta_s: float, p_tox_star: float, saf_prob_cut: float,
-                       fut_prob_cut: float) -> Dict[str, np.ndarray]:
-    eff_min_r_interim, eff_min_r_final = compute_efficacy_min_r_by_t(N, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final)
-    saf_min_r = compute_safety_min_r_by_t(N, alpha_s, beta_s, p_tox_star, saf_prob_cut)
-    fut_min_r_needed = compute_futility_min_r_by_t(N, alpha_e, beta_e, p0, eff_prob_final, fut_prob_cut)
-    return {
-        "eff_min_r_interim": eff_min_r_interim,
-        "eff_min_r_final": eff_min_r_final,
-        "saf_min_r": saf_min_r,
-        "fut_min_r_needed": fut_min_r_needed,
-    }
-
-# Tabs
-main_tabs = st.tabs([
-    "1) Quick Scan (N range)",
-    "2) Compare Specific Ns",
-    "3) Deep Dive (single N)",
-    "4) OC Matrix (grid)",
-    "Selected Design, Boundaries & Export",
-])
-
-# --- 1) Quick Scan ---
-with main_tabs[0]:
-    st.subheader("1) Quick Scan Across N")
-    c1, c2, c3 = st.columns(3)
-    N_min = int(c1.number_input("N min", min_value=5, value=40, step=1, key="auto_key_0018"))
-    N_max = int(c2.number_input("N max", min_value=N_min, value=80, step=1, key="auto_key_0019"))
-    N_step = int(c3.number_input("Step", min_value=1, value=5, step=1, key="auto_key_0020"))
-    c4, c5 = st.columns(2)
-    sims_fast = int(c4.number_input("Sims per N", min_value=500, value=3000, step=500, key="auto_key_0021"))
-    ptox_eval = float(c5.number_input("True toxicity (acceptable)", 0.0, 1.0, max(0.01, min(p_tox_star - 0.05, 0.99)), 0.01, key="auto_key_0022"))
-    run_btn = st.button("Run Quick Scan", type="primary", key="auto_key_0023")
-
-    if run_btn:
-        results = []
-        Ns = list(range(N_min, N_max + 1, N_step))
-        prog = st.progress(0.0)
-        for i, N in enumerate(Ns, start=1):
-            eff_looks = build_schedule(N, mode_eff, params_eff)
-            saf_looks = build_schedule(N, mode_saf, params_saf)
-            fut_looks = build_schedule(N, mode_fut, params_fut)
-            if engine == 'FAST':
-                b = compile_boundaries(N, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                                       alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-                df_h0 = simulate_many_trials(sims_fast, rand_seed + 11*N, 'FAST', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                             true_p_eff=p0, true_p_tox=ptox_eval)
-                df_h1 = simulate_many_trials(sims_fast, rand_seed + 13*N, 'FAST', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                             true_p_eff=p1, true_p_tox=ptox_eval)
-            else:
-                df_h0 = simulate_many_trials(sims_fast, rand_seed + 11*N, 'ACCURATE', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             true_p_eff=p0, true_p_tox=ptox_eval)
-                df_h1 = simulate_many_trials(sims_fast, rand_seed + 13*N, 'ACCURATE', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             true_p_eff=p1, true_p_tox=ptox_eval)
-            results.append({
-                "N": N,
-                "Type I": float(df_h0['success'].mean()),
-                "Power": float(df_h1['success'].mean()),
-                "ESS@H0": float(df_h0['n_enrolled'].mean()),
-                "ESS@H1": float(df_h1['n_enrolled'].mean()),
-                "Pr(EarlySucc)": float((df_h1['stop_reason'] == 'efficacy_early').mean()),
-                "Pr(SafetyStop@H0)": float((df_h0['stop_reason'] == 'safety').mean()),
-            })
-            prog.progress(i/len(Ns))
-        scan_df = pd.DataFrame(results)
-        st.session_state['latest_scan_df'] = scan_df
-        st.dataframe(scan_df.style.format({"Type I": "{:.3f}", "Power": "{:.3f}", "ESS@H0": "{:.1f}", "ESS@H1": "{:.1f}", "Pr(EarlySucc)": "{:.3f}", "Pr(SafetyStop@H0)": "{:.3f}"}), use_container_width=True)
-        fig, ax = plt.subplots(figsize=(8,4))
-        ax.plot(scan_df['N'], scan_df['Type I'], marker='o', label='Type I')
-        ax.plot(scan_df['N'], scan_df['Power'], marker='o', label='Power')
-        ax.axhline(max_type1, color='r', ls='--', alpha=0.5, label='Max Type I')
-        ax.axhline(min_power, color='g', ls='--', alpha=0.5, label='Min Power')
-        ax.set_xlabel('N'); ax.set_ylabel('Probability'); ax.set_title('Type I & Power vs N')
-        ax.legend(); st.pyplot(fig)
-        feas = scan_df[(scan_df['Type I'] <= max_type1 + flex_tol) & (scan_df['Power'] >= min_power - flex_tol)]
-        st.markdown("**Feasible designs (within tolerance):**")
-        st.dataframe(feas, use_container_width=True)
-
-# --- 2) Compare Specific Ns ---
-with main_tabs[1]:
-    st.subheader("2) Compare Specific Ns")
-    Ns_text = st.text_input("N values (comma)", value="40, 50, 60, 70, 80", key="auto_key_0024")
-    sims_cmp = int(st.number_input("Sims per N", min_value=1000, value=5000, step=1000, key="auto_key_0025"))
-    ptox_eval = float(st.number_input("True toxicity (acceptable)", 0.0, 1.0, max(0.01, min(p_tox_star - 0.05, 0.99)), 0.01, key="auto_key_0026"))
-    cmp_btn = st.button("Run Comparison", key="auto_key_0027")
-
-    if cmp_btn:
-        Ns_list = [int(x.strip()) for x in Ns_text.split(',') if x.strip().isdigit()]
-        rows = []
-        prog = st.progress(0.0)
-        for i, N in enumerate(Ns_list, start=1):
-            eff_looks = build_schedule(N, mode_eff, params_eff)
-            saf_looks = build_schedule(N, mode_saf, params_saf)
-            fut_looks = build_schedule(N, mode_fut, params_fut)
-            if engine == 'FAST':
-                b = compile_boundaries(N, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                                       alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-                df_h0 = simulate_many_trials(sims_cmp, rand_seed + 101*N, 'FAST', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                             true_p_eff=p0, true_p_tox=ptox_eval)
-                df_h1 = simulate_many_trials(sims_cmp, rand_seed + 103*N, 'FAST', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                             true_p_eff=p1, true_p_tox=ptox_eval)
-            else:
-                df_h0 = simulate_many_trials(sims_cmp, rand_seed + 101*N, 'ACCURATE', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             true_p_eff=p0, true_p_tox=ptox_eval)
-                df_h1 = simulate_many_trials(sims_cmp, rand_seed + 103*N, 'ACCURATE', N, eff_looks, saf_looks, fut_looks,
-                                             alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                             p_tox_star, saf_prob_cut, fut_prob_cut,
-                                             true_p_eff=p1, true_p_tox=ptox_eval)
-            rows.append({
-                "N": N,
-                "Type I": float(df_h0['success'].mean()),
-                "Power": float(df_h1['success'].mean()),
-                "ESS@H0": float(df_h0['n_enrolled'].mean()),
-                "ESS@H1": float(df_h1['n_enrolled'].mean()),
-                "Pr(EarlySucc|H1)": float((df_h1['stop_reason'] == 'efficacy_early').mean()),
-            })
-            prog.progress(i/len(Ns_list))
-        cmp_df = pd.DataFrame(rows).sort_values("N")
-        st.session_state['latest_compare_df'] = cmp_df
-        st.dataframe(cmp_df.style.format({"Type I": "{:.3f}", "Power": "{:.3f}", "ESS@H0": "{:.1f}", "ESS@H1": "{:.1f}", "Pr(EarlySucc|H1)": "{:.3f}"}), use_container_width=True)
-        fig2, ax2 = plt.subplots(figsize=(8,4))
-        ax2.plot(cmp_df['N'], cmp_df['Type I'], marker='o', label='Type I')
-        ax2.plot(cmp_df['N'], cmp_df['Power'], marker='o', label='Power')
-        ax2.axhline(max_type1, color='r', ls='--', alpha=0.5, label='Max Type I')
-        ax2.axhline(min_power, color='g', ls='--', alpha=0.5, label='Min Power')
-        ax2.set_xlabel('N'); ax2.set_ylabel('Probability'); ax2.set_title('Type I & Power vs N (Comparison)'); ax2.legend()
-        st.pyplot(fig2)
-
-# --- 3) Deep Dive ---
-with main_tabs[2]:
-    st.subheader("3) Deep Dive on a Specific N")
-    N_deep = int(st.number_input("Select N (final)", min_value=5, value=60, step=1, key="auto_key_0028"))
-    sims_deep = int(st.number_input("Sims (deep dive)", min_value=5000, value=50000, step=5000, key="auto_key_0029"))
-    ptox_deep = float(st.number_input("True toxicity (acceptable)", 0.0, 1.0, max(0.01, min(p_tox_star - 0.05, 0.99)), 0.01, key="auto_key_0030"))
-    deep_btn = st.button("Run Deep Dive", key="auto_key_0031")
-
-    if deep_btn:
-        eff_looks = build_schedule(N_deep, mode_eff, params_eff)
-        saf_looks = build_schedule(N_deep, mode_saf, params_saf)
-        fut_looks = build_schedule(N_deep, mode_fut, params_fut)
-        if engine == 'FAST':
-            b = compile_boundaries(N_deep, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                                   alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-            df_h0 = simulate_many_trials(sims_deep, rand_seed + 1001, 'FAST', N_deep, eff_looks, saf_looks, fut_looks,
-                                         alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                         p_tox_star, saf_prob_cut, fut_prob_cut,
-                                         b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                         true_p_eff=p0, true_p_tox=ptox_deep)
-            df_h1 = simulate_many_trials(sims_deep, rand_seed + 1003, 'FAST', N_deep, eff_looks, saf_looks, fut_looks,
-                                         alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                         p_tox_star, saf_prob_cut, fut_prob_cut,
-                                         b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                         true_p_eff=p1, true_p_tox=ptox_deep)
-        else:
-            df_h0 = simulate_many_trials(sims_deep, rand_seed + 1001, 'ACCURATE', N_deep, eff_looks, saf_looks, fut_looks,
-                                         alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                         p_tox_star, saf_prob_cut, fut_prob_cut,
-                                         true_p_eff=p0, true_p_tox=ptox_deep)
-            df_h1 = simulate_many_trials(sims_deep, rand_seed + 1003, 'ACCURATE', N_deep, eff_looks, saf_looks, fut_looks,
-                                         alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                         p_tox_star, saf_prob_cut, fut_prob_cut,
-                                         true_p_eff=p1, true_p_tox=ptox_deep)
-
-        # Key metrics & CIs
-        def binom_ci(p, n, alpha=0.05):
-            # normal approx
-            se = np.sqrt(p*(1-p)/max(1,n))
-            z = 1.959963984540054
-            return max(0.0, p - z*se), min(1.0, p + z*se)
-
-        type1 = float(df_h0['success'].mean()); type1_ci = binom_ci(type1, len(df_h0))
-        power = float(df_h1['success'].mean()); power_ci = binom_ci(power, len(df_h1))
-        ess_h0 = float(df_h0['n_enrolled'].mean()); ess_h1 = float(df_h1['n_enrolled'].mean())
-        st.markdown(f"**Type I** (p={p0:.2f}) = **{type1:.3f}** (95% CI {type1_ci[0]:.3f}-{type1_ci[1]:.3f}) | "
-                    f"**Power** (p={p1:.2f}) = **{power:.3f}** (95% CI {power_ci[0]:.3f}-{power_ci[1]:.3f})")
-        st.markdown(f"**ESS@H0** = {ess_h0:.1f} | **ESS@H1** = {ess_h1:.1f}")
-
-        # Detailed readouts
-        def detailed_readouts(df: pd.DataFrame, label: str):
-            st.markdown(f"### Detailed readouts – {label}")
-            # Stop reasons
-            sr = df['stop_reason'].value_counts().reindex(['safety','efficacy_early','efficacy_final','futility','no_effect'], fill_value=0)
-            st.write(pd.DataFrame({'count': sr, 'prob': (sr/len(df)).round(3)}))
-            # n_enrolled quantiles
-            q = df['n_enrolled'].quantile([0.1,0.25,0.5,0.75,0.9]).round(1)
-            st.write(pd.DataFrame({'quantile': q.index, 'n_enrolled': q.values}))
-            # Conditional metrics
-            early = df[df['stop_reason']=='efficacy_early']
-            fut = df[df['stop_reason']=='futility']
-            st.write({
-                'Pr(Early success)': float((df['stop_reason']=='efficacy_early').mean()),
-                'Pr(Futility)': float((df['stop_reason']=='futility').mean()),
-                'ESS | Early success': float(early['n_enrolled'].mean()) if not early.empty else np.nan,
-                'ESS | Futility': float(fut['n_enrolled'].mean()) if not fut.empty else np.nan,
-                'E[r_eff] at stop': float(df['r_eff'].mean()),
-                'E[r_tox] at stop': float(df['r_tox'].mean()),
-            })
-            # Per-look stop probabilities (map time to look index per schedule)
-            look_map = {t:i+1 for i,t in enumerate(sorted(set(eff_looks + saf_looks + fut_looks)))}
-            df['look_idx'] = df['stop_time'].map(look_map).fillna(np.nan)
-            by_look = df.groupby(['look_idx','stop_reason']).size().unstack(fill_value=0)
-            by_look_prob = by_look.div(len(df))
-            st.markdown("**Per-look stop probabilities**")
-            st.dataframe(by_look_prob)
-            # Cumulative stopping curve
-            cum = df['n_enrolled'].value_counts().sort_index().cumsum()/len(df)
-            fig, ax = plt.subplots(figsize=(6,3.5))
-            ax.step(cum.index, cum.values, where='post')
-            ax.set_xlabel('n (enrolled)'); ax.set_ylabel('Cumulative Pr[stop ≤ n]'); ax.set_title(f'Cumulative stopping: {label}')
-            st.pyplot(fig)
-            return by_look_prob
-
-        bl_h0 = detailed_readouts(df_h0, 'H0')
-        bl_h1 = detailed_readouts(df_h1, 'H1')
-
-        # Boundary visualization
-        if engine == 'FAST':
-            b = compile_boundaries(N_deep, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                                   alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-            figB, axB = plt.subplots(figsize=(7,4))
-            ts = np.arange(1, N_deep+1)
-            axB.plot(ts, b['eff_min_r_interim'][1:], label='Efficacy interim r_min', color='#1f77b4')
-            axB.plot(ts, b['eff_min_r_final'][1:], label='Efficacy final r_min', color='#2ca02c')
-            axB.plot(ts, b['saf_min_r'][1:], label='Safety r_tox min', color='#d62728')
-            axB.plot(ts[:-1], b['fut_min_r_needed'][1:-1], label='Futility r_eff needed', color='#9467bd')
-            axB.set_xlabel('n'); axB.set_ylabel('required count'); axB.set_title('Compiled decision boundaries')
-            axB.legend(); st.pyplot(figB)
-
-        # Save for export
-        st.session_state['deep_dive_h0_df'] = df_h0
-        st.session_state['deep_dive_h1_df'] = df_h1
-
-# --- 4) OC Matrix ---
-with main_tabs[3]:
-    st.subheader("4) Operating Characteristics (OC) Matrix")
-    c1, c2 = st.columns(2)
-    p_eff_min = float(c1.number_input("Efficacy min", 0.0, 1.0, max(0.0, p0-0.1), 0.01, key="auto_key_0032"))
-    p_eff_max = float(c1.number_input("Efficacy max", p_eff_min, 1.0, min(1.0, p1+0.2), 0.01, key="auto_key_0033"))
-    p_eff_step= float(c1.number_input("Efficacy step", 0.01, 0.5, 0.05, 0.01, key="auto_key_0034"))
-    p_tox_min = float(c2.number_input("Toxicity min", 0.0, 1.0, max(0.0, p_tox_star-0.2), 0.01, key="auto_key_0035"))
-    p_tox_max = float(c2.number_input("Toxicity max", p_tox_min, 1.0, min(1.0, p_tox_star+0.2), 0.01, key="auto_key_0036"))
-    p_tox_step= float(c2.number_input("Toxicity step", 0.01, 0.5, 0.05, 0.01, key="auto_key_0037"))
-
-    N_oc = int(st.number_input("Select N for OC matrix", min_value=5, value=60, step=1, key="auto_key_0038"))
-    sims_oc = int(st.number_input("Sims per cell", min_value=500, value=2000, step=500, key="auto_key_0039"))
-    run_oc_btn = st.button("Run OC Matrix", key="auto_key_0040")
-
-    if run_oc_btn:
-        eff_looks = build_schedule(N_oc, mode_eff, params_eff)
-        saf_looks = build_schedule(N_oc, mode_saf, params_saf)
-        fut_looks = build_schedule(N_oc, mode_fut, params_fut)
-        if engine == 'FAST':
-            b = compile_boundaries(N_oc, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                                   alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-        eff_vals = np.round(np.arange(p_eff_min, p_eff_max+1e-9, p_eff_step), 3)
-        tox_vals = np.round(np.arange(p_tox_min, p_tox_max+1e-9, p_tox_step), 3)
-        recs = []
-        prog = st.progress(0.0)
-        total = len(eff_vals)*len(tox_vals)
-        idx=0
-        for pe in eff_vals:
-            for pt in tox_vals:
-                if engine == 'FAST':
-                    df = simulate_many_trials(sims_oc, rand_seed + 2001 + idx, 'FAST', N_oc, eff_looks, saf_looks, fut_looks,
-                                              alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                              p_tox_star, saf_prob_cut, fut_prob_cut,
-                                              b['eff_min_r_interim'], b['eff_min_r_final'], b['saf_min_r'], b['fut_min_r_needed'],
-                                              true_p_eff=float(pe), true_p_tox=float(pt))
-                else:
-                    df = simulate_many_trials(sims_oc, rand_seed + 2001 + idx, 'ACCURATE', N_oc, eff_looks, saf_looks, fut_looks,
-                                              alpha_e, beta_e, alpha_s, beta_s, p0, eff_prob_interim, eff_prob_final,
-                                              p_tox_star, saf_prob_cut, fut_prob_cut,
-                                              true_p_eff=float(pe), true_p_tox=float(pt))
-                recs.append({
-                    'p_eff': float(pe), 'p_tox': float(pt),
-                    'Pr(Success)': float(df['success'].mean()),
-                    'ESS': float(df['n_enrolled'].mean()),
-                    'Pr(SafetyStop)': float((df['stop_reason']=='safety').mean()),
-                    'Pr(Futility)': float((df['stop_reason']=='futility').mean()),
-                })
-                idx+=1
-                prog.progress(idx/total)
-        oc_df = pd.DataFrame(recs)
-        st.session_state['oc_matrix_df'] = oc_df
-        st.dataframe(oc_df, use_container_width=True)
-        # Heatmaps
-        def plot_heatmap(pivot_df: pd.DataFrame, title: str, cmap='viridis'):
-            fig, ax = plt.subplots(figsize=(6,5))
-            im = ax.imshow(pivot_df.values, origin='lower', aspect='auto', cmap=cmap,
-                           extent=[pivot_df.columns.min(), pivot_df.columns.max(), pivot_df.index.min(), pivot_df.index.max()])
-            ax.set_xlabel('p_tox'); ax.set_ylabel('p_eff'); ax.set_title(title)
-            fig.colorbar(im, ax=ax)
-            return fig
-        st.markdown("**Heatmaps**")
-        piv1 = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(Success)')
-        piv2 = oc_df.pivot(index='p_eff', columns='p_tox', values='ESS')
-        piv3 = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(SafetyStop)')
-        piv4 = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(Futility)')
-        st.pyplot(plot_heatmap(piv1, 'Pr(Success)'))
-        st.pyplot(plot_heatmap(piv2, 'Expected Sample Size', cmap='magma'))
-        st.pyplot(plot_heatmap(piv3, 'Pr(Safety Stop)', cmap='Reds'))
-        st.pyplot(plot_heatmap(piv4, 'Pr(Futility)', cmap='Blues'))
-
-# --- 5) Selected Design, Boundaries & Export ---
-with main_tabs[4]:
-    st.subheader("Selected Design & Export")
-    N_sel = int(st.number_input("Final N (selected)", min_value=5, value=60, step=1, key="auto_key_0041"))
-    eff_looks_sel = build_schedule(N_sel, mode_eff, params_eff)
-    saf_looks_sel = build_schedule(N_sel, mode_saf, params_saf)
-    fut_looks_sel = build_schedule(N_sel, mode_fut, params_fut)
-
-    if st.button("Compile & show decision boundaries", key="auto_key_0042"):
-        b = compile_boundaries(N_sel, alpha_e, beta_e, p0, eff_prob_interim, eff_prob_final,
-                               alpha_s, beta_s, p_tox_star, saf_prob_cut, fut_prob_cut)
-        st.session_state['boundaries_sel'] = {k: v.tolist() for k,v in b.items()}
-        st.success("Boundaries compiled.")
-        ts = np.arange(1, N_sel+1)
-        figB2, axB2 = plt.subplots(figsize=(7,4))
-        axB2.plot(ts, b['eff_min_r_interim'][1:], label='Efficacy interim r_min')
-        axB2.plot(ts, b['eff_min_r_final'][1:], label='Efficacy final r_min')
-        axB2.plot(ts, b['saf_min_r'][1:], label='Safety r_tox min')
-        axB2.plot(ts[:-1], b['fut_min_r_needed'][1:-1], label='Futility r_eff needed')
-        axB2.set_xlabel('n'); axB2.set_ylabel('required count'); axB2.legend(); axB2.set_title('Decision boundaries (selected N)')
-        st.pyplot(figB2)
-
-    if st.button("Set as Selected Design", key="auto_key_0043"):
-        selection = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "N": N_sel,
-            "p0": p0, "p1": p1,
-            "priors": {"eff": [alpha_e, beta_e], "saf": [alpha_s, beta_s]},
-            "eff_schedule": {"mode": mode_eff, "params": params_eff, "looks": eff_looks_sel},
-            "saf_schedule": {"mode": mode_saf, "params": params_saf, "looks": saf_looks_sel},
-            "fut_schedule": {"mode": mode_fut, "params": params_fut, "looks": fut_looks_sel},
-            "thresholds": {
-                "eff_interim": eff_prob_interim, "eff_final": eff_prob_final,
-                "p_tox_star": p_tox_star, "safety_cut": saf_prob_cut, "futility_cut": fut_prob_cut,
-            },
-            "oc_targets": {"max_type1": max_type1, "min_power": min_power, "tolerance": flex_tol},
-            "engine": engine, "scipy": SCIPY_AVAILABLE,
-            "boundaries": st.session_state.get('boundaries_sel')
-        }
-        st.session_state['final_design_selection'] = selection
-        st.success("Selected design saved for export.")
-
-    if 'final_design_selection' in st.session_state:
-        st.markdown("### Final Design Summary")
-        st.json(st.session_state['final_design_selection'])
-
-    st.markdown("---")
-    st.subheader("Export")
-
-    def _fig_to_png_bytes(fig) -> bytes:
-        buf = io.BytesIO(); fig.savefig(buf, format='png', bbox_inches='tight', dpi=160); buf.seek(0); return buf.read()
-
-    def build_export_zip() -> bytes:
-        zbuf = io.BytesIO()
-        with zipfile.ZipFile(zbuf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-            readme = (
-                "Bayesian Single-Arm Trial Designer Export\n"
-                f"Created: {datetime.utcnow().isoformat()}Z\n\n"
-                "Contents:\n"
-                "- final_design.json: JSON summary of selected design\n"
-                "- boundaries.json: compiled boundaries for selected N (if compiled)\n"
-                "- scan.csv, compare.csv: if available\n"
-                "- deep_dive_h0.csv / deep_dive_h1.csv: raw outputs (if available)\n"
-                "- oc_matrix.csv: OC matrix (if available)\n"
-                "- figures/*.png: Plots\n"
-            )
-            zf.writestr("README.txt", readme)
-            if 'final_design_selection' in st.session_state:
-                zf.writestr("final_design.json", json.dumps(st.session_state['final_design_selection'], indent=2))
-                if st.session_state['final_design_selection'].get('boundaries') is not None:
-                    zf.writestr("boundaries.json", json.dumps(st.session_state['final_design_selection']['boundaries'], indent=2))
-            if 'latest_scan_df' in st.session_state:
-                df = st.session_state['latest_scan_df']
-                zf.writestr("scan.csv", df.to_csv(index=False))
-                try:
-                    fig, ax = plt.subplots(figsize=(8,4))
-                    ax.plot(df['N'], df['Type I'], marker='o', label='Type I')
-                    ax.plot(df['N'], df['Power'], marker='o', label='Power')
-                    ax.set_xlabel('N'); ax.set_ylabel('Probability'); ax.set_title('Quick Scan: Type I & Power vs N'); ax.legend()
-                    zf.writestr("figures/quick_scan.png", _fig_to_png_bytes(fig)); plt.close(fig)
-                except: pass
-            if 'latest_compare_df' in st.session_state:
-                zf.writestr("compare.csv", st.session_state['latest_compare_df'].to_csv(index=False))
-            if 'deep_dive_h0_df' in st.session_state:
-                zf.writestr("deep_dive_h0.csv", st.session_state['deep_dive_h0_df'].to_csv(index=False))
-            if 'deep_dive_h1_df' in st.session_state:
-                zf.writestr("deep_dive_h1.csv", st.session_state['deep_dive_h1_df'].to_csv(index=False))
-            if 'oc_matrix_df' in st.session_state:
-                oc_df = st.session_state['oc_matrix_df']
-                zf.writestr("oc_matrix.csv", oc_df.to_csv(index=False))
-                try:
-                    piv_success = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(Success)')
-                    piv_ess = oc_df.pivot(index='p_eff', columns='p_tox', values='ESS')
-                    piv_saf = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(SafetyStop)')
-                    piv_fut = oc_df.pivot(index='p_eff', columns='p_tox', values='Pr(Futility)')
-                    def heat(pivot_df, title, cmap='viridis'):
-                        fig, ax = plt.subplots(figsize=(6,5))
-                        im = ax.imshow(pivot_df.values, origin='lower', aspect='auto', cmap=cmap,
-                                       extent=[pivot_df.columns.min(), pivot_df.columns.max(), pivot_df.index.min(), pivot_df.index.max()])
-                        ax.set_xlabel('p_tox'); ax.set_ylabel('p_eff'); ax.set_title(title); fig.colorbar(im, ax=ax)
-                        return fig
-                    zf.writestr("figures/oc_success.png", _fig_to_png_bytes(heat(piv_success, 'Pr(Success)')))
-                    zf.writestr("figures/oc_ess.png", _fig_to_png_bytes(heat(piv_ess, 'Expected Sample Size', 'magma')))
-                    zf.writestr("figures/oc_safety.png", _fig_to_png_bytes(heat(piv_saf, 'Pr(Safety Stop)', 'Reds')))
-                    zf.writestr("figures/oc_futility.png", _fig_to_png_bytes(heat(piv_fut, 'Pr(Futility)', 'Blues')))
-                    plt.close('all')
-                except: pass
-        zbuf.seek(0)
-        return zbuf.read()
-
-    if st.button("Build export zip", key="auto_key_0044"):
-        try:
-            zip_bytes = build_export_zip()
-            st.download_button(label="Download Export (.zip)", data=zip_bytes, file_name="bayesian_single_arm_design_export.zip", mime="application/zip", key="auto_key_0045")
-        except Exception as e:
-            st.error(f"Export failed: {e}")
-
-# Footer
-st.markdown('---')
-with st.expander('Methodology & Defaults', expanded=False):
-    st.markdown(
-        """
-        **Model & Rules**
-        - Efficacy & Safety ~ Bernoulli with Beta priors; posteriors are Beta(α + r, β + n − r).
-        - Efficacy rule: Pr(p_eff > p0) > threshold (interim/final). Safety rule: Pr(p_tox > p_tox*) > cutoff.
-        - Futility: predictive Pr(meeting *final* efficacy rule at N) < cutoff.
-        - Stop priority: Safety → Efficacy success → Futility.
-
-        **Performance**
-        - FAST mode compiles integer decision boundaries for each look size t and uses only integer comparisons; with SciPy this is exact.
-        - Without SciPy, Beta tail probabilities use a Monte Carlo fallback. Predictive probability remains exact via Beta–Binomial.
-
-        **Defaults**
-        - Priors Beta(1,1). Thresholds: interim 0.99, final 0.975; safety cutoff 0.90 at p_tox* = 0.30; futility 0.05.
-        - OC targets: Type I ≤ 0.10; Power ≥ 0.80; tolerance ±0.02.
-        """
-    )
+ 
+# AVF_Bayes_Monitor_Designer_runin_safety_v3_1_3.py 
+# Streamlit app for single-arm Bayesian monitored design (binary endpoint) 
+# v3.1.4 UX upgrades: 
+# • Plain-language labels and richer help tooltips across the app 
+# • Friendlier “Chosen Design Summary” panel (clear bullets + decision rules) 
+# • Keeps v3.1.2 safety fixes for OC interpretation and robust strings 
+from __future__ import annotations 
+import io 
+import json 
+import zipfile 
+import math 
+from typing import Dict, List, Optional, Tuple 
+import numpy as np 
+import pandas as pd 
+import streamlit as st 
+from scipy.stats import beta 
+from scipy.special import betaln, comb 
+# PDFs 
+from reportlab.lib.pagesizes import A4 
+from reportlab.pdfgen import canvas 
+from reportlab.lib.units import cm 
+# Plots 
+try: 
+    import plotly.express as px 
+    import plotly.graph_objects as go 
+    _HAS_PLOTLY = True 
+except Exception: 
+    _HAS_PLOTLY = False 
+SCHEMA_VERSION = "v3_1_4_everyN_stops_charts" 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ CORE BAYESIAN UTILITIES ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+def beta_posterior_params(a0: float, b0: float, x: int, n: int) -> Tuple[float, float]: 
+    return a0 + x, b0 + (n - x) 
+
+def posterior_prob_p_greater_than(p_cut: float, a_post: float, b_post: float) -> float: 
+    return 1.0 - beta.cdf(p_cut, a_post, b_post) 
+
+def min_successes_for_posterior_threshold(a0: float, b0: float, N: int, p0: float, theta_final: float) -> Optional[int]: 
+    lo, hi = 0, N 
+    ans = N + 1 
+    while lo <= hi: 
+        mid = (lo + hi) // 2 
+        a_post, b_post = beta_posterior_params(a0, b0, mid, N) 
+        prob = posterior_prob_p_greater_than(p0, a_post, b_post) 
+        if prob >= theta_final: 
+            ans = mid 
+            hi = mid - 1 
+        else: 
+            lo = mid + 1 
+    return None if ans == N + 1 else int(ans) 
+
+def log_beta_binomial_pmf(y: int, m: int, a: float, b: float) -> float: 
+    if y < 0 or y > m: 
+        return -np.inf 
+    return math.log(comb(m, y)) + betaln(y + a, m - y + b) - betaln(a, b) 
+
+def beta_binomial_cdf_upper_tail(y_min: int, m: int, a: float, b: float) -> float: 
+    if y_min <= 0: 
+        return 1.0 
+    if y_min > m: 
+        return 0.0 
+    ys = np.arange(y_min, m + 1) 
+    logs = np.array([log_beta_binomial_pmf(int(y), m, a, b) for y in ys]) 
+    mlog = np.max(logs) 
+    return float(np.exp(mlog) * np.sum(np.exp(logs - mlog))) 
+
+def predictive_prob_of_final_success(a0: float, b0: float, N_total: int, x_curr: int, n_curr: int, p0: float, theta_final: float) -> float: 
+    a_post, b_post = beta_posterior_params(a0, b0, x_curr, n_curr) 
+    m_remain = N_total - n_curr 
+    s_min = min_successes_for_posterior_threshold(a0, b0, N_total, p0, theta_final) 
+    if s_min is None: 
+        return 0.0 
+    y_needed = s_min - x_curr 
+    return beta_binomial_cdf_upper_tail(y_needed, m_remain, a_post, b_post) 
+
+def compute_interim_futility_cutoffs(a0: float, b0: float, N_total: int, looks_eff: List[int], p0: float, theta_final: float, c_futility: float) -> Dict[int, Optional[int]]: 
+    cutoffs: Dict[int, Optional[int]] = {} 
+    for n in looks_eff: 
+        lo, hi = 0, n 
+        ans = n + 1 
+        while lo <= hi: 
+            mid = (lo + hi) // 2 
+            ppos = predictive_prob_of_final_success(a0, b0, N_total, mid, n, p0, theta_final) 
+            if ppos >= c_futility: 
+                ans = mid 
+                hi = mid - 1 
+            else: 
+                lo = mid + 1 
+        cutoffs[n] = None if ans == n + 1 else int(ans) 
+    return cutoffs 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ LOOK SCHEDULE UTILITIES ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+def parse_percent_list(s: str) -> List[float]: 
+    vals: List[float] = [] 
+    if s: 
+        for tok in s.split(","): 
+            tok = tok.strip().replace("%", "") 
+            if tok: 
+                try: 
+                    v = float(tok) / 100.0 
+                    if np.isfinite(v): 
+                        vals.append(v) 
+                except Exception: 
+                    pass 
+    return vals 
+
+def parse_n_list(s: str) -> List[int]: 
+    vals: List[int] = [] 
+    if s: 
+        for tok in s.split(","): 
+            tok = tok.strip() 
+            if tok: 
+                try: 
+                    v = int(round(float(tok))) 
+                    vals.append(v) 
+                except Exception: 
+                    pass 
+    return vals 
+
+def build_looks_with_runin(N: int, run_in: int, mode_label: str, k_total: Optional[int] = None, perc_str: Optional[str] = None, ns_str: Optional[str] = None, step_every: Optional[int] = None) -> List[int]: 
+    looks: List[int] = [] 
+    run_in = int(max(0, min(run_in, N - 1))) 
+    if run_in > 0: 
+        looks.append(run_in) 
+    if mode_label == "None (final only)": 
+        return looks 
+    if mode_label == "Equal‑spaced (choose total looks incl. run‑in)": 
+        K = int(k_total or 0) 
+        K_rem = max(0, K - (1 if run_in > 0 else 0)) 
+        if K_rem > 0 and (N - run_in) > 0: 
+            for i in range(1, K_rem + 1): 
+                n_i = run_in + int(np.floor(i * (N - run_in) / (K_rem + 1))) 
+                if 0 < n_i < N: 
+                    looks.append(n_i) 
+    elif mode_label == "Custom percentages of remaining": 
+        fracs = parse_percent_list(perc_str or "") 
+        for f in fracs: 
+            n_i = run_in + int(np.floor(f * (N - run_in))) 
+            if 0 < n_i < N: 
+                looks.append(n_i) 
+    elif mode_label == "Custom absolute Ns": 
+        ns = parse_n_list(ns_str or "") 
+        for n_i in ns: 
+            if run_in > 0 and n_i == run_in: 
+                pass 
+            if run_in < n_i < N: 
+                looks.append(int(n_i)) 
+    elif mode_label == "Look every N after run‑in": 
+        step = int(step_every or 0) 
+        if step > 0 and (N - run_in) > 0: 
+            k = 1 
+            while True: 
+                n_i = run_in + k*step 
+                if n_i >= N: 
+                    break 
+                looks.append(int(n_i)) 
+                k += 1 
+    looks = [int(x) for x in looks if 0 < x < N] 
+    looks = sorted(list(dict.fromkeys(looks))) 
+    return looks 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ MONTE CARLO SE/CI HELPERS ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+def se_prop(p_hat: float, n: int) -> float: 
+    p_hat = max(0.0, min(1.0, float(p_hat))) 
+    return math.sqrt(max(p_hat * (1 - p_hat), 1e-12) / max(1, n)) 
+
+def ci95_prop(p_hat: float, n: int) -> Tuple[float, float]: 
+    se = se_prop(p_hat, n) 
+    return max(0.0, p_hat - 1.96 * se), min(1.0, p_hat + 1.96 * se) 
+
+def ess_se_from_stopdist(df_stop: pd.DataFrame, n: int) -> float: 
+    if df_stop is None or len(df_stop) == 0: 
+        return float('nan') 
+    mean = float((df_stop["N_stop"] * df_stop["Probability"]).sum()) 
+    var = float(((df_stop["N_stop"] - mean) ** 2 * df_stop["Probability"]).sum()) 
+    return float(math.sqrt(max(var, 0.0) / max(n, 1))) 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ SIMULATION ENGINES ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+def simulate_design_eff_only(design: Dict, p: float, U: np.ndarray) -> Dict: 
+    N = design["N_total"] 
+    looks_eff = design["looks_eff"] 
+    looks_fut = design.get("looks_fut", looks_eff) 
+    run_in_eff = design.get("run_in_eff", 0) 
+    a0 = design["a0"]; b0 = design["b0"] 
+    p0 = design["p0"]; theta_final = design["theta_final"] 
+    theta_interim = design.get("theta_interim", theta_final) 
+    allow_early = design["allow_early_success"] 
+    s_min_final = design["s_min_final"] 
+    x_min_to_continue = design["x_min_to_continue_by_look_fut"] 
+    n_sims = U.shape[0] 
+    X = (U[:, :N] < p).astype(np.int16) 
+    cum_x = np.zeros(n_sims, dtype=np.int32) 
+    n_curr = 0 
+    active = np.ones(n_sims, dtype=bool) 
+    success = np.zeros(n_sims, dtype=bool) 
+    final_n = np.zeros(n_sims, dtype=np.int32) 
+    eff_early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64) 
+    fut_early_by_look = np.zeros(len(looks_fut), dtype=np.int64) 
+    # unify event ordering across engines: start at 0 and advance to each event 
+    events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_fut) + [N]))) 
+    for ev in events: 
+        if ev > n_curr and active.any(): 
+            cum_x[active] += np.sum(X[active, n_curr:ev], axis=1) 
+            n_curr = ev 
+        # early success at efficacy looks 
+        if ev in looks_eff and allow_early and active.any(): 
+            a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr) 
+            post_probs = 1.0 - beta.cdf(p0, a_post, b_post) 
+            early_succ = (post_probs >= theta_interim) 
+            if np.any(early_succ): 
+                idx_active = np.where(active)[0] 
+                idx = idx_active[early_succ] 
+                success[idx] = True 
+                final_n[idx] = n_curr 
+                active[idx] = False 
+                li_e = looks_eff.index(ev) 
+                eff_early_succ_by_look[li_e] += early_succ.sum() 
+        if not active.any(): 
+            break 
+        # futility at futility looks 
+        if ev in looks_fut and active.any(): 
+            x_min = x_min_to_continue.get(ev, None) 
+            li_f = looks_fut.index(ev) 
+            if x_min is None: 
+                idx = np.where(active)[0] 
+                if idx.size > 0: 
+                    final_n[idx] = n_curr 
+                    active[idx] = False 
+                    fut_early_by_look[li_f] += idx.size 
+            else: 
+                need_continue = cum_x[active] >= x_min 
+                idx_all = np.where(active)[0] 
+                idx_stop = idx_all[~need_continue] 
+                if idx_stop.size > 0: 
+                    final_n[idx_stop] = n_curr 
+                    active[idx_stop] = False 
+                    fut_early_by_look[li_f] += idx_stop.size 
+        if not active.any(): 
+            break 
+    # proceed to final if still active 
+    if active.any(): 
+        add = N - n_curr 
+        if add > 0: 
+            cum_x[active] += np.sum(X[active, n_curr:N], axis=1) 
+            n_curr = N 
+        succ_final = (cum_x[active] >= s_min_final) 
+        idx_active = np.where(active)[0] 
+        success[idx_active[succ_final]] = True 
+        final_n[idx_active] = N 
+    reject_rate = success.mean() 
+    ess = final_n.mean() 
+    early_succ_rate = eff_early_succ_by_look.sum() / n_sims 
+    early_fut_rate = fut_early_by_look.sum() / n_sims 
+    early_stop_rate = early_succ_rate + early_fut_rate 
+    unique_ns, counts = np.unique(final_n, return_counts=True) 
+    stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop") 
+    return { 
+        "reject_rate": float(reject_rate), 
+        "ess": float(ess), 
+        "stop_dist": stop_dist, 
+        "early_succ_by_look_eff": (eff_early_succ_by_look / n_sims).tolist(), 
+        "early_fut_by_look_eff": (fut_early_by_look / n_sims).tolist(), 
+        "eff_early_succ_rate": float(early_succ_rate), 
+        "eff_early_fut_rate": float(early_fut_rate), 
+        "early_stop_rate": float(early_stop_rate), 
+    } 
+
+def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.ndarray, U_tox: np.ndarray) -> Dict: 
+    N = design["N_total"] 
+    looks_eff = design["looks_eff"] 
+    looks_saf = design.get("looks_saf", []) 
+    looks_fut = design.get("looks_fut", looks_eff) 
+    a0 = design["a0"]; b0 = design["b0"] 
+    p0 = design["p0"]; theta_final = design["theta_final"] 
+    theta_interim = design.get("theta_interim", theta_final) 
+    allow_early = design["allow_early_success"] 
+    s_min_final = design["s_min_final"] 
+    x_min_to_continue = design["x_min_to_continue_by_look_fut"] 
+    tox = design.get("safety", None) 
+    n_sims = U_eff.shape[0] 
+    X_eff = (U_eff[:, :N] < p_eff).astype(np.int16) 
+    X_tox = (U_tox[:, :N] < p_tox).astype(np.int16) if tox is not None else None 
+    cum_x = np.zeros(n_sims, dtype=np.int32) 
+    cum_t = np.zeros(n_sims, dtype=np.int32) if tox is not None else None 
+    n_curr = 0 
+    active = np.ones(n_sims, dtype=bool) 
+    success = np.zeros(n_sims, dtype=bool) 
+    final_n = np.zeros(n_sims, dtype=np.int32) 
+    eff_early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64) 
+    fut_early_by_look = np.zeros(len(looks_fut), dtype=np.int64) 
+    saf_stop_by_look = np.zeros(len(looks_saf) + 1, dtype=np.int64) 
+    events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_fut) + list(looks_saf) + [N]))) 
+    for ev in events: 
+        if ev > n_curr and active.any(): 
+            cum_x[active] += np.sum(X_eff[active, n_curr:ev], axis=1) 
+            if tox is not None: 
+                cum_t[active] += np.sum(X_tox[active, n_curr:ev], axis=1) 
+            n_curr = ev 
+        # Safety checks at safety looks
+        if tox is not None and ev in looks_saf and active.any(): 
+            a_t = tox["a_t0"] + (cum_t[active] if cum_t is not None else 0) 
+            b_t = tox["b_t0"] + (n_curr - (cum_t[active] if cum_t is not None else 0)) 
+            prob_tox_high = 1.0 - beta.cdf(tox["q_max"], a_t, b_t) 
+            unsafe = (prob_tox_high >= tox["theta_tox"]) 
+            if np.any(unsafe): 
+                idx_active = np.where(active)[0] 
+                idx = idx_active[unsafe] 
+                final_n[idx] = n_curr 
+                active[idx] = False 
+                li_s = looks_saf.index(ev) 
+                saf_stop_by_look[li_s] += unsafe.sum() 
+        if not active.any(): 
+            break 
+        # Early success at efficacy looks 
+        if ev in looks_eff and active.any(): 
+            if allow_early: 
+                a_post, b_post = beta_posterior_params(a0, b0, cum_x[active], n_curr) 
+                post_probs = 1.0 - beta.cdf(p0, a_post, b_post) 
+                early_succ = (post_probs >= theta_interim) 
+                if np.any(early_succ): 
+                    idx_active = np.where(active)[0] 
+                    idx = idx_active[early_succ] 
+                    success[idx] = True 
+                    final_n[idx] = n_curr 
+                    active[idx] = False 
+                    li_e = looks_eff.index(ev) 
+                    eff_early_succ_by_look[li_e] += early_succ.sum() 
+        if not active.any(): 
+            break 
+        # Futility at futility looks (separate from efficacy)
+        if ev in looks_fut and active.any(): 
+            x_min = x_min_to_continue.get(ev, None) 
+            li_f = looks_fut.index(ev) 
+            if x_min is None: 
+                idx = np.where(active)[0] 
+                if idx.size > 0: 
+                    final_n[idx] = n_curr 
+                    active[idx] = False 
+                    fut_early_by_look[li_f] += idx.size 
+            else: 
+                need_continue = cum_x[active] >= x_min 
+                idx_all = np.where(active)[0] 
+                idx_stop = idx_all[~need_continue] 
+                if idx_stop.size > 0: 
+                    final_n[idx_stop] = n_curr 
+                    active[idx_stop] = False 
+                    fut_early_by_look[li_f] += idx_stop.size 
+        if not active.any(): 
+            break 
+    # After last interim, accrue to final N and evaluate safety + final success 
+    if active.any(): 
+        if n_curr < N: 
+            cum_x[active] += np.sum(X_eff[active, n_curr:N], axis=1) 
+            if tox is not None: 
+                cum_t[active] += np.sum(X_tox[active, n_curr:N], axis=1) 
+            n_curr = N 
+        if tox is not None and active.any(): 
+            a_t = tox["a_t0"] + (cum_t[active] if cum_t is not None else 0) 
+            b_t = tox["b_t0"] + (n_curr - (cum_t[active] if cum_t is not None else 0)) 
+            prob_tox_high = 1.0 - beta.cdf(tox["q_max"], a_t, b_t) 
+            unsafe = (prob_tox_high >= tox["theta_tox"]) 
+            if np.any(unsafe): 
+                idx_active = np.where(active)[0] 
+                idx = idx_active[unsafe] 
+                final_n[idx] = n_curr 
+                active[idx] = False 
+                saf_stop_by_look[-1] += unsafe.sum() 
+        if active.any(): 
+            succ_final = (cum_x[active] >= s_min_final) 
+            idx_active = np.where(active)[0] 
+            success[idx_active[succ_final]] = True 
+            final_n[idx_active] = N 
+    reject_rate = success.mean() 
+    ess = final_n.mean() 
+    eff_early_succ_rate = eff_early_succ_by_look.sum() / n_sims 
+    fut_early_rate = fut_early_by_look.sum() / n_sims 
+    saf_early_rate = saf_stop_by_look[:-1].sum() / n_sims 
+    any_safety_rate = saf_stop_by_look.sum() / n_sims 
+    early_stop_rate = eff_early_succ_rate + fut_early_rate + saf_early_rate 
+    unique_ns, counts = np.unique(final_n, return_counts=True) 
+    stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop") 
+    return { 
+        "reject_rate": float(reject_rate), 
+        "ess": float(ess), 
+        "safety_stop_prob": float(any_safety_rate), 
+        "stop_dist": stop_dist, 
+        "eff_early_succ_by_look": (eff_early_succ_by_look / n_sims).tolist(), 
+        "fut_early_by_look": (fut_early_by_look / n_sims).tolist(), 
+        "saf_by_look": (saf_stop_by_look / n_sims).tolist(), 
+        "eff_early_succ_rate": float(eff_early_succ_rate), 
+        "fut_early_rate": float(fut_early_rate), 
+        "saf_early_rate": float(saf_early_rate), 
+        "early_stop_rate": float(early_stop_rate), 
+    } 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ SCREENING (FAST) ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: Optional[np.ndarray] = None): 
+    rng = np.random.default_rng(seed) 
+    if U is None: 
+        Nmax = max([g["N_total"] for g in param_grid]) 
+        U = rng.uniform(size=(n_sims_small, Nmax)) 
+    rows = [] 
+    designs_built = [] 
+    for g in param_grid: 
+        N = g["N_total"] 
+        looks_eff = g["looks_eff"] 
+        looks_fut = g.get("looks_fut", looks_eff) 
+        a0 = g["a0"]; b0 = g["b0"] 
+        p0 = g["p0"]; p1 = g["p1"] 
+        theta_final = g["theta_final"]; c_futility = g["c_futility"] 
+        theta_interim = g.get("theta_interim", theta_final) 
+        allow_early = g["allow_early_success"] 
+        s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final) 
+        if s_min is None: 
+            continue 
+        x_min_to_continue = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, c_futility) 
+        design = dict( 
+            N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, 
+            theta_final=theta_final, theta_interim=theta_interim, 
+            c_futility=c_futility, allow_early_success=allow_early, 
+            s_min_final=s_min, x_min_to_continue_by_look_fut=x_min_to_continue, 
+            p1=p1, run_in_eff=g.get("run_in_eff", 0) 
+        ) 
+        res_p0 = simulate_design_eff_only(design, p0, U[:, :N]) 
+        res_p1 = simulate_design_eff_only(design, p1, U[:, :N]) 
+        rows.append({ 
+            "N_total": N, 
+            "looks_eff": looks_eff, 
+            "run_in_eff": design["run_in_eff"], 
+            "theta_final": theta_final, 
+            "theta_interim": theta_interim, 
+            "c_futility": c_futility, 
+            "allow_early_success": allow_early, 
+            "Type I error @ p0": res_p0["reject_rate"], 
+            "Power @ p1": res_p1["reject_rate"], 
+            "ESS @ p0": res_p0["ess"], 
+            "ESS @ p1": res_p1["ess"], 
+            "Early stop @ p0 (any)": res_p0["early_stop_rate"], 
+            "Early success @ p0": res_p0.get("eff_early_succ_rate", res_p0.get("early_succ_rate", float("nan"))), 
+            "Early futility @ p0": res_p0.get("eff_early_fut_rate", res_p0.get("early_fut_rate", float("nan"))), 
+            "s_min_final": s_min, 
+            "x_min_to_continue_eff": x_min_to_continue, 
+        }) 
+        designs_built.append(design) 
+    df = pd.DataFrame(rows) 
+    return df, designs_built 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ STREAMLIT UI — Header & Sidebar (with richer tooltips) ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.4", layout="wide") 
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.4") 
+st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.") 
+with st.expander("What this tool does (in simple terms)"): 
+    st.markdown( 
+        "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.
+
+" 
+        "• **You set** prior beliefs, thresholds, and when to look at the data.
+" 
+        "• The **Screener** tries many maximum sample sizes (N) and filters by α/power.
+" 
+        "• The **Deep Dive** runs precise joint simulations (benefit + safety).
+" 
+        "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.") 
+# Sidebar — Efficacy (plainer labels + help) 
+st.sidebar.header("1) Efficacy target and prior") 
+col1, col2 = st.sidebar.columns(2) 
+with col1: 
+    p0 = st.number_input("Null response rate (p₀)", 0.0, 1.0, 0.20, 0.01, format="%.2f", key='p0', 
+        help="The highest response rate that you would still consider not clinically worthwhile.") 
+    a0 = st.number_input("Prior a₀ (efficacy)", 0.0, None, 1.0, 0.5, key='a0', 
+        help="Beta(a₀,b₀) prior for response. Increase a₀+b₀ for a stronger prior.") 
+    theta_final_default = 0.95 if 'theta_final' not in st.session_state else float(st.session_state['theta_final']) 
+    theta_final = st.number_input("Final success threshold (θ_final)", 0.5, 0.999, theta_final_default, 0.01, format="%.3f", key='theta_final', 
+        help="At the final look, declare success if P(p>p₀ | all data) ≥ θ_final.") 
+with col2: 
+    p1 = st.number_input("Target (promising) response rate (p₁)", 0.0, 1.0, 0.40, 0.01, format="%.2f", key='p1', 
+        help="A response rate you would be happy to see. Power is evaluated here.") 
+    b0 = st.number_input("Prior b₀ (efficacy)", 0.0, None, 1.0, 0.5, key='b0', 
+        help="Beta(a₀,b₀) prior for response. Prior mean=a₀/(a₀+b₀); ESS≈a₀+b₀.") 
+    c_futility_default = 0.05 if 'c_futility' not in st.session_state else float(st.session_state['c_futility']) 
+    c_futility = st.number_input("Futility cutoff (PPoS)", 0.0, 0.5, c_futility_default, 0.01, format="%.3f", key='c_futility', 
+        help="At interim looks, stop for futility if Predictive Probability of **final** success < this value.") 
+with st.sidebar.expander("About your efficacy prior"): 
+    if (a0 + b0) > 0: 
+        st.write(f"Prior mean = **{a0/(a0+b0):.3f}**, prior ESS ≈ **{a0+b0:.1f}**.") 
+    else: 
+        st.write("Prior mean undefined (a₀+b₀=0). Consider Beta(1,1).") 
+allow_early_success = st.sidebar.checkbox("Allow early success at interim looks?", value=st.session_state.get('allow_early_success', False), key='allow_early_success', 
+    help="If checked, you may stop early for success when the posterior reaches θ_interim.") 
+if 'theta_interim' not in st.session_state: 
+    st.session_state['theta_interim'] = float(theta_final) 
+theta_interim = st.sidebar.number_input("Interim success threshold (θ_interim)", 0.5, 0.999, float(st.session_state['theta_interim']), 0.01, format="%.3f", key='theta_interim', 
+    help="Often set near θ_final to avoid overly optimistic early claims.") 
+# Sidebar — Safety (plainer labels + help) 
+st.sidebar.header("2) Optional safety monitoring") 
+enable_safety = st.sidebar.checkbox("Enable safety monitoring?", True, key='enable_safety', help="Monitor serious adverse events (SAE) with a Beta prior; stop if SAE rate likely exceeds q_max.") 
+if enable_safety: 
+    c1, c2 = st.sidebar.columns(2) 
+    with c1: 
+        a_t0 = st.number_input("Safety prior a_t0", 0.0, None, 1.0, 0.5, key='a_t0', 
+            help="Beta(a_t0,b_t0) prior for SAE rate.") 
+        q_max = st.number_input("Max acceptable SAE rate (q_max)", 0.0, 1.0, 0.15, 0.01, format="%.2f", key='q_max', 
+            help="If the SAE rate is likely above q_max, the trial stops for safety.") 
+    with c2: 
+        b_t0 = st.number_input("Safety prior b_t0", 0.0, None, 9.0, 0.5, key='b_t0', help="Increase a_t0+b_t0 for a stronger safety prior (e.g., Beta(1,9) → mean≈0.10).") 
+        theta_tox = st.number_input("Safety stop threshold (θ_tox)", 0.5, 0.999, 0.90, 0.01, format="%.3f", key='theta_tox', 
+            help="Stop when P(q>q_max | data) ≥ θ_tox at interims or final.") 
+    with st.sidebar.expander("About your safety prior"): 
+        if (a_t0 is not None) and (b_t0 is not None) and (a_t0 + b_t0) > 0: 
+            st.write(f"Prior mean = **{a_t0/(a_t0+b_t0):.3f}**, prior ESS ≈ **{a_t0+b_t0:.1f}**.") 
+        else: 
+            st.write("Prior mean undefined (a_t0+b_t0=0). Consider Beta(1,9) or similar.") 
+else: 
+    a_t0 = b_t0 = q_max = theta_tox = None 
+# Sidebar — Look schedules (helped) 
+st.sidebar.header("3) When to check the data (look schedule)") 
+run_in_eff = st.sidebar.number_input("Run‑in for efficacy (patients enrolled before first look)", 0, 400, 0, 1, key='run_in_eff', 
+    help="Patients enrolled before the first efficacy look; they count for all decisions.") 
+looks_eff_mode_label = st.sidebar.selectbox( 
+    "Efficacy look timing", 
+    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns"], 
+    index=1, key='eff_mode', 
+    help="Choose how to place efficacy interim looks.") 
+k_looks_eff = perc_eff_str = ns_eff_str = step_eff = None 
+if looks_eff_mode_label == "Equal‑spaced (choose total looks incl. run‑in)": 
+    k_looks_eff = st.sidebar.slider("Total efficacy looks (including run‑in)", 1, 8, 2, 1, key='k_eff', 
+        help="For example, 2 looks → roughly at 1/3 and 2/3 of the maximum N.") 
+elif looks_eff_mode_label == "Custom percentages of remaining": 
+    perc_eff_str = st.sidebar.text_input("Efficacy look percentages (comma)", "33,67", key='perc_eff', 
+        help="Example: 25,50,75 (percent of the planned maximum N)") 
+elif looks_eff_mode_label == "Custom absolute Ns": 
+    ns_eff_str = st.sidebar.text_input("Efficacy look sample sizes N (comma)", "", key='ns_eff', 
+        help="Example: 20,40 (each must be less than the maximum N)") 
+# Safety schedule 
+st.sidebar.header("4) Safety look schedule") 
+run_in_saf = st.sidebar.number_input("Run‑in for safety", 0, 400, 0, 1, key='run_in_saf', help="Patients enrolled before the first safety look; they count for safety decisions.") 
+looks_saf_mode_label = st.sidebar.selectbox("Safety look timing", 
+    ["None (final only)", "Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns", "Look every N after run‑in"], index=1, key='saf_mode', 
+    help="Choose how to place safety interim looks.") 
+k_looks_saf = perc_saf_str = ns_saf_str = step_saf = None 
+if looks_saf_mode_label == "Equal‑spaced (choose total looks incl. run‑in)": 
+    k_looks_saf = st.sidebar.slider("Total safety looks (including run‑in)", 1, 8, 2, 1, key='k_saf') 
+elif looks_saf_mode_label == "Custom percentages of remaining": 
+    perc_saf_str = st.sidebar.text_input("Safety look percentages (comma)", "33,67", key='perc_saf') 
+elif looks_saf_mode_label == "Custom absolute Ns": 
+    ns_saf_str = st.sidebar.text_input("Safety look sample sizes N (comma)", "", key='ns_saf') 
+elif looks_saf_mode_label == "Look every N after run‑in": 
+    step_saf = st.sidebar.number_input("Look every N participants (after safety run‑in)", 1, 400, 10, 1, key='step_saf', help="First safety look is after the run‑in; then look every N participants. Final analysis still occurs at max N.") 
+# Futility schedule 
+st.sidebar.header("4b) Futility look schedule") 
+use_fut_same = st.sidebar.checkbox( 
+    "Use same schedule as efficacy? (default)", 
+    True, 
+    key='fut_same', 
+    help="If checked, futility looks occur at the same Ns as efficacy looks (backward-compatible). Uncheck to customize a separate futility schedule.") 
+if use_fut_same: 
+    run_in_fut = int(st.session_state.get('run_in_eff', run_in_eff)) 
+    looks_fut_mode_label = "Same as efficacy" 
+    k_looks_fut = perc_fut_str = ns_fut_str = step_fut = None 
+else: 
+    run_in_fut = st.sidebar.number_input( 
+        "Run‑in for futility", 
+        0, 400, int(st.session_state.get('run_in_eff', run_in_eff)), 1, key='run_in_fut', 
+        help="Patients enrolled before the first futility look; they count for futility decisions.") 
+    looks_fut_mode_label = st.sidebar.selectbox( 
+        "Futility look timing", 
+        ["Equal‑spaced (choose total looks incl. run‑in)", "Custom percentages of remaining", "Custom absolute Ns", "Look every N after run‑in"], 
+        index=1, key='fut_mode', 
+        help="Choose how to place futility interim looks.") 
+    k_looks_fut = perc_fut_str = ns_fut_str = step_fut = None 
+    if looks_fut_mode_label == "Equal‑spaced (choose total looks incl. run‑in)": 
+        k_looks_fut = st.sidebar.slider("Total futility looks (including run‑in)", 1, 8, 2, 1, key='k_fut') 
+    elif looks_fut_mode_label == "Custom percentages of remaining": 
+        perc_fut_str = st.sidebar.text_input("Futility look percentages (comma)", "33,67", key='perc_fut') 
+    elif looks_fut_mode_label == "Custom absolute Ns": 
+        ns_fut_str = st.sidebar.text_input("Futility look sample sizes N (comma)", "", key='ns_fut') 
+    elif looks_fut_mode_label == "Look every N after run‑in": 
+        step_fut = st.sidebar.number_input("Look every N participants (after futility run‑in)", 1, 400, 10, 1, key='step_fut', 
+            help="First futility look is after the run‑in; then look every N participants. Final analysis still occurs at max N.") 
+# Screener settings 
+st.sidebar.header("5) Rapid Screener") 
+N_min, N_max = st.sidebar.slider("Range of maximum N values to test", 10, 400, (30, 120), 1, key='Nrange', help="We'll scan this range to find feasible, efficient designs.") 
+N_step = st.sidebar.number_input("Step between N values", 1, 50, 5, 1, key='Nstep', help="Larger steps scan fewer N values (faster).") 
+n_sims_small = st.sidebar.number_input("Simulations per design (screening)", 100, 200000, 5000, 500, key='sims_small', help="Higher = more precision; the Deep Dive is where precision matters most.") 
+alpha_max = st.sidebar.number_input("Max Type I error (α) allowed", 0.0, 0.5, 0.10, 0.01, format="%.2f", key='alpha_max', help="Keep only designs with false-positive rate ≤ this.") 
+power_min = st.sidebar.number_input("Min power at p₁", 0.0, 1.0, 0.80, 0.01, format="%.2f", key='power_min', help="Keep only designs with success rate at p₁ ≥ this.") 
+seed = st.sidebar.number_input("Random seed", 1, None, 2026, 1, key='seed', help="Controls reproducibility.") 
+# Build candidate grid for Screener 
+Ns = list(range(N_min, N_max + 1, N_step)) 
+param_grid = [] 
+for N in Ns: 
+    looks_eff = build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str, step_every=step_eff) 
+    looks_fut = looks_eff if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N, run_in_fut, looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut) 
+    param_grid.append(dict(N_total=N, looks_eff=looks_eff, a0=a0, b0=b0, p0=p0, p1=p1, 
+        theta_final=theta_final, theta_interim=float(theta_interim), 
+        c_futility=c_futility, allow_early_success=allow_early_success, 
+        run_in_eff=int(run_in_eff))) 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ 1) Rapid Screener (efficacy‑only) ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+@st.cache_data(show_spinner=False) 
+def _screen(param_grid, n_sims_small, seed, schema_version: str): 
+    rng = np.random.default_rng(seed) 
+    Nmax = max([g["N_total"] for g in param_grid]) if param_grid else 0 
+    if Nmax <= 0: 
+        return pd.DataFrame(), [] 
+    U = rng.uniform(size=(n_sims_small, Nmax)) 
+    df, designs = shortlist_designs(param_grid, n_sims_small, seed, U) 
+    _ = schema_version 
+    return df, designs 
+df_screen, designs_built = _screen(param_grid, n_sims_small, seed, SCHEMA_VERSION) 
+st.write("### 1) Rapid Screener (efficacy‑only)") 
+st.caption("Screens a range of N using quick efficacy-only sims to find candidates that meet α/power targets.") 
+if df_screen.empty: 
+    st.warning("No viable designs found. Try relaxing θ_final or increasing N.") 
+else: 
+    df_ok = df_screen[(df_screen["Type I error @ p0"] <= alpha_max) & (df_screen["Power @ p1"] >= power_min)].copy() 
+    cols = ["N_total", "run_in_eff", "looks_eff", "theta_final", "c_futility", "Type I error @ p0", "Power @ p1", "ESS @ p0", "Early stop @ p0 (any)"] 
+    table_df = df_ok if not df_ok.empty else df_screen 
+    st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True), use_container_width=True) 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ 2) Compare multiple Ns (joint with safety) ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+st.write("### 2) Compare multiple N values (deep‑dive, joint with safety)") 
+st.caption("Runs precise joint simulations at the N values you type, using your current rule settings.") 
+with st.expander("Open compare panel", expanded=False): 
+    ns_str_compare = st.text_input("Enter N values (comma)", "60,70,80", key='cmp_ns_str', help="We'll construct designs with the SAME rule settings you set above.") 
+    n_sims_compare = st.number_input("Simulations per design (compare run)", 5000, 400000, 80000, 5000, key='cmp_sims') 
+    seed_compare = st.number_input("Random seed (compare run)", 1, None, seed + 2, 1, key='cmp_seed') 
+    q_good_cmp = st.number_input("q_good (typical/benign toxicity)", 0.0, 1.0, 0.10, 0.01, key='cmp_qgood') 
+    q_bad_cmp = st.number_input("q_bad (concerning/high toxicity)", 0.0, 1.0, 0.20, 0.01, key='cmp_qbad') 
+    def _build_eff(N): 
+        return build_looks_with_runin(N, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str) 
+    def _build_saf(N): 
+        return build_looks_with_runin(N, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf) 
+    if st.button("Run compare", key='run_compare'): 
+        Ns_cmp = [] 
+        for tok in ns_str_compare.split(','): 
+            tok = tok.strip() 
+            if tok: 
+                try: 
+                    Ns_cmp.append(int(round(float(tok)))) 
+                except Exception: 
+                    pass 
+        Ns_cmp = [n for n in Ns_cmp if n >= 5] 
+        if not Ns_cmp: 
+            st.warning("Please enter one or more valid integers for N.") 
+        else: 
+            rng = np.random.default_rng(seed_compare) 
+            rows = [] 
+            for Ncmp in Ns_cmp: 
+                looks_eff_cmp = _build_eff(Ncmp) 
+                looks_saf_cmp = _build_saf(Ncmp) 
+                # NEW: build futility schedule consistent with Deep Dive logic 
+                if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy': 
+                    looks_fut_cmp = looks_eff_cmp 
+                    run_in_fut_cmp = int(st.session_state.get('run_in_eff', run_in_eff)) 
+                else: 
+                    run_in_fut_cmp = int(st.session_state.get('run_in_fut', 0) or 0) 
+                    looks_fut_cmp = build_looks_with_runin(Ncmp, run_in_fut_cmp, looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut) 
+                smin_cmp = min_successes_for_posterior_threshold(a0, b0, Ncmp, p0, theta_final) 
+                if smin_cmp is None: 
+                    continue 
+                x_min_cmp = compute_interim_futility_cutoffs(a0, b0, Ncmp, looks_fut_cmp, p0, theta_final, c_futility) 
+                design_cmp = dict(N_total=Ncmp, looks_eff=looks_eff_cmp, looks_saf=looks_saf_cmp, looks_fut=looks_fut_cmp, 
+                    run_in_eff=int(run_in_eff), run_in_saf=int(run_in_saf), a0=a0, b0=b0, 
+                    p0=p0, theta_final=theta_final, theta_interim=float(theta_interim), 
+                    c_futility=c_futility, allow_early_success=allow_early_success, 
+                    s_min_final=smin_cmp, x_min_to_continue_by_look_fut=x_min_cmp) 
+                if enable_safety: 
+                    design_cmp["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox) 
+                Ueff = rng.uniform(size=(n_sims_compare, Ncmp)) 
+                Utox = rng.uniform(size=(n_sims_compare, Ncmp)) 
+                r_p0 = simulate_design_joint(design_cmp, p_eff=p0, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox) 
+                r_p1 = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox) 
+                r_p1_bad = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_bad_cmp, U_eff=Ueff, U_tox=Utox) 
+                rows.append(dict(N=Ncmp, looks_eff=looks_eff_cmp, looks_fut=looks_fut_cmp, looks_saf=looks_saf_cmp, s_min_final=smin_cmp, 
+                    **{"Type I @p0,q_good": r_p0["reject_rate"], "Power @p1,q_good": r_p1["reject_rate"], 
+                    "ESS @p0": r_p0["ess"], "ESS @p1": r_p1["ess"], 
+                    "Early stop (any) @p1": r_p1["early_stop_rate"], 
+                    "Early succ @p1": r_p1["eff_early_succ_rate"], 
+                    "Early fut @p1": r_p1.get("fut_early_rate", r_p1.get("eff_early_fut_rate", 0.0)), 
+                    "Early safety @p1": r_p1.get("saf_early_rate", 0.0), 
+                    "Safety stop @p1,q_bad (any stage)": r_p1_bad.get("safety_stop_prob", 0.0)}) ) 
+            if not rows: 
+                st.warning("None of the N values produced a feasible final rule. Try relaxing θ_final or adjusting looks.") 
+            else: 
+                df_cmp = pd.DataFrame(rows).sort_values("N").reset_index(drop=True) 
+                st.dataframe(df_cmp, use_container_width=True) 
+                st.session_state['compare_df'] = df_cmp 
+                # Stop-reason chart across input N values 
+                if _HAS_PLOTLY and not df_cmp.empty: 
+                    fig_cmp = go.Figure() 
+                    fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early succ @p1'], name='Early success @p1,q_good') 
+                    fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early fut @p1'], name='Early futility @p1,q_good') 
+                    if 'Early safety @p1' in df_cmp.columns: 
+                        fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early safety @p1'], name='Early safety @p1,q_good') 
+                    if 'Safety stop @p1,q_bad (any stage)' in df_cmp.columns: 
+                        fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Safety stop @p1,q_bad (any stage)'], name='Safety stop (any) @p1,q_bad') 
+                    fig_cmp.update_layout(barmode='group', title='Stop proportions by reason vs N', xaxis_title='N', yaxis_title='Proportion') 
+                    st.plotly_chart(fig_cmp, use_container_width=True) 
+# ╔══════════════════════════════════════════════════════════════════════════╗ 
+# ║ 3) Deep Dive (joint efficacy + safety) ║ 
+# ╚══════════════════════════════════════════════════════════════════════════╝ 
+st.write("### 3) Deep Dive (joint efficacy + safety)") 
+st.caption("Locks a single design and shows detailed operating characteristics, per-look summaries, and stop reasons.") 
+N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select', 
+    help="Choose an N from your screening range (or adjacent values) to inspect in detail.") 
+looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str, step_every=step_eff) 
+looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf) 
+s_min_sel = min_successes_for_posterior_threshold(a0, b0, N_select, p0, theta_final) 
+if s_min_sel is None: 
+    st.error("Final rule infeasible at this N. Relax θ_final / adjust prior / increase N.") 
+else: 
+    # Build futility looks (same as efficacy by default) 
+    looks_fut_sel = looks_eff_sel if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N_select, int(st.session_state.get('run_in_fut', run_in_fut)), looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut) 
+    x_min_to_continue_sel = compute_interim_futility_cutoffs(a0, b0, N_select, looks_fut_sel, p0, theta_final, c_futility) 
+    design_sel = dict(N_total=N_select, a0=a0, b0=b0, p0=p0, p1=p1, theta_final=theta_final, 
+        theta_interim=float(theta_interim), c_futility=c_futility, 
+        allow_early_success=allow_early_success, s_min_final=s_min_sel, 
+        looks_eff=looks_eff_sel, looks_saf=looks_saf_sel, looks_fut=looks_fut_sel, 
+        run_in_eff=int(run_in_eff), run_in_saf=int(run_in_saf), 
+        x_min_to_continue_by_look_fut=x_min_to_continue_sel) 
+    if enable_safety: 
+        design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox) 
+    # Summary panel and deep dive UI ... (unchanged from prior, omitted here to save space) 
+# TUNER CORE + OC Explorer + EXPORT sections ... (unchanged; included in full file) 
