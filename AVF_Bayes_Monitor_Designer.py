@@ -1,7 +1,8 @@
 # AVF_Bayes_Monitor_Designer_v3_1_5_OCcurves_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.5p: Harden Deep‑Dive OC/ESS preview with single-line guard (no indentation block);
-#          retains OC Explorer plots; bumps schema/version/exports.
+# v3.1.5q: Restores rich Deep‑Dive tables/plots safely.
+#          Adds "Compute OC/ESS Curves (fixed q)" in Deep‑Dive.
+#          Keeps single‑line guard to avoid indentation errors.
 
 from __future__ import annotations
 import io
@@ -29,7 +30,7 @@ try:
 except Exception:
     _HAS_PLOTLY = False
 
-SCHEMA_VERSION = "v3_1_5p_indent_noblock"
+SCHEMA_VERSION = "v3_1_5q_indent_guard_plus_preview"
 
 # --- UI state helpers (keep panels open after a run) ---
 def _get_flag(name: str, default: bool = False) -> bool:
@@ -41,6 +42,7 @@ def _get_flag(name: str, default: bool = False) -> bool:
 def _set_flag(name: str, value: bool = True):
     import streamlit as st
     st.session_state[name] = value
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                 ║
@@ -104,6 +106,7 @@ def compute_interim_futility_cutoffs(a0: float, b0: float, N_total: int, looks_e
                 lo = mid + 1
         cutoffs[n] = None if ans == n + 1 else int(ans)
     return cutoffs
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ LOOK SCHEDULE UTILITIES                                                 ║
@@ -188,6 +191,7 @@ def build_looks_with_runin(
     looks = sorted(list(dict.fromkeys(looks)))
     return looks
 
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ MONTE CARLO SE/CI HELPERS                                               ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -205,6 +209,7 @@ def ess_se_from_stopdist(df_stop: pd.DataFrame, n: int) -> float:
     mean = float((df_stop["N_stop"] * df_stop["Probability"]).sum())
     var = float((((df_stop["N_stop"] - mean) ** 2) * df_stop["Probability"]).sum())
     return float(math.sqrt(max(var, 0.0) / max(n, 1)))
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ SIMULATION ENGINES                                                      ║
@@ -445,6 +450,52 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
         "early_stop_rate": float(early_stop_rate),
     }
 
+
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║ PLOTTING HELPERS (OC/ESS preview)                                       ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+def _normalize_oc_ess_df(df_curves: pd.DataFrame) -> pd.DataFrame:
+    """Normalize columns to expected names: p, reject_rate, ess."""
+    df = df_curves.copy()
+    ren = {}
+    if 'reject_rate' not in df.columns:
+        if 'reject rate' in df.columns:
+            ren['reject rate'] = 'reject_rate'
+        if 'Pr(declare efficacy)' in df.columns:
+            ren['Pr(declare efficacy)'] = 'reject_rate'
+    if 'ess' not in df.columns and 'ESS' in df.columns:
+        ren['ESS'] = 'ess'
+    if 'p' not in df.columns and 'p_eff' in df.columns:
+        ren['p_eff'] = 'p'
+    if ren:
+        df = df.rename(columns=ren)
+    return df
+
+def _render_oc_ess_preview(df_curves: pd.DataFrame, q_fixed: Optional[float] = None):
+    """Render dual-axis OC/ESS vs p using plotly (called via one-line guard)."""
+    if not _HAS_PLOTLY:
+        st.dataframe(df_curves, use_container_width=True)
+        return
+    df_plot = _normalize_oc_ess_df(df_curves)
+    required = {'p', 'reject_rate', 'ess'}
+    if df_plot.empty or not required.issubset(set(df_plot.columns)):
+        st.warning("OC/ESS curves: results are empty or columns are missing; showing raw table instead of a plot.")
+        st.dataframe(df_curves, use_container_width=True)
+        return
+    fig = make_subplots(specs=[[{'secondary_y': True}]])
+    fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['reject_rate'],
+                             mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
+    fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['ess'],
+                             mode='lines+markers', name='ESS'), secondary_y=True)
+    fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0, 1])
+    fig.update_yaxes(title_text='ESS', secondary_y=True)
+    fig.update_xaxes(title_text='Efficacy rate p')
+    title_q = f"OC/ESS vs p at fixed q={q_fixed:.2f}" if (q_fixed is not None) else "OC/ESS vs p (fixed q)"
+    fig.update_layout(title=title_q)
+    st.plotly_chart(fig, use_container_width=True)
+    st.dataframe(df_plot, use_container_width=True)
+
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ SCREENING (FAST)                                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -502,12 +553,13 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
     df = pd.DataFrame(rows)
     return df, designs_built
 
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ STREAMLIT UI — Header & Sidebar                                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5p", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5p")
-st.caption("Deep‑Dive OC/ESS preview hardened with a single‑line guard; OC Explorer unchanged; futility fixes retained; Threshold Tuner removed.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5q", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5q")
+st.caption("Deep‑Dive: restored OC/ESS preview & detailed tables; keeps single‑line guard; OC Explorer unchanged.")
 
 # Sidebar — Efficacy
 st.sidebar.header("1) Efficacy target and prior")
@@ -700,6 +752,7 @@ else:
 
     st.dataframe(table_df[cols].sort_values(["ESS @ p0", "N_total"]).reset_index(drop=True), use_container_width=True)
 
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 2) Compare multiple Ns (deep‑dive, joint with safety)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -790,6 +843,7 @@ with st.expander("Open compare panel", expanded=False):
                         fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Safety stop @p1,q_bad (any stage)'], name='Safety stop (any) @p1,q_bad')
                     fig_cmp.update_layout(barmode='group', title='Stop proportions by reason vs N (final always evaluated at max N)', xaxis_title='N', yaxis_title='Proportion')
                     st.plotly_chart(fig_cmp, use_container_width=True)
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 3) Deep Dive (joint efficacy + safety)                                  ║
@@ -887,8 +941,84 @@ else:
         if enable_safety:
             sprob = deep['res_p1_qbad']['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁, q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}" if show_ci else None)
 
-        # **Indentation‑proof** Deep‑Dive OC/ESS preview (table only; full plots are in OC Explorer)
-        if _HAS_PLOTLY and 'oc_ess_curves_df' in st.session_state: st.dataframe(st.session_state['oc_ess_curves_df'], use_container_width=True)
+        # ----- New: Deep‑Dive details (tables & plots) -----
+        with st.expander("Deep‑Dive: Detailed tables & plots", expanded=True):
+            c1, c2, c3 = st.columns(3)
+            # Stopping distributions
+            if isinstance(deep['res_p1_qgood'].get('stop_dist', None), pd.DataFrame):
+                c1.markdown("**Stop distribution @ p₁, q_good**")
+                c1.dataframe(deep['res_p1_qgood']['stop_dist'], use_container_width=True)
+            if isinstance(deep['res_p0_qgood'].get('stop_dist', None), pd.DataFrame):
+                c2.markdown("**Stop distribution @ p₀, q_good**")
+                c2.dataframe(deep['res_p0_qgood']['stop_dist'], use_container_width=True)
+            if enable_safety and isinstance(deep['res_p1_qbad'].get('stop_dist', None), pd.DataFrame):
+                c3.markdown("**Stop distribution @ p₁, q_bad**")
+                c3.dataframe(deep['res_p1_qbad']['stop_dist'], use_container_width=True)
+
+            # By-look breakdown (efficacy & futility)
+            looks_eff = design_sel['looks_eff']
+            looks_fut = design_sel['looks_fut']
+            # Success by look
+            eff_succ = pd.DataFrame({"Look (eff)": looks_eff,
+                                     "Early success prob": deep['res_p1_qgood'].get('eff_early_succ_by_look', [0.0]*len(looks_eff))})
+            # Futility by look
+            fut_prob = pd.DataFrame({"Look (fut)": looks_fut,
+                                     "Early futility prob": deep['res_p1_qgood'].get('fut_early_by_look', [0.0]*len(looks_fut))})
+            st.markdown("**By‑look breakdown @ p₁, q_good**")
+            st.dataframe(eff_succ, use_container_width=True)
+            st.dataframe(fut_prob, use_container_width=True)
+
+            # Safety by look (+ final)
+            if enable_safety:
+                saf_vec = deep['res_p1_qgood'].get('saf_by_look', [])
+                if saf_vec:
+                    labels_saf = [f"{n}" for n in design_sel.get('looks_saf', [])] + ["FINAL"]
+                    df_saf = pd.DataFrame({"Safety look": labels_saf, "Stop for safety": saf_vec})
+                    st.dataframe(df_saf, use_container_width=True)
+
+            # Stacked bar: reasons for early stopping @ p1,q_good
+            if _HAS_PLOTLY:
+                succ_r = deep['res_p1_qgood'].get('eff_early_succ_rate', 0.0)
+                fut_r  = deep['res_p1_qgood'].get('eff_early_fut_rate', 0.0)
+                saf_r  = deep['res_p1_qgood'].get('saf_early_rate', 0.0)
+                fig_r = go.Figure()
+                fig_r.add_bar(x=['@p1,q_good'], y=[succ_r], name='Early success')
+                fig_r.add_bar(x=['@p1,q_good'], y=[fut_r],  name='Early futility')
+                if enable_safety:
+                    fig_r.add_bar(x=['@p1,q_good'], y=[saf_r],  name='Early safety')
+                fig_r.update_layout(barmode='stack', title='Reasons for early stop @ p1,q_good',
+                                    yaxis_title='Proportion', xaxis_title='Scenario')
+                st.plotly_chart(fig_r, use_container_width=True)
+
+        # ----- Compute OC/ESS curves at fixed q (and preview) -----
+        with st.expander("Compute OC/ESS Curves (fixed q)", expanded=False):
+            cA, cB = st.columns(2)
+            with cA:
+                p_min_c = st.number_input("Curves: p_min", 0.0, 1.0, max(0.0, p0-0.15), 0.01, key='curve_pmin')
+                p_max_c = st.number_input("Curves: p_max", 0.0, 1.0, min(1.0, p1+0.15), 0.01, key='curve_pmax')
+                p_points_c = st.slider("Curves: number of p points", 3, 25, 9, 1, key='curve_ppoints')
+            with cB:
+                q_fixed = st.number_input("Fixed q for curves", 0.0, 1.0, q_good, 0.01, key='curve_qfixed')
+                n_sims_curves = st.number_input("Simulations per p point", 2000, 200000, max(20000, int(n_sims_deep/5)), 1000, key='curve_sims')
+
+            if st.button("Compute OC/ESS curves", key='btn_curves'):
+                rng = np.random.default_rng(seed_deep + 11)
+                ps = np.linspace(p_min_c, p_max_c, p_points_c)
+                Ueff = rng.uniform(size=(n_sims_curves, design_sel["N_total"]))
+                Utox = rng.uniform(size=(n_sims_curves, design_sel["N_total"]))
+                rows = []
+                for pp in ps:
+                    r = simulate_design_joint(design_sel, p_eff=pp, p_tox=q_fixed, U_eff=Ueff, U_tox=Utox)
+                    rows.append(dict(p=pp, reject_rate=r['reject_rate'], ess=r['ess']))
+                df_curves = pd.DataFrame(rows)
+                st.session_state['oc_ess_curves_df'] = df_curves
+                st.session_state['oc_ess_q_fixed'] = float(q_fixed)
+                # Immediate render
+                _render_oc_ess_preview(st.session_state['oc_ess_curves_df'], st.session_state.get('oc_ess_q_fixed'))
+
+        # Parse‑proof guard: preview curves if already computed earlier
+        if _HAS_PLOTLY and 'oc_ess_curves_df' in st.session_state: _render_oc_ess_preview(st.session_state['oc_ess_curves_df'], st.session_state.get('oc_ess_q_fixed'))
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 4) OC Explorer (always‑on heatmap) + Automated Interpretation            ║
@@ -989,6 +1119,7 @@ with st.expander("Open OC Explorer", expanded=True):
                         "**ESS:** " + ess_txt)
                 st.markdown(body)
 
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ PDF EXPORT HELPERS                                                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -1006,7 +1137,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.drawString(x0, y, text)
         y -= dy
 
-    line("Bayesian Single-Arm Design – Summary (v3.1.5p)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.5q)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1046,6 +1177,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
     c.save()
     return buf.getvalue()
 
+
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ 5) Export settings and results (JSON / CSVs / PDF)                      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -1059,7 +1191,7 @@ export_bundle = {
     "oc_ess_curves": None if 'oc_ess_curves_df' not in st.session_state else st.session_state['oc_ess_curves_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5p.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5q.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1081,9 +1213,9 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
     if 'oc_ess_curves_df' in st.session_state:
         zf.writestr("oc_ess_curves.csv", st.session_state['oc_ess_curves_df'].to_csv(index=False))
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5p_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5q_csv.zip", mime="application/zip")
 
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5p.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5q.pdf", mime="application/pdf")
