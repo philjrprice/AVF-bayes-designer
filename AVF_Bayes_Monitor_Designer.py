@@ -458,15 +458,15 @@ st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v
 st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.") 
 with st.expander("What this tool does (in simple terms)"): 
     st.markdown( 
-        "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**."
+        "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.
 
-
-        "• **You set** prior beliefs, thresholds, and when to look at the data."
-
-        "• The **Screener** tries many maximum sample sizes (N) and filters by α/power."
-
-        "• The **Deep Dive** runs precise joint simulations (benefit + safety)."
-
+" 
+        "• **You set** prior beliefs, thresholds, and when to look at the data.
+" 
+        "• The **Screener** tries many maximum sample sizes (N) and filters by α/power.
+" 
+        "• The **Deep Dive** runs precise joint simulations (benefit + safety).
+" 
         "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.") 
 # Sidebar — Efficacy (plainer labels + help) 
 st.sidebar.header("1) Efficacy target and prior") 
@@ -732,6 +732,3 @@ else:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox) 
     # Summary panel and deep dive UI ... (unchanged from prior, omitted here to save space) 
 # TUNER CORE + OC Explorer + EXPORT sections ... (unchanged; included in full file) 
-
-
-
