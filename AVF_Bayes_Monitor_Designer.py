@@ -456,14 +456,16 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.4", layout="wide") 
 st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.4") 
 st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.") 
-with st.expander("What this tool does (in simple terms)"): 
-    st.markdown( 
-        "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.
+with st.expander("What this tool does (in simple terms)"):
+    st.markdown("""
+This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.
 
-" 
-        "• **You set** prior beliefs, thresholds, and when to look at the data.
-" 
-        "• The **Screener** tries many maximum sample sizes (N) and filters by α/power.
+• **You set** prior beliefs, thresholds, and when to look at the data.
+• The **Screener** tries many maximum sample sizes (N) and filters by α/power.
+• The **Deep Dive** runs precise joint simulations (benefit + safety).
+• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.
+""")
+and filters by α/power.
 " 
         "• The **Deep Dive** runs precise joint simulations (benefit + safety).
 " 
