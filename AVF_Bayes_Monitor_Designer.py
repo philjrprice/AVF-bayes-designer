@@ -711,8 +711,19 @@ with st.expander("Open compare panel", expanded=False):
 # ╚══════════════════════════════════════════════════════════════════════════╝ 
 st.write("### 3) Deep Dive (joint efficacy + safety)") 
 st.caption("Locks a single design and shows detailed operating characteristics, per-look summaries, and stop reasons.") 
-N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select', 
-    help="Choose an N from your screening range (or adjacent values) to inspect in detail.") 
+# Compute a safe default value for N_select (must lie within [min,max])
+if Ns:
+    _nselect_default = min(max(60, Ns[0]), Ns[-1])
+    _nselect_min, _nselect_max = Ns[0], Ns[-1]
+else:
+    _nselect_default = 60
+    _nselect_min, _nselect_max = 5, 400
+N_select = st.number_input(
+    "Select a maximum sample size N to deep‑dive",
+    _nselect_min, _nselect_max, _nselect_default, 1,
+    key='N_select',
+    help="Choose an N from your screening range (or adjacent values) to inspect in detail."
+) 
 looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str, step_every=step_eff) 
 looks_saf_sel = build_looks_with_runin(N_select, run_in_saf, looks_saf_mode_label, k_total=k_looks_saf, perc_str=perc_saf_str, ns_str=ns_saf_str, step_every=step_saf) 
 s_min_sel = min_successes_for_posterior_threshold(a0, b0, N_select, p0, theta_final) 
