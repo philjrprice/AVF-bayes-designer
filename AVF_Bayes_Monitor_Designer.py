@@ -75,10 +75,30 @@ def log_beta(a: float, b: float) -> float:
     return lgamma(a) + lgamma(b) - lgamma(a + b)
 
 def beta_binomial_pmf_vec(k: np.ndarray, n: int, alpha: float, beta: float) -> np.ndarray:
-    from numpy import log, exp
-    lg_coef = lgamma(n + 1) - lgamma(k + 1) - lgamma(n - k + 1)
-    val = np.exp(lg_coef + log_beta(alpha + k, beta + n - k) - log_beta(alpha, beta))
-    return val
+    """Vectorized predictive Beta-Binomial pmf over k (0..n).
+    Uses scipy.special.gammaln when available; otherwise falls back to a vectorized
+    wrapper around math.lgamma. This fixes errors when passing numpy arrays to
+    math.lgamma and is numerically stable.
+    """
+    k = np.asarray(k, dtype=float)
+    # Choose appropriate log-gamma
+    try:
+        from scipy.special import gammaln  # vectorized
+        def _log_choose(nv, kv):
+            return gammaln(nv + 1) - gammaln(kv + 1) - gammaln(nv - kv + 1)
+        def _log_beta(av, bv):
+            return gammaln(av) + gammaln(bv) - gammaln(av + bv)
+    except Exception:
+        from math import lgamma
+        vlgamma = np.vectorize(lgamma)
+        def _log_choose(nv, kv):
+            return vlgamma(nv + 1) - vlgamma(kv + 1) - vlgamma(nv - kv + 1)
+        def _log_beta(av, bv):
+            return vlgamma(av) + vlgamma(bv) - vlgamma(av + bv)
+
+    lg_coef = _log_choose(n, k)
+    log_val = lg_coef + _log_beta(alpha + k, beta + n - k) - _log_beta(alpha, beta)
+    return np.exp(log_val)
 
 @lru_cache(maxsize=200000)
 def predictive_prob_success_at_final_cached(r_eff: int, n_curr: int, N_final: int,
