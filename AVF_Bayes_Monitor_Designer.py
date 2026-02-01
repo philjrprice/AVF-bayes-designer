@@ -731,7 +731,7 @@ with st.expander("Open compare panel", expanded=False):
                 r_p0 = simulate_design_joint(design_cmp, p_eff=p0, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox)
                 r_p1 = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_good_cmp, U_eff=Ueff, U_tox=Utox)
                 r_p1_bad = simulate_design_joint(design_cmp, p_eff=p1, p_tox=q_bad_cmp, U_eff=Ueff, U_tox=Utox)
-                rows.append(dict(N=Ncmp, looks_eff=looks_eff_cmp, looks_saf=looks_saf_cmp, s_min_final=smin_cmp,
+                rows.append(dict(N=Ncmp, looks_eff=looks_eff_cmp, looks_fut=looks_fut_cmp, looks_saf=looks_saf_cmp, s_min_final=smin_cmp,
                                  **{"Type I @p0,q_good": r_p0["reject_rate"], "Power @p1,q_good": r_p1["reject_rate"],
                                     "ESS @p0": r_p0["ess"], "ESS @p1": r_p1["ess"],
                                     "Early stop (any) @p1": r_p1["early_stop_rate"],
@@ -791,10 +791,10 @@ else:
         st.markdown("**Design snapshot**")
         st.markdown("• **Planned maximum participants (N):** " + str(design_sel["N_total"]))
         st.markdown("• **Run‑in (eff/saf):** " + f"{design_sel.get('run_in_eff',0)} / {design_sel.get('run_in_saf',0)}")
-        st.markdown("• **Interim looks — efficacy:** " + eff_looks_txt)
-        st.markdown("• **Interim looks — safety:** " + saf_looks_txt)
+        st.markdown("• **Looks — efficacy:** " + (eff_looks_txt + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
+        st.markdown("• **Looks — safety:** " + (saf_looks_txt + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
         fut_looks_txt = 'same as efficacy' if design_sel.get('looks_fut', []) == design_sel.get('looks_eff', []) else ('none (final only)' if len(design_sel.get('looks_fut', [])) == 0 else ', '.join(str(x) for x in design_sel.get('looks_fut', [])))
-        st.markdown("• **Interim looks — futility:** " + fut_looks_txt)
+        st.markdown("• **Looks — futility:** " + (('same as efficacy' if fut_looks_txt=='same as efficacy' else fut_looks_txt) + (f", final={design_sel['N_total']}" if design_sel.get('N_total') not in (None, 0) else '')))
         st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
         if enable_safety:
             st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
@@ -812,8 +812,45 @@ else:
         if enable_safety:
             st.markdown("- **Safety:** If P(q>q_max | data) ≥ θ_tox at any look (or final), stop for safety.")
 
-        st.caption("Futility thresholds (x responders needed to CONTINUE at each futility look):")
-        st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_fut"], orient="index", columns=["x ≥ to continue"]))
+        
+        # Look schedule overview (shows *all* look points incl. final)
+        try:
+            eff_looks = design_sel.get('looks_eff', [])
+            fut_looks = design_sel.get('looks_fut', eff_looks)
+            saf_looks = design_sel.get('looks_saf', [])
+            Ntot = int(design_sel.get('N_total', 0))
+
+            rows_over = []
+            # Efficacy: interim looks use theta_interim; final uses theta_final
+            for n in eff_looks:
+                rows_over.append(dict(Domain='Efficacy', Look_N=int(n), Stage='Interim', Threshold=f"θ_interim={design_sel.get('theta_interim'):.3f}"))
+            if Ntot>0:
+                rows_over.append(dict(Domain='Efficacy', Look_N=Ntot, Stage='Final', Threshold=f"θ_final={design_sel.get('theta_final'):.3f}"))
+
+            # Futility: interim looks use c_futility (PPoS); no futility at final
+            for n in fut_looks:
+                rows_over.append(dict(Domain='Futility', Look_N=int(n), Stage='Interim', Threshold=f"PPoS ≥ c_futility={design_sel.get('c_futility'):.3f} to continue"))
+            if Ntot>0:
+                rows_over.append(dict(Domain='Futility', Look_N=Ntot, Stage='Final', Threshold='(no futility rule; final success vs θ_final)'))
+
+            # Safety: interim & final use θ_tox against q_max
+            if 'safety' in design_sel and isinstance(design_sel['safety'], dict):
+                s = design_sel['safety']
+                for n in saf_looks:
+                    rows_over.append(dict(Domain='Safety', Look_N=int(n), Stage='Interim', Threshold=f"θ_tox={s.get('theta_tox', float('nan')):.3f} vs q_max={s.get('q_max', float('nan')):.2f}"))
+                if Ntot>0:
+                    rows_over.append(dict(Domain='Safety', Look_N=Ntot, Stage='Final', Threshold=f"θ_tox={s.get('theta_tox', float('nan')):.3f} vs q_max={s.get('q_max', float('nan')):.2f}"))
+
+            if rows_over:
+                import pandas as _pd
+                df_over = _pd.DataFrame(rows_over).sort_values(['Domain','Look_N']).reset_index(drop=True)
+                st.caption('Look schedule overview (all look points and thresholds)')
+                st.dataframe(df_over, use_container_width=True)
+        except Exception as _e:
+            pass
+        
+    st.caption("Futility thresholds (x responders needed to CONTINUE at each futility look):")
+    st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_fut"], orient="index", columns=["x ≥ to continue"]))
 
     st.write("#### Deep‑dive simulation settings")
     colD1, colD2, colD3 = st.columns(3)
@@ -883,14 +920,14 @@ else:
                 'Efficacy look N': eff_looks,
                 'Early success': list(succ_by_look)[:len(eff_looks)],
             })
-            st.caption('Proportion of early stops at each *efficacy* look (p1,q_good)')
+            st.caption('Proportion of early stops at each *efficacy* interim look (p1,q_good)')
             st.dataframe(df_eff_looks, use_container_width=True)
         if fut_looks and fut_by_look:
             df_fut_looks = pd.DataFrame({
                 'Futility look N': fut_looks,
                 'Early futility': list(fut_by_look)[:len(fut_looks)],
             })
-            st.caption('Proportion of early *futility* stops at each futility look (p1,q_good)')
+            st.caption('Proportion of early *futility* stops at each futility interim look (p1,q_good)')
             st.dataframe(df_fut_looks, use_container_width=True)
         if enable_safety:
             saf_by_look = res_p1_qgood.get('saf_by_look', [])
