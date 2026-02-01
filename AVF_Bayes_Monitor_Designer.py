@@ -481,8 +481,8 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
             "ESS @ p0": res_p0["ess"],
             "ESS @ p1": res_p1["ess"],
             "Early stop @ p0 (any)": res_p0["early_stop_rate"],
-            "Early success @ p0": res_p0["early_succ_rate"],
-            "Early futility @ p0": res_p0["early_fut_rate"],
+            "Early success @ p0": res_p0.get("eff_early_succ_rate", res_p0.get("early_succ_rate", float("nan"))),
+            "Early futility @ p0": res_p0.get("eff_early_fut_rate", res_p0.get("early_fut_rate", float("nan"))),
             "s_min_final": s_min,
             "x_min_to_continue_eff": x_min_to_continue,
         })
@@ -1017,9 +1017,10 @@ with st.expander("Open Threshold Tuner++", expanded=False):
         rng_tune = np.random.default_rng(seed_tuner)
         U_tune = rng_tune.uniform(size=(n_sims_tuner, st.session_state.get('N_select', 60)))
         looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
+        looks_fut_tune = looks_eff_tune if st.session_state.get('fut_same', True) or looks_fut_mode_label == "Same as efficacy" else build_looks_with_runin(st.session_state.get('N_select', 60), int(st.session_state.get('run_in_fut', run_in_fut)), looks_fut_mode_label, k_total=st.session_state.get('k_fut', k_looks_fut), perc_str=st.session_state.get('perc_fut', perc_fut_str), ns_str=st.session_state.get('ns_fut', ns_fut_str), step_every=st.session_state.get('step_fut', step_fut))
         theta_final_star = tune_theta_final_bisect(
             N=st.session_state.get('N_select', 60),
-            looks_eff=looks_eff_tune, a0=a0, b0=b0, p0=p0, p1=p1,
+            looks_eff=looks_eff_tune, looks_fut=looks_fut_tune, a0=a0, b0=b0, p0=p0, p1=p1,
             allow_early_success=allow_early_success,
             c_futility=st.session_state.get('c_futility', c_futility),
             theta_interim=st.session_state.get('theta_interim', theta_interim),
@@ -1030,7 +1031,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
         else:
             st.success(f"Bisection θ_final ≈ {theta_final_star:.3f}")
             best = joint_search_theta_interim_cf_with_bounds(
-                N=st.session_state.get('N_select', 60), looks_eff=looks_eff_tune, a0=a0, b0=b0, p0=p0, p1=p1,
+                N=st.session_state.get('N_select', 60), looks_eff=looks_eff_tune, looks_fut=looks_fut_tune, a0=a0, b0=b0, p0=p0, p1=p1,
                 theta_final=theta_final_star, allow_early_success=allow_early_success, run_in_eff=run_in_eff,
                 objective=objective, alpha_cap=alpha_cap, power_floor=power_floor, n_sims=n_sims_tuner,
                 seed=seed_tuner, ti_min=ti_min, ti_max=ti_max, cf_min=cf_min, cf_max=cf_max,
