@@ -1,7 +1,7 @@
  
 # AVF_Bayes_Monitor_Designer_v3_1_5_OCcurves_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.5m: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
+# v3.1.5n: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
 from __future__ import annotations
 import io
 import json
@@ -25,7 +25,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5m_indent_block_strict"
+SCHEMA_VERSION = "v3_1_5n_indent_final"
 
 # --- UI state helpers (keep panels open after a run) ---
 def _get_flag(name: str, default: bool = False) -> bool:
@@ -500,8 +500,8 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5m", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5m")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5n", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5n")
 st.caption("Adds persistent Deep‑Dive/OC‑curve outputs and removes unused Deep‑Dive q; shows FINAL alongside all looks; futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
@@ -872,10 +872,14 @@ else:
     df_plot = df_curves.copy()
     ren = {}
     if 'reject_rate' not in df_plot.columns:
-        if 'reject rate' in df_plot.columns: ren['reject rate'] = 'reject_rate'
-        if 'Pr(declare efficacy)' in df_plot.columns: ren['Pr(declare efficacy)'] = 'reject_rate'
-    if 'ess' not in df_plot.columns and 'ESS' in df_plot.columns: ren['ESS'] = 'ess'
-    if 'p' not in df_plot.columns and 'p_eff' in df_plot.columns: ren['p_eff'] = 'p'
+        if 'reject rate' in df_plot.columns:
+            ren['reject rate'] = 'reject_rate'
+        if 'Pr(declare efficacy)' in df_plot.columns:
+            ren['Pr(declare efficacy)'] = 'reject_rate'
+    if 'ess' not in df_plot.columns and 'ESS' in df_plot.columns:
+        ren['ESS'] = 'ess'
+    if 'p' not in df_plot.columns and 'p_eff' in df_plot.columns:
+        ren['p_eff'] = 'p'
     if ren:
         df_plot = df_plot.rename(columns=ren)
     required = {'p','reject_rate','ess'}
@@ -889,224 +893,6 @@ else:
         fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
         fig.update_yaxes(title_text='ESS', secondary_y=True)
         fig.update_xaxes(title_text='Efficacy rate p')
-        fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
+        fig.update_layout(title='OC/ESS vs p (fixed q)')
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(df_plot, use_container_width=True)
-    # Normalize columns to avoid KeyErrors from cached/renamed headings
-    df_plot = df_curves.copy()
-    ren = {}
-    if 'reject_rate' not in df_plot.columns:
-        if 'reject rate' in df_plot.columns: ren['reject rate'] = 'reject_rate'
-        if 'Pr(declare efficacy)' in df_plot.columns: ren['Pr(declare efficacy)'] = 'reject_rate'
-    if 'ess' not in df_plot.columns and 'ESS' in df_plot.columns: ren['ESS'] = 'ess'
-    if 'p' not in df_plot.columns and 'p_eff' in df_plot.columns: ren['p_eff'] = 'p'
-    if ren:
-        df_plot = df_plot.rename(columns=ren)
-    required = {'p','reject_rate','ess'}
-    if df_plot.empty or not required.issubset(set(df_plot.columns)):
-        st.warning('OC/ESS curves: results are empty or columns are missing; showing raw table instead of a plot.')
-        st.dataframe(df_curves, use_container_width=True)
-    else:
-        fig = make_subplots(specs=[[{'secondary_y': True}]])
-        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
-        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
-        fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
-        fig.update_yaxes(title_text='ESS', secondary_y=True)
-        fig.update_xaxes(title_text='Efficacy rate p')
-        fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df_plot, use_container_width=True)
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 4) OC Explorer (always-on heatmap) + Automated Interpretation            ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.write("### 4) OC Explorer")
-with st.expander("Open OC Explorer", expanded=True):
-    if 'deep_design' not in st.session_state:
-        st.info("Run a deep‑dive first to lock a design.")
-    else:
-        design_sel = st.session_state['deep_design']
-        colO1, colO2 = st.columns(2)
-        with colO1:
-            p_min = st.number_input("Grid: p_min", 0.0, 1.0, max(0.0, st.session_state.get('p0', p0)-0.20), 0.01, key='oc_pmin', help="Start of efficacy (p) grid.")
-            p_max = st.number_input("Grid: p_max", 0.0, 1.0, min(1.0, st.session_state.get('p1', p1)+0.25), 0.01, key='oc_pmax', help="End of efficacy (p) grid.")
-            p_points = st.slider("Number of p points", 3, 25, 9, 1, key='oc_ppoints')
-        with colO2:
-            q_min = st.number_input("Grid: q_min", 0.0, 1.0, max(0.0, (st.session_state.get('q_max', 0.10) or 0.10)-0.10), 0.01, key='oc_qmin', help="Start of toxicity (q) grid.")
-            q_max_g = st.number_input("Grid: q_max", 0.0, 1.0, min(1.0, (st.session_state.get('q_max', 0.10) or 0.10)+0.20), 0.01, key='oc_qmax', help="End of toxicity (q) grid.")
-            q_points = st.slider("Number of q points", 3, 25, 7, 1, key='oc_qpoints')
-        n_sims_oc = st.number_input("Simulations per cell", 2000, 200000, 50000, 2000, key='oc_sims', help="Higher = more precise but slower.")
-        seed_oc = st.number_input("Random seed (OC)", 1, None, st.session_state.get('seed', 2026)+4, 1, key='oc_seed')
-        if st.button("Run OC Explorer", key='run_oc'):
-            rng = np.random.default_rng(seed_oc)
-            Ueff = rng.uniform(size=(n_sims_oc, design_sel['N_total']))
-            Utox = rng.uniform(size=(n_sims_oc, design_sel['N_total']))
-            ps = np.linspace(p_min, p_max, p_points)
-            qs = np.linspace(q_min, q_max_g, q_points)
-            oc_rows = []
-            for pp in ps:
-                for qq in qs:
-                    r = simulate_design_joint(design_sel, p_eff=pp, p_tox=qq, U_eff=Ueff, U_tox=Utox)
-                    oc_rows.append(dict(p=pp, q=qq,
-                                        reject_rate=r['reject_rate'], ess=r['ess'],
-                                        safety_stop_any=r['safety_stop_prob'], early_any=r['early_stop_rate']))
-            df_grid = pd.DataFrame(oc_rows)
-            st.session_state['oc_grid_df'] = df_grid
-            nice = df_grid.copy()
-            nice.rename(columns={'reject_rate': 'Pr(declare efficacy)', 'ess': 'ESS', 'safety_stop_any': 'Pr(safety stop)', 'early_any': 'Pr(early stop any)'}, inplace=True)
-            nice = nice[['p','q','Pr(declare efficacy)','ESS','Pr(safety stop)','Pr(early stop any)']]
-            nice = nice.sort_values(['q','p']).reset_index(drop=True)
-            st.dataframe(nice, use_container_width=True)
-            if _HAS_PLOTLY:
-        piv = df_grid.pivot(index='q', columns='p', values='reject_rate')
-                fig = px.imshow(piv.values, x=[f"{x:.2f}" for x in piv.columns], y=[f"{y:.2f}" for y in piv.index],
-                                aspect='auto', origin='lower', color_continuous_scale='Viridis',
-                                labels=dict(color='Probability of declaring efficacy'),
-                                title='Probability of declaring efficacy across (p,q)')
-                fig.update_xaxes(title_text='Efficacy rate p')
-                fig.update_yaxes(title_text='Toxicity rate q')
-                st.plotly_chart(fig, use_container_width=True)
-
-            st.write("#### Automated Interpretation & Design Diagnostics")
-            Ntot = design_sel['N_total']
-            pow_target = st.session_state.get('power_min', 0.80)
-            saf_warn_thr = 0.25
-            # Removed erroneous groupby(function=...) line that could trigger exceptions
-            grp = df_grid.groupby('q')['reject_rate'].apply(lambda s: (s >= pow_target).sum()/len(s))
-            robust_qs = grp[grp >= 0.6].index.tolist()
-            fragile_qs = grp[grp < 0.6].index.tolist()
-            saf_grp = df_grid.groupby('q')['safety_stop_any'].mean()
-            high_safety_qs = saf_grp[saf_grp > saf_warn_thr].index.tolist()
-            ess_mean = df_grid.groupby('p')['ess'].mean()
-            ess_spike = (ess_mean > 0.9 * Ntot).sum() / len(ess_mean) > 0.3
-            bullets = []
-            if robust_qs:
-                bullets.append(f"Design maintains power≥{pow_target:.2f} across most p for q≤{max(robust_qs):.2f}.")
-            else:
-                bullets.append("Power region is narrow; few (p,q) cells reach target power.")
-            if high_safety_qs:
-                bullets.append(f"Safety stopping becomes frequent (> {saf_warn_thr:.0%}) at q≥{min(high_safety_qs):.2f}.")
-            else:
-                bullets.append("Safety-stop probability remains moderate across evaluated q.")
-            bullets.append("ESS is " + ("often near max N" if ess_spike else "well below max N for much of the grid") + ".")
-            for b in bullets:
-                st.write("• " + b)
-            warn_msgs = []
-            if fragile_qs and min(fragile_qs) <= (q_max_g if 'q_max_g' in locals() else max(qs)):
-                warn_msgs.append("Power falls below target for many p at moderate q levels.")
-            if high_safety_qs:
-                warn_msgs.append("Safety stop rate high in upper‑q region — consider stricter θ_tox or fewer safety looks.")
-            if ess_spike:
-                warn_msgs.append("ESS frequently approaches N — consider adding futility or relaxing θ_final.")
-            if warn_msgs:
-                st.warning("\n".join(["⚠ " + m for m in warn_msgs]))
-            with st.expander("Extended interpretation (details)"):
-                robust_text = (f"q ≤ {max(robust_qs):.2f}" if len(robust_qs) > 0 else "no robust q-levels")
-                fragile_text = (f"q ≥ {min(fragile_qs):.2f}" if len(fragile_qs) > 0 else "no fragile q-levels")
-                safety_q = (min(high_safety_qs) if len(high_safety_qs) > 0 else q_max_g)
-                ess_txt = ('Large portions of the grid require near‑max N.' if ess_spike else 'ESS stays moderate for many scenarios.')
-                body = ("**Robust region (indicative):** " + robust_text + "; "
-                        "**Fragile region:** " + fragile_text + ".\n\n"
-                        "**Safety:** Above q≈" + f"{safety_q:.2f}" + ", safety stops become common.\n\n"
-                        "**ESS:** " + ess_txt)
-                st.markdown(body)
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ PDF EXPORT HELPERS                                                       ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Optional[pd.DataFrame]) -> bytes:
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    W, H = A4
-    x0, y = 2*cm, H - 2*cm
-    def line(text: str, dy: float = 0.6*cm, bold: bool = False):
-        nonlocal y
-        if y < 3*cm:
-            c.showPage(); y = H - 2*cm
-        c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
-        c.drawString(x0, y, text)
-        y -= dy
-    line("Bayesian Single-Arm Design – Summary (v3.1.5m)", bold=True)
-    line("")
-    line("Design settings", bold=True)
-    if isinstance(design, dict):
-        line(f"N_total: {design.get('N_total')}")
-        line(f"Look points — efficacy: {design.get('looks_eff')} + [FINAL]")
-        line(f"Look points — futility: {design.get('looks_fut')} + [FINAL]")
-        if design.get('looks_saf') is not None:
-            line(f"Look points — safety: {design.get('looks_saf')} + [FINAL]")
-        line(f"Run-in (eff/saf/fut): {design.get('run_in_eff',0)} / {design.get('run_in_saf',0)} / {design.get('run_in_fut', design.get('run_in_eff',0))}")
-        line(f"Final evaluation at N: {design.get('N_total')}")
-        line(f"Efficacy Beta(a0,b0): {design.get('a0')}, {design.get('b0')}")
-        if 'safety' in design:
-            s = design['safety']
-            line(f"Safety Beta(a_t0,b_t0): {s.get('a_t0')}, {s.get('b_t0')}")
-            line(f"q_max / θ_tox: {s.get('q_max')} / {s.get('theta_tox')}")
-        line(f"p0 / p1: {design.get('p0')} / {design.get('p1')}")
-        line(f"θ_final / θ_interim / c_futility: {design.get('theta_final')} / {design.get('theta_interim')} / {design.get('c_futility')}")
-        line(f"s_min_final: {design.get('s_min_final')}")
-    if deep_results is not None and isinstance(deep_results, dict):
-        line("")
-        line("Deep-dive key metrics", bold=True)
-        for k, r in deep_results.items():
-            if isinstance(r, dict):
-                rr = r.get('reject_rate', float('nan'))
-                ess = r.get('ess', float('nan'))
-                estop = r.get('early_stop_rate', float('nan'))
-                line(f"{k}: Pr(declare eff)={rr:.3f}, ESS={ess:.1f}, Early(any)={estop:.3f}")
-    if compare_df is not None and isinstance(compare_df, pd.DataFrame) and not compare_df.empty:
-        line("")
-        line("Compare by N (first 10)", bold=True)
-        for _, row in compare_df.head(10).iterrows():
-            line(f"N={row['N']}, Pow={row['Power @p1,q_good']:.3f}, ESS1={row['ESS @p1']:.1f}")
-    c.showPage()
-    c.save()
-    return buf.getvalue()
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 5) Export settings and results (JSON / CSVs / PDF)                       ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.write("### 5) Export settings and results (JSON / CSVs / PDF)")
-export_bundle = {
-    "design": st.session_state.get('deep_design', {}),
-    "screening_table": None if 'df_screen' not in locals() or df_screen.empty else df_screen.to_dict(orient='list'),
-    "deep_dive": st.session_state.get('deep_results', None),
-    "compare": st.session_state.get('compare_df', None),
-    "oc_grid": None if 'oc_grid_df' not in st.session_state else st.session_state['oc_grid_df'].to_dict(orient='list'),
-    "oc_ess_curves": None if 'oc_ess_curves_df' not in st.session_state else st.session_state['oc_ess_curves_df'].to_dict(orient='list'),
-}
-json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5m.json", mime="application/json")
-
-buf = io.BytesIO()
-with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-    if 'df_screen' in locals() and not df_screen.empty:
-        zf.writestr("screening.csv", df_screen.to_csv(index=False))
-    deep = st.session_state.get('deep_results', None)
-    if isinstance(deep, dict):
-        rows = []
-        for k,v in deep.items():
-            if isinstance(v, dict) and 'stop_dist' in v and isinstance(v['stop_dist'], pd.DataFrame):
-                zf.writestr(f"deep_{k}_stopdist.csv", v['stop_dist'].to_csv(index=False))
-            if isinstance(v, dict):
-                rows.append({"scenario": k, **{kk: vv for kk, vv in v.items() if kk != 'stop_dist'}})
-        if rows:
-            zf.writestr("deep_summary.csv", pd.DataFrame(rows).to_csv(index=False))
-    if 'compare_df' in st.session_state:
-        zf.writestr("compare.csv", st.session_state['compare_df'].to_csv(index=False))
-    if 'oc_grid_df' in st.session_state:
-        zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
-    if 'oc_ess_curves_df' in st.session_state:
-        zf.writestr("oc_ess_curves.csv", st.session_state['oc_ess_curves_df'].to_csv(index=False))
-
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5m_csv.zip", mime="application/zip")
-
-if st.button("Download protocol‑ready PDF", key='download_pdf'):
-    design_pdf = st.session_state.get('deep_design', None)
-    pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5m.pdf", mime="application/pdf")
-
-
