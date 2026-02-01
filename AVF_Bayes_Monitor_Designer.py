@@ -672,6 +672,7 @@ def _screen(param_grid, n_sims_small, seed, schema_version: str):
 df_screen, designs_built = _screen(param_grid, n_sims_small, seed, SCHEMA_VERSION)
 
 st.write("### 1) Rapid Screener (efficacy‑only)")
+st.caption("Screens a range of N using quick efficacy-only sims to find candidates that meet α/power targets.")
 if df_screen.empty:
     st.warning("No viable designs found. Try relaxing θ_final or increasing N.")
 else:
@@ -685,6 +686,7 @@ else:
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 2) Compare multiple N values (deep‑dive, joint with safety)")
+st.caption("Runs precise joint simulations at the N values you type, using your current rule settings.")
 with st.expander("Open compare panel", expanded=False):
     ns_str_compare = st.text_input("Enter N values (comma)", "60,70,80", key='cmp_ns_str', help="We'll construct designs with the SAME rule settings you set above.")
     n_sims_compare = st.number_input("Simulations per design (compare run)", 5000, 400000, 80000, 5000, key='cmp_sims')
@@ -763,6 +765,7 @@ with st.expander("Open compare panel", expanded=False):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 3) Deep Dive (joint efficacy + safety)")
+st.caption("Locks a single design and shows detailed operating characteristics, per-look summaries, and stop reasons.")
 N_select = st.number_input("Select a maximum sample size N to deep‑dive", Ns[0] if Ns else 5, Ns[-1] if Ns else 400, max(60, Ns[0] if Ns else 60), 1, key='N_select',
                            help="Choose an N from your screening range (or adjacent values) to inspect in detail.")
 looks_eff_sel = build_looks_with_runin(N_select, run_in_eff, looks_eff_mode_label, k_total=k_looks_eff, perc_str=perc_eff_str, ns_str=ns_eff_str)
@@ -773,7 +776,7 @@ if s_min_sel is None:
     st.error("Final rule infeasible at this N. Relax θ_final / adjust prior / increase N.")
 else:
     # Build futility looks (same as efficacy by default)
-    looks_fut_sel = looks_eff_sel if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N_select, int(st.session_state.get('run_in_fut', run_in_eff)), looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut)
+    looks_fut_sel = looks_eff_sel if st.session_state.get('fut_same', True) or looks_fut_mode_label == 'Same as efficacy' else build_looks_with_runin(N_select, int(st.session_state.get('run_in_fut', run_in_fut)), looks_fut_mode_label, k_total=k_looks_fut, perc_str=perc_fut_str, ns_str=ns_fut_str, step_every=step_fut)
     x_min_to_continue_sel = compute_interim_futility_cutoffs(a0, b0, N_select, looks_fut_sel, p0, theta_final, c_futility)
     design_sel = dict(N_total=N_select, a0=a0, b0=b0, p0=p0, p1=p1, theta_final=theta_final,
                       theta_interim=float(theta_interim), c_futility=c_futility,
@@ -786,6 +789,12 @@ else:
 
     # Friendlier design summary panel
     with st.expander("Chosen Design Summary (plain language)", expanded=True):
+
+        with st.expander("ℹ Thresholds — interim vs final", expanded=False):
+            st.markdown("- **Efficacy**: Interim uses **θ_interim** for early success; **final** uses **θ_final** with minimum successes.")
+            st.markdown("- **Futility**: Only at **interim** looks via **PPoS ≥ c_futility**; **no futility at final**.")
+            st.markdown("- **Safety**: Checked at **interim** and **final** using **θ_tox** vs **q_max**.")
+    
         eff_looks_txt = ("none (final only)" if len(design_sel["looks_eff"]) == 0 else ", ".join(str(x) for x in design_sel["looks_eff"]))
         saf_looks_txt = ("none (final only)" if len(design_sel.get("looks_saf", [])) == 0 else ", ".join(str(x) for x in design_sel.get("looks_saf", [])))
         st.markdown("**Design snapshot**")
@@ -908,6 +917,34 @@ else:
             fig_dd.update_layout(barmode='group', title='Deep-dive: stop proportions by reason', yaxis_title='Proportion')
             st.plotly_chart(fig_dd, use_container_width=True)
 
+            # --- Final stop decomposition (includes final stops) ---
+            try:
+                rej_p1 = res_p1_qgood.get('reject_rate', float('nan'))
+                early_succ = res_p1_qgood.get('eff_early_succ_rate', 0.0)
+                early_fut = res_p1_qgood.get('eff_early_fut_rate', 0.0)
+                early_saf = res_p1_qgood.get('saf_early_rate', 0.0)
+                stopdist = res_p1_qgood.get('stop_dist', None)
+                final_mass = 0.0
+                if isinstance(stopdist, pd.DataFrame) and not stopdist.empty:
+                    final_mass = float(stopdist.loc[stopdist['N_stop'] == design_sel['N_total'], 'Probability'].sum())
+                saf_by_look = res_p1_qgood.get('saf_by_look', [])
+                final_safety = float(saf_by_look[-1]) if isinstance(saf_by_look, list) and len(saf_by_look) >= 1 else 0.0
+                final_success = max(0.0, rej_p1 - early_succ)
+                final_futility = max(0.0, final_mass - final_success - final_safety)
+                df_break = pd.DataFrame([
+                    {'Reason': 'Early success', 'Proportion': early_succ},
+                    {'Reason': 'Early futility', 'Proportion': early_fut},
+                    {'Reason': 'Early safety', 'Proportion': early_saf},
+                    {'Reason': 'Final success', 'Proportion': final_success},
+                    {'Reason': 'Final futility', 'Proportion': final_futility},
+                    {'Reason': 'Final safety', 'Proportion': final_safety},
+                ])
+                st.caption('Stop reason decomposition at p1,q_good (includes **final** stops)')
+                st.dataframe(df_break, use_container_width=True)
+            except Exception:
+                pass
+    
+
         # Per-look stop tables (proportions at each efficacy/futility/safety look) for p1,q_good
     try:
         eff_looks = design_sel.get('looks_eff', [])
@@ -1026,6 +1063,7 @@ def joint_search_theta_interim_cf_with_bounds(
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 4) Threshold Tuner++ (with bounds)")
+st.caption("Helps pick θ_final via bisection for α, then searches θ_interim and c_futility within bounds under constraints.")
 with st.expander("Open Threshold Tuner++", expanded=False):
     colT1, colT2 = st.columns(2)
     with colT1:
@@ -1106,6 +1144,7 @@ with st.expander("Open Threshold Tuner++", expanded=False):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 5) OC Explorer")
+st.caption("Explores probability of declaring efficacy, ESS, and safety-stop rates across a grid of (p,q).")
 with st.expander("Open OC Explorer", expanded=True):
     if 'deep_design' not in st.session_state:
         st.info("Run a deep‑dive first to lock a design.")
@@ -1283,6 +1322,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 st.write("### 6) Export settings and results (JSON / CSVs / PDF)")
+st.caption("Download everything: settings JSON, CSV summaries (screen/deep/compare/tuner/OC), and a protocol-ready PDF.")
 export_bundle = {
     "design": st.session_state.get('deep_design', {}),
     "screening_table": None if 'df_screen' not in locals() or df_screen.empty else df_screen.to_dict(orient='list'),
