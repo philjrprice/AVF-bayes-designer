@@ -1,7 +1,7 @@
  
 # AVF_Bayes_Monitor_Designer_v3_1_5_OCcurves_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.5l: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
+# v3.1.5m: Adds OC/ESS curves (fixed q), expands summary look-points (incl. final), removes stray groupby(function=...) line
 from __future__ import annotations
 import io
 import json
@@ -25,7 +25,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_5l_indent_guard_fix"
+SCHEMA_VERSION = "v3_1_5m_indent_block_strict"
 
 # --- UI state helpers (keep panels open after a run) ---
 def _get_flag(name: str, default: bool = False) -> bool:
@@ -500,8 +500,8 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar                                          ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5l", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5l")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5m", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5m")
 st.caption("Adds persistent Deep‑Dive/OC‑curve outputs and removes unused Deep‑Dive q; shows FINAL alongside all looks; futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
@@ -867,7 +867,31 @@ else:
             sprob = res_p1_qbad['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁, q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}" if show_ci else None)
 
         if _HAS_PLOTLY and 'oc_ess_curves_df' in st.session_state:
-        df_curves = st.session_state['oc_ess_curves_df']
+    df_curves = st.session_state['oc_ess_curves_df']
+    # Normalize columns to avoid KeyErrors from cached/renamed headings
+    df_plot = df_curves.copy()
+    ren = {}
+    if 'reject_rate' not in df_plot.columns:
+        if 'reject rate' in df_plot.columns: ren['reject rate'] = 'reject_rate'
+        if 'Pr(declare efficacy)' in df_plot.columns: ren['Pr(declare efficacy)'] = 'reject_rate'
+    if 'ess' not in df_plot.columns and 'ESS' in df_plot.columns: ren['ESS'] = 'ess'
+    if 'p' not in df_plot.columns and 'p_eff' in df_plot.columns: ren['p_eff'] = 'p'
+    if ren:
+        df_plot = df_plot.rename(columns=ren)
+    required = {'p','reject_rate','ess'}
+    if df_plot.empty or not required.issubset(set(df_plot.columns)):
+        st.warning('OC/ESS curves: results are empty or columns are missing; showing raw table instead of a plot.')
+        st.dataframe(df_curves, use_container_width=True)
+    else:
+        fig = make_subplots(specs=[[{'secondary_y': True}]])
+        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
+        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
+        fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
+        fig.update_yaxes(title_text='ESS', secondary_y=True)
+        fig.update_xaxes(title_text='Efficacy rate p')
+        fig.update_layout(title=f'OC/ESS vs p at fixed q={q_fixed:.2f}')
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(df_plot, use_container_width=True)
     # Normalize columns to avoid KeyErrors from cached/renamed headings
     df_plot = df_curves.copy()
     ren = {}
@@ -1004,7 +1028,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
         c.drawString(x0, y, text)
         y -= dy
-    line("Bayesian Single-Arm Design – Summary (v3.1.5l)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.5m)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1055,7 +1079,7 @@ export_bundle = {
     "oc_ess_curves": None if 'oc_ess_curves_df' not in st.session_state else st.session_state['oc_ess_curves_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5l.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5m.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1078,11 +1102,11 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
     if 'oc_ess_curves_df' in st.session_state:
         zf.writestr("oc_ess_curves.csv", st.session_state['oc_ess_curves_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5l_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5m_csv.zip", mime="application/zip")
 
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
     pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5l.pdf", mime="application/pdf")
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5m.pdf", mime="application/pdf")
 
 
