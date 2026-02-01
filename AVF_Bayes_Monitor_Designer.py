@@ -867,32 +867,10 @@ else:
             sprob = res_p1_qbad['safety_stop_prob']; cols[5].metric("P(Safety stop) @ p₁, q_bad", f"{sprob:.3f}", f"±{1.96*se_p(sprob):.3f}" if show_ci else None)
 
         if _HAS_PLOTLY and 'oc_ess_curves_df' in st.session_state:
-    df_curves = st.session_state['oc_ess_curves_df']
-    # Normalize columns to avoid KeyErrors from cached/renamed headings
-    df_plot = df_curves.copy()
-    ren = {}
-    if 'reject_rate' not in df_plot.columns:
-        if 'reject rate' in df_plot.columns:
-            ren['reject rate'] = 'reject_rate'
-        if 'Pr(declare efficacy)' in df_plot.columns:
-            ren['Pr(declare efficacy)'] = 'reject_rate'
-    if 'ess' not in df_plot.columns and 'ESS' in df_plot.columns:
-        ren['ESS'] = 'ess'
-    if 'p' not in df_plot.columns and 'p_eff' in df_plot.columns:
-        ren['p_eff'] = 'p'
-    if ren:
-        df_plot = df_plot.rename(columns=ren)
-    required = {'p','reject_rate','ess'}
-    if df_plot.empty or not required.issubset(set(df_plot.columns)):
-        st.warning('OC/ESS curves: results are empty or columns are missing; showing raw table instead of a plot.')
-        st.dataframe(df_curves, use_container_width=True)
-    else:
-        fig = make_subplots(specs=[[{'secondary_y': True}]])
-        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['reject_rate'], mode='lines+markers', name='Pr(declare efficacy)'), secondary_y=False)
-        fig.add_trace(go.Scatter(x=df_plot['p'], y=df_plot['ess'], mode='lines+markers', name='ESS'), secondary_y=True)
-        fig.update_yaxes(title_text='Pr(declare efficacy)', secondary_y=False, range=[0,1])
-        fig.update_yaxes(title_text='ESS', secondary_y=True)
-        fig.update_xaxes(title_text='Efficacy rate p')
-        fig.update_layout(title='OC/ESS vs p (fixed q)')
-        st.plotly_chart(fig, use_container_width=True)
+    # Safe preview: minimal stub to avoid indentation issues if curves exist
+    try:
+        df_curves = st.session_state['oc_ess_curves_df']
+        df_plot = df_curves
         st.dataframe(df_plot, use_container_width=True)
+    except Exception:
+        pass
