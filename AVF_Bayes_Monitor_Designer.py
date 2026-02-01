@@ -298,6 +298,7 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
     N = design["N_total"]
     looks_eff = design["looks_eff"]
     looks_saf = design.get("looks_saf", [])
+    looks_fut = design.get("looks_fut", looks_eff)
     a0 = design["a0"]; b0 = design["b0"]
     p0 = design["p0"]; theta_final = design["theta_final"]
     theta_interim = design.get("theta_interim", theta_final)
@@ -319,10 +320,10 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
     final_n = np.zeros(n_sims, dtype=np.int32)
 
     eff_early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64)
-    eff_early_fut_by_look = np.zeros(len(looks_eff), dtype=np.int64)
+    fut_early_by_look = np.zeros(len(looks_fut), dtype=np.int64)
     saf_stop_by_look = np.zeros(len(looks_saf) + 1, dtype=np.int64)
 
-    events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_saf) + [N])))
+    events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_fut) + list(looks_saf) + [N])))
 
     for ev in events:
         if ev > n_curr and active.any():
@@ -410,10 +411,11 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
     ess = final_n.mean()
 
     eff_early_succ_rate = eff_early_succ_by_look.sum() / n_sims
-    eff_early_fut_rate = eff_early_fut_by_look.sum() / n_sims
+    eff_early_fut_rate = 0.0
+    fut_early_rate = fut_early_by_look.sum() / n_sims
     saf_early_rate = saf_stop_by_look[:-1].sum() / n_sims
     any_safety_rate = saf_stop_by_look.sum() / n_sims
-    early_stop_rate = eff_early_succ_rate + eff_early_fut_rate + saf_early_rate
+    early_stop_rate = eff_early_succ_rate + fut_early_rate + saf_early_rate
 
     unique_ns, counts = np.unique(final_n, return_counts=True)
     stop_dist = pd.DataFrame({"N_stop": unique_ns, "Probability": counts / n_sims}).sort_values("N_stop")
@@ -424,10 +426,12 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
         "safety_stop_prob": float(any_safety_rate),
         "stop_dist": stop_dist,
         "eff_early_succ_by_look": (eff_early_succ_by_look / n_sims).tolist(),
-        "eff_early_fut_by_look": (eff_early_fut_by_look / n_sims).tolist(),
+        "eff_early_fut_by_look": (fut_early_by_look / n_sims).tolist(),
+        "fut_early_by_look": (fut_early_by_look / n_sims).tolist(),
         "saf_by_look": (saf_stop_by_look / n_sims).tolist(),
         "eff_early_succ_rate": float(eff_early_succ_rate),
         "eff_early_fut_rate": float(eff_early_fut_rate),
+        "fut_early_rate": float(fut_early_rate),
         "saf_early_rate": float(saf_early_rate),
         "early_stop_rate": float(early_stop_rate),
     }
