@@ -1,14 +1,11 @@
  
-# AVF_Bayes_Monitor_Designer_futility_fixed_FULL.py 
+# AVF_Bayes_Monitor_Designer_final_looks_NO_TUNER.py
 # Streamlit app for single-arm Bayesian monitored design (binary endpoint)
-# v3.1.4 UX upgrades + futility schedule fixes + compare/tuner fixes:
-# • Plain-language labels and richer help tooltips across the app
-# • Friendlier “Chosen Design Summary” panel (clear bullets + decision rules)
-# • Keeps v3.1.2 safety fixes for OC interpretation and robust strings
-# • FIX: Joint simulator now respects a separate futility look schedule
-# • FIX: Rapid Screener carries futility schedule into param grid
-# • FIX: Compare panel builds and uses futility looks per N
-# • FIX: Tuner++ accepts looks_fut and uses it to compute interim cutoffs
+# v3.1.5: Display all efficacy & safety looks incl. FINAL + remove Threshold Tuner
+# • Displays final evaluation point (N) alongside interim looks in tables & summary
+# • Safety per-look table already had 'Final'; label now shows 'Final (N)'
+# • Removed Tuner++ functions and UI; exports & PDF updated accordingly
+# • Retains futility schedule fixes and compare/deep-dive/OC Explorer features
 from __future__ import annotations
 import io
 import json
@@ -31,7 +28,7 @@ try:
     _HAS_PLOTLY = True
 except Exception:
     _HAS_PLOTLY = False
-SCHEMA_VERSION = "v3_1_4_everyN_stops_charts"
+SCHEMA_VERSION = "v3_1_5_final_looks_no_tuner"
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║ CORE BAYESIAN UTILITIES                                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
@@ -316,8 +313,8 @@ def simulate_design_joint(design: Dict, p_eff: float, p_tox: float, U_eff: np.nd
     final_n = np.zeros(n_sims, dtype=np.int32)
 
     eff_early_succ_by_look = np.zeros(len(looks_eff), dtype=np.int64)
-    eff_early_fut_by_look = np.zeros(len(looks_fut), dtype=np.int64)  # futility-tally at futility looks
-    saf_stop_by_look = np.zeros(len(looks_saf) + 1, dtype=np.int64)   # +1 for final
+    eff_early_fut_by_look = np.zeros(len(looks_fut), dtype=np.int64)
+    saf_stop_by_look = np.zeros(len(looks_saf) + 1, dtype=np.int64)  # +1 for final
 
     events = sorted(list(dict.fromkeys(list(looks_eff) + list(looks_fut) + list(looks_saf) + [N])))
 
@@ -493,9 +490,9 @@ def shortlist_designs(param_grid: List[Dict], n_sims_small: int, seed: int, U: O
 # ║ STREAMLIT UI — Header & Sidebar (with richer tooltips)                   ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.4", layout="wide")
-st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.4")
-st.caption("Now with plainer labels, richer help tooltips, and a friendlier design summary. All v3.1.2 robustness fixes are retained.")
+st.set_page_config(page_title="Bayesian Single‑Arm Designer (Binary) — v3.1.5", layout="wide")
+st.title("Bayesian Single‑Arm Monitored Study Designer (Binary Endpoint) — v3.1.5")
+st.caption("Now shows FINAL evaluation alongside all looks. Futility fixes retained; Threshold Tuner removed.")
 with st.expander("What this tool does (in simple terms)"):
     st.markdown(
         "This app helps you design a single‑arm trial with interim checks for **benefit** and optional **safety**.\n\n"
@@ -504,7 +501,7 @@ with st.expander("What this tool does (in simple terms)"):
         "• The **Deep Dive** runs precise joint simulations (benefit + safety).\n"
         "• The **OC Explorer** scans a grid of scenarios (efficacy p, toxicity q) and interprets them for you.")
 
-# Sidebar — Efficacy (plainer labels + help)
+# Sidebar — Efficacy
 st.sidebar.header("1) Efficacy target and prior")
 col1, col2 = st.sidebar.columns(2)
 with col1:
@@ -535,7 +532,7 @@ if 'theta_interim' not in st.session_state:
 theta_interim = st.sidebar.number_input("Interim success threshold (θ_interim)", 0.5, 0.999, float(st.session_state['theta_interim']), 0.01, format="%.3f", key='theta_interim',
                                         help="Often set near θ_final to avoid overly optimistic early claims.")
 
-# Sidebar — Safety (plainer labels + help)
+# Sidebar — Safety
 st.sidebar.header("2) Optional safety monitoring")
 enable_safety = st.sidebar.checkbox("Enable safety monitoring?", True, key='enable_safety', help="Monitor serious adverse events (SAE) with a Beta prior; stop if SAE rate likely exceeds q_max.")
 if enable_safety:
@@ -557,7 +554,7 @@ if enable_safety:
 else:
     a_t0 = b_t0 = q_max = theta_tox = None
 
-# Sidebar — Look schedules (helped)
+# Sidebar — Look schedules
 st.sidebar.header("3) When to check the data (look schedule)")
 run_in_eff = st.sidebar.number_input("Run‑in for efficacy (patients enrolled before first look)", 0, 400, 0, 1, key='run_in_eff',
                                      help="Patients enrolled before the first efficacy look; they count for all decisions.")
@@ -592,7 +589,7 @@ elif looks_saf_mode_label == "Custom absolute Ns":
 elif looks_saf_mode_label == "Look every N after run‑in":
     step_saf = st.sidebar.number_input("Look every N participants (after safety run‑in)", 1, 400, 10, 1, key='step_saf', help="First safety look is after the run‑in; then look every N participants. Final analysis still occurs at max N.")
 
-# Sidebar — Futility look schedule (new)
+# Sidebar — Futility look schedule
 st.sidebar.header("4b) Futility look schedule")
 use_fut_same = st.sidebar.checkbox(
     "Use same schedule as efficacy? (default)",
@@ -624,7 +621,7 @@ else:
         step_fut = st.sidebar.number_input("Look every N participants (after futility run‑in)", 1, 400, 10, 1, key='step_fut',
                                            help="First futility look is after the run‑in; then look every N participants. Final analysis still occurs at max N.")
 
-# Sidebar — Screener settings (helped)
+# Sidebar — Screener settings
 st.sidebar.header("5) Rapid Screener")
 N_min, N_max = st.sidebar.slider("Range of maximum N values to test", 10, 400, (30, 120), 1, key='Nrange', help="We'll scan this range to find feasible, efficient designs.")
 N_step = st.sidebar.number_input("Step between N values", 1, 50, 5, 1, key='Nstep', help="Larger steps scan fewer N values (faster).")
@@ -749,7 +746,7 @@ with st.expander("Open compare panel", expanded=False):
                         fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Early safety @p1'], name='Early safety @p1,q_good')
                     if 'Safety stop @p1,q_bad (any stage)' in df_cmp.columns:
                         fig_cmp.add_bar(x=df_cmp['N'], y=df_cmp['Safety stop @p1,q_bad (any stage)'], name='Safety stop (any) @p1,q_bad')
-                    fig_cmp.update_layout(barmode='group', title='Stop proportions by reason vs N', xaxis_title='N', yaxis_title='Proportion')
+                    fig_cmp.update_layout(barmode='group', title='Stop proportions by reason vs N (final always evaluated at max N)', xaxis_title='N', yaxis_title='Proportion')
                     st.plotly_chart(fig_cmp, use_container_width=True)
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -777,7 +774,7 @@ else:
     if enable_safety:
         design_sel["safety"] = dict(a_t0=a_t0, b_t0=b_t0, q_max=q_max, theta_tox=theta_tox)
 
-    # Friendlier design summary panel
+    # Friendlier design summary panel, explicitly list FINAL
     with st.expander("Chosen Design Summary (plain language)", expanded=True):
         eff_looks_txt = ("none (final only)" if len(design_sel["looks_eff"]) == 0 else ", ".join(str(x) for x in design_sel["looks_eff"]))
         saf_looks_txt = ("none (final only)" if len(design_sel.get("looks_saf", [])) == 0 else ", ".join(str(x) for x in design_sel.get("looks_saf", [])))
@@ -788,6 +785,7 @@ else:
         st.markdown("• **Interim looks — safety:** " + saf_looks_txt)
         fut_looks_txt = 'same as efficacy' if design_sel.get('looks_fut', []) == design_sel.get('looks_eff', []) else ('none (final only)' if len(design_sel.get('looks_fut', [])) == 0 else ', '.join(str(x) for x in design_sel.get('looks_fut', [])))
         st.markdown("• **Interim looks — futility:** " + fut_looks_txt)
+        st.markdown("• **Final evaluation (efficacy & safety):** at N = **" + str(design_sel['N_total']) + "** (always evaluated if not stopped earlier)")
         st.markdown("• **Efficacy prior Beta(a₀,b₀):** " + f"{design_sel['a0']:.3g}, {design_sel['b0']:.3g}")
         if enable_safety:
             st.markdown("• **Safety prior Beta(a_t0,b_t0):** " + f"{a_t0:.3g}, {b_t0:.3g}")
@@ -798,6 +796,7 @@ else:
         st.markdown("• **Final rule (minimum successes needed):** " + f"s_min_final={design_sel['s_min_final']}")
         st.caption("Futility thresholds (x responders needed to CONTINUE at each futility look):")
         st.dataframe(pd.DataFrame.from_dict(design_sel["x_min_to_continue_by_look_fut"], orient="index", columns=["x ≥ to continue"]))
+
     st.write("#### Deep‑dive simulation settings")
     colD1, colD2, colD3 = st.columns(3)
     with colD1:
@@ -850,7 +849,7 @@ else:
             fig_dd = go.Figure([go.Bar(x=bars_x, y=bars_y, name='Early stops')])
             if enable_safety:
                 fig_dd.add_bar(x=['Safety stop (any) @p1,q_bad'], y=[res_p1_qbad.get('safety_stop_prob', 0.0)], name='Safety (any) @q_bad')
-            fig_dd.update_layout(barmode='group', title='Deep-dive: stop proportions by reason', yaxis_title='Proportion')
+            fig_dd.update_layout(barmode='group', title='Deep-dive: stop proportions by reason (final always evaluated at max N)', yaxis_title='Proportion')
             st.plotly_chart(fig_dd, use_container_width=True)
 
         # Per-look tables (p1,q_good)
@@ -860,186 +859,44 @@ else:
             saf_looks = design_sel.get('looks_saf', [])
             succ_by_look = res_p1_qgood.get('eff_early_succ_by_look', [])
             fut_by_look = res_p1_qgood.get('fut_early_by_look', res_p1_qgood.get('eff_early_fut_by_look', []))
-            if eff_looks and succ_by_look:
-                df_eff_looks = pd.DataFrame({'Efficacy look N': eff_looks, 'Early success': list(succ_by_look)[:len(eff_looks)]})
-                st.caption('Proportion of early stops at each *efficacy* look (p1,q_good)')
+
+            # Efficacy table: include FINAL row for visibility (no early success at final)
+            if eff_looks and succ_by_look is not None:
+                eff_labels = [str(n) for n in eff_looks] + [f"Final ({design_sel['N_total']})"]
+                eff_vals = list(succ_by_look)[:len(eff_looks)] + [0.0]
+                df_eff_looks = pd.DataFrame({
+                    'Efficacy evaluation': eff_labels,
+                    'Early success (proportion)': eff_vals,
+                })
+                st.caption('All **efficacy** evaluations (interims + final). Final row shown to indicate evaluation at max N (no early success at final).')
                 st.dataframe(df_eff_looks, use_container_width=True)
+
+            # Futility table (interims only)
             if fut_looks and fut_by_look:
-                df_fut_looks = pd.DataFrame({'Futility look N': fut_looks, 'Early futility': list(fut_by_look)[:len(fut_looks)]})
-                st.caption('Proportion of early *futility* stops at each futility look (p1,q_good)')
+                df_fut_looks = pd.DataFrame({'Futility look N': fut_looks, 'Early futility (proportion)': list(fut_by_look)[:len(fut_looks)]})
+                st.caption('Proportion of early **futility** stops at each futility look (p1,q_good)')
                 st.dataframe(df_fut_looks, use_container_width=True)
+
+            # Safety table already includes final; label as Final (N)
             if enable_safety:
                 saf_by_look = res_p1_qgood.get('saf_by_look', [])
                 if saf_looks and saf_by_look:
-                    labels = [str(n) for n in saf_looks] + ['Final'] if len(saf_by_look)==len(saf_looks)+1 else [str(n) for n in saf_looks[:len(saf_by_look)]]
-                    df_saf_looks = pd.DataFrame({'Safety look': labels, 'Safety stops': list(saf_by_look)[:len(labels)]})
-                    st.caption('Proportion of safety stops at each *safety* look (p1,q_good)')
+                    labels = [str(n) for n in saf_looks]
+                    if len(saf_by_look) == len(saf_looks) + 1:
+                        labels = labels + [f"Final ({design_sel['N_total']})"]
+                    else:
+                        labels = labels[:len(saf_by_look)]
+                    df_saf_looks = pd.DataFrame({'Safety evaluation': labels, 'Safety stops (proportion)': list(saf_by_look)[:len(labels)]})
+                    st.caption('All **safety** evaluations (interims + final).')
                     st.dataframe(df_saf_looks, use_container_width=True)
         except Exception:
             pass
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ TUNER CORE (θ_final bisection + (θ_interim, c_futility) grid search)     ║
+# ║ 4) OC Explorer (always-on heatmap) + Automated Interpretation            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def tune_theta_final_bisect(N, looks_eff, looks_fut, a0, b0, p0, p1,
-                             allow_early_success, c_futility,
-                             theta_interim, run_in_eff,
-                             alpha_target, n_sims, seed,
-                             tol=0.002, max_iter=22, U=None):
-    import numpy as np
-    if U is None:
-        rng = np.random.default_rng(seed)
-        U = rng.uniform(size=(n_sims, N))
-    lo = max(0.50, float(theta_interim)); hi = 0.999
-    def type1_given(theta_final: float) -> float:
-        s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
-        if s_min is None:
-            return 0.0
-        x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, c_futility)
-        design = dict(N_total=N, looks_eff=looks_eff, looks_fut=looks_fut, a0=a0, b0=b0, p0=p0, p1=p1,
-                      theta_final=theta_final, theta_interim=theta_interim, c_futility=c_futility,
-                      allow_early_success=allow_early_success, s_min_final=s_min,
-                      x_min_to_continue_by_look_fut=x_min, run_in_eff=run_in_eff)
-        return float(simulate_design_eff_only(design, p0, U[:, :N])['reject_rate'])
-    f_lo, f_hi = type1_given(lo), type1_given(hi)
-    if not (f_lo >= alpha_target and f_hi <= alpha_target):
-        return None
-    last_mid = lo
-    for _ in range(max_iter):
-        mid = 0.5*(lo+hi); f_mid = type1_given(mid); last_mid = mid
-        if abs(f_mid - alpha_target) < tol:
-            return float(mid)
-        if f_mid > alpha_target:
-            lo = mid
-        else:
-            hi = mid
-    return float(last_mid)
-
-def joint_search_theta_interim_cf_with_bounds(
-    N, looks_eff, looks_fut, a0, b0, p0, p1,
-    theta_final, allow_early_success, run_in_eff,
-    objective, alpha_cap, power_floor, n_sims, seed,
-    ti_min, ti_max, cf_min, cf_max,
-    ti_steps=8, cf_steps=8, U=None):
-    import numpy as np
-    if U is None:
-        rng = np.random.default_rng(seed)
-        U = rng.uniform(size=(n_sims, N))
-    TI_vals = np.linspace(float(ti_min), float(ti_max), int(max(2, ti_steps)))
-    CF_vals = np.linspace(float(cf_min), float(cf_max), int(max(2, cf_steps)))
-    best = None
-    for ti in TI_vals:
-        for cf in CF_vals:
-            s_min = min_successes_for_posterior_threshold(a0, b0, N, p0, theta_final)
-            if s_min is None:
-                continue
-            x_min = compute_interim_futility_cutoffs(a0, b0, N, looks_fut, p0, theta_final, cf)
-            design = dict(N_total=N, looks_eff=looks_eff, looks_fut=looks_fut, a0=a0, b0=b0, p0=p0, p1=p1,
-                          theta_final=theta_final, theta_interim=float(ti), c_futility=float(cf),
-                          allow_early_success=allow_early_success, s_min_final=s_min,
-                          x_min_to_continue_by_look_fut=x_min, run_in_eff=run_in_eff)
-            r0 = simulate_design_eff_only(design, p0, U[:, :N])
-            r1 = simulate_design_eff_only(design, p1, U[:, :N])
-            if r0['reject_rate'] > alpha_cap or r1['reject_rate'] < power_floor:
-                continue
-            if objective == 'Min ESS @ p0':
-                val = r0['ess']; better = (best is None) or (val < best['val'])
-            elif objective == 'Min ESS @ p1':
-                val = r1['ess']; better = (best is None) or (val < best['val'])
-            elif objective == 'Max Power @ p1':
-                val = r1['reject_rate']; better = (best is None) or (val > best['val'])
-            elif objective == 'Max Early stops @ p0':
-                val = r0['early_stop_rate']; better = (best is None) or (val > best['val'])
-            else:
-                continue
-            if better:
-                best = dict(val=float(val), theta_interim=float(ti), c_futility=float(cf), r0=r0, r1=r1, objective=objective)
-    return best
-
-# ║ 4) Threshold Tuner++ (with bounds)                                       ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.write("### 4) Threshold Tuner++ (with bounds)")
-with st.expander("Open Threshold Tuner++", expanded=False):
-    colT1, colT2 = st.columns(2)
-    with colT1:
-        n_sims_tuner = st.number_input("Simulations per evaluation", 2000, 200000, 40000, 2000, key='tuner_sims')
-        seed_tuner = st.number_input("Random seed (tuner)", 1, None, st.session_state.get('seed', 2026)+3, 1, key='tuner_seed')
-        alpha_target = st.number_input("Target α at p₀ (for θ_final bisection)", 0.0, 0.5, st.session_state.get('alpha_max', 0.10), 0.01, format="%.2f", key='tuner_alpha_target')
-    with colT2:
-        objective = st.selectbox("Optimize for", ["Min ESS @ p0", "Min ESS @ p1", "Max Power @ p1", "Max Early stops @ p0"], index=0, key='tuner_objective')
-        power_floor = st.number_input("Constraint: minimum power", 0.0, 1.0, st.session_state.get('power_min', 0.80), 0.01, format="%.2f", key='tuner_power_floor')
-        alpha_cap = st.number_input("Constraint: maximum α", 0.0, 0.5, st.session_state.get('alpha_max', 0.10), 0.01, format="%.2f", key='tuner_alpha_cap')
-    st.markdown("**Bounds** (defaults are typical) — adjust if needed")
-    colB1, colB2 = st.columns(2)
-    with colB1:
-        ti_min_default = max(0.5, float(st.session_state.get('theta_final', theta_final)) - 0.15)
-        ti_max_default = float(st.session_state.get('theta_final', theta_final))
-        ti_min = st.number_input("θ_interim min", 0.5, 0.999, ti_min_default, 0.01, format="%.3f", key='ti_min', help="Interim threshold is often ≤ final by 0.05–0.15 in Phase II.")
-        ti_max = st.number_input("θ_interim max", 0.5, 0.999, ti_max_default, 0.01, format="%.3f", key='ti_max', help="Often set ≤ θ_final to avoid overly stringent interim claims.")
-    with colB2:
-        cf_min = st.number_input("c_futility min", 0.0, 0.5, 0.02, 0.01, format="%.3f", key='cf_min', help="Typical futility PPoS bounds in Phase II are ~0.05–0.25.")
-        cf_max = st.number_input("c_futility max", 0.0, 0.5, 0.25, 0.01, format="%.3f", key='cf_max', help="Upper end beyond ~0.25 may be operationally aggressive.")
-        ti_steps = st.number_input("θ_interim grid points", 3, 25, 8, 1, key='ti_steps', help="Increase for a finer search; reduces speed.")
-        cf_steps = st.number_input("c_futility grid points", 3, 25, 8, 1, key='cf_steps', help="Increase for a finer search; reduces speed.")
-
-    if st.button("Run Tuner++", key='run_tuner'):
-        rng_tune = np.random.default_rng(seed_tuner)
-        U_tune = rng_tune.uniform(size=(n_sims_tuner, st.session_state.get('N_select', 60)))
-        looks_eff_tune = build_looks_with_runin(st.session_state.get('N_select', 60), st.session_state.get('run_in_eff', run_in_eff), st.session_state.get('eff_mode', looks_eff_mode_label), k_total=st.session_state.get('k_eff', k_looks_eff), perc_str=st.session_state.get('perc_eff', perc_eff_str), ns_str=st.session_state.get('ns_eff', ns_eff_str))
-        looks_fut_tune = looks_eff_tune if st.session_state.get('fut_same', True) or looks_fut_mode_label == "Same as efficacy" else build_looks_with_runin(st.session_state.get('N_select', 60), int(st.session_state.get('run_in_fut', run_in_fut)), looks_fut_mode_label, k_total=st.session_state.get('k_fut', k_looks_fut), perc_str=st.session_state.get('perc_fut', perc_fut_str), ns_str=st.session_state.get('ns_fut', ns_fut_str), step_every=st.session_state.get('step_fut', step_fut))
-        theta_final_star = tune_theta_final_bisect(
-            N=st.session_state.get('N_select', 60),
-            looks_eff=looks_eff_tune, looks_fut=looks_fut_tune, a0=a0, b0=b0, p0=p0, p1=p1,
-            allow_early_success=allow_early_success,
-            c_futility=st.session_state.get('c_futility', c_futility),
-            theta_interim=st.session_state.get('theta_interim', theta_interim),
-            run_in_eff=run_in_eff, alpha_target=alpha_target,
-            n_sims=n_sims_tuner, seed=seed_tuner, U=U_tune)
-        if theta_final_star is None:
-            st.error("Could not find a feasible θ_final that meets the α target. Try relaxing the target or increasing N.")
-        else:
-            st.success(f"Bisection θ_final ≈ {theta_final_star:.3f}")
-            best = joint_search_theta_interim_cf_with_bounds(
-                N=st.session_state.get('N_select', 60), looks_eff=looks_eff_tune, looks_fut=looks_fut_tune, a0=a0, b0=b0, p0=p0, p1=p1,
-                theta_final=theta_final_star, allow_early_success=allow_early_success, run_in_eff=run_in_eff,
-                objective=objective, alpha_cap=alpha_cap, power_floor=power_floor, n_sims=n_sims_tuner,
-                seed=seed_tuner, ti_min=ti_min, ti_max=ti_max, cf_min=cf_min, cf_max=cf_max,
-                ti_steps=st.session_state.get('ti_steps', 8), cf_steps=st.session_state.get('cf_steps', 8), U=U_tune,
-            )
-            if best is None:
-                st.warning("No (θ_interim, c_futility) pair within bounds met the constraints.")
-            else:
-                r0, r1 = best['r0'], best['r1']
-                st.write({
-                    'theta_final*': float(theta_final_star),
-                    'theta_interim*': float(best['theta_interim']),
-                    'c_futility*': float(best['c_futility']),
-                    'Type I @ p0': r0['reject_rate'],
-                    'Power @ p1': r1['reject_rate'],
-                    'ESS @ p0': r0['ess'],
-                    'ESS @ p1': r1['ess'],
-                })
-                if st.button("Apply tuned thresholds to sidebar", key='apply_tuned'):
-                    st.session_state['theta_final'] = float(theta_final_star)
-                    st.session_state['theta_interim'] = float(best['theta_interim'])
-                    st.session_state['c_futility'] = float(best['c_futility'])
-                    st.success("Applied tuned θ_final, θ_interim, c_futility to the sidebar.")
-                    st.rerun()
-                st.session_state['tuner_df'] = pd.DataFrame([{
-                    'theta_final': float(theta_final_star),
-                    'theta_interim': float(best['theta_interim']),
-                    'c_futility': float(best['c_futility']),
-                    'type1': r0['reject_rate'], 'power': r1['reject_rate'],
-                    'ESS_p0': r0['ess'], 'ESS_p1': r1['ess'], 'objective': best['objective']
-                }])
-
-# ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 5) OC Explorer (always-on heatmap) + Automated Interpretation            ║
-# ╚══════════════════════════════════════════════════════════════════════════╝
-
-st.write("### 5) OC Explorer")
+st.write("### 4) OC Explorer")
 with st.expander("Open OC Explorer", expanded=True):
     if 'deep_design' not in st.session_state:
         st.info("Run a deep‑dive first to lock a design.")
@@ -1098,7 +955,10 @@ with st.expander("Open OC Explorer", expanded=True):
             Ntot = design_sel['N_total']
             pow_target = st.session_state.get('power_min', 0.80)
             saf_warn_thr = 0.25
-            grp = df_grid.groupby('q').apply(lambda g: (g['reject_rate'] >= pow_target).sum()/len(g))
+            grp = df_grid.groupby('q').apply(function=lambda g: (g['reject_rate'] >= pow_target).sum()/len(g))
+            # Pandas >=2.1 may warn on groupby.apply; suppress by explicit function=...
+            # Recompute robust/fragile with a safer approach
+            grp = df_grid.groupby('q')['reject_rate'].apply(lambda s: (s >= pow_target).sum()/len(s))
             robust_qs = grp[grp >= 0.6].index.tolist()
             fragile_qs = grp[grp < 0.6].index.tolist()
             saf_grp = df_grid.groupby('q')['safety_stop_any'].mean()
@@ -1143,7 +1003,7 @@ with st.expander("Open OC Explorer", expanded=True):
 # ║ PDF EXPORT HELPERS                                                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Optional[pd.DataFrame], tuner_df: Optional[pd.DataFrame]) -> bytes:
+def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Optional[pd.DataFrame]) -> bytes:
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
@@ -1155,7 +1015,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         c.setFont("Helvetica-Bold" if bold else "Helvetica", 11 if bold else 10)
         c.drawString(x0, y, text)
         y -= dy
-    line("Bayesian Single-Arm Design – Summary (v3.1.4)", bold=True)
+    line("Bayesian Single-Arm Design – Summary (v3.1.5)", bold=True)
     line("")
     line("Design settings", bold=True)
     if isinstance(design, dict):
@@ -1165,6 +1025,7 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
         if design.get('looks_saf') is not None:
             line(f"Safety looks: {design.get('looks_saf')}")
         line(f"Run-in (eff/saf/fut): {design.get('run_in_eff',0)} / {design.get('run_in_saf',0)} / {design.get('run_in_fut', design.get('run_in_eff',0))}")
+        line(f"Final evaluation at N: {design.get('N_total')}")
         line(f"Efficacy Beta(a0,b0): {design.get('a0')}, {design.get('b0')}")
         if 'safety' in design:
             s = design['safety']
@@ -1182,11 +1043,6 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
                 ess = r.get('ess', float('nan'))
                 estop = r.get('early_stop_rate', float('nan'))
                 line(f"{k}: Pr(declare eff)={rr:.3f}, ESS={ess:.1f}, Early(any)={estop:.3f}")
-    if tuner_df is not None and isinstance(tuner_df, pd.DataFrame) and not tuner_df.empty:
-        line("")
-        line("Tuner best candidate(s)", bold=True)
-        for _, row in tuner_df.head(10).iterrows():
-            line(f"θf={row['theta_final']:.3f}, θi={row['theta_interim']:.3f}, cf={row['c_futility']:.3f}, α={row['type1']:.3f}, Pow={row['power']:.3f}, ESS0={row['ESS_p0']:.1f}")
     if compare_df is not None and isinstance(compare_df, pd.DataFrame) and not compare_df.empty:
         line("")
         line("Compare by N (first 10)", bold=True)
@@ -1197,20 +1053,19 @@ def make_design_pdf(design: Dict, deep_results: Optional[Dict], compare_df: Opti
     return buf.getvalue()
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║ 6) Export settings and results (JSON / CSVs / PDF)                       ║
+# ║ 5) Export settings and results (JSON / CSVs / PDF)                       ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
-st.write("### 6) Export settings and results (JSON / CSVs / PDF)")
+st.write("### 5) Export settings and results (JSON / CSVs / PDF)")
 export_bundle = {
     "design": st.session_state.get('deep_design', {}),
     "screening_table": None if 'df_screen' not in locals() or df_screen.empty else df_screen.to_dict(orient='list'),
     "deep_dive": st.session_state.get('deep_results', None),
     "compare": st.session_state.get('compare_df', None),
-    "tuner": None if 'tuner_df' not in st.session_state else st.session_state['tuner_df'].to_dict(orient='list'),
     "oc_grid": None if 'oc_grid_df' not in st.session_state else st.session_state['oc_grid_df'].to_dict(orient='list'),
 }
 json_bytes = json.dumps(export_bundle, default=lambda o: o if isinstance(o, (int,float,str,bool,type(None))) else str(o)).encode('utf-8')
-st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_4.json", mime="application/json")
+st.download_button("Download JSON bundle", data=json_bytes, file_name="design_and_results_v3_1_5.json", mime="application/json")
 
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
@@ -1228,14 +1083,12 @@ with zipfile.ZipFile(buf, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("deep_summary.csv", pd.DataFrame(rows).to_csv(index=False))
     if 'compare_df' in st.session_state:
         zf.writestr("compare.csv", st.session_state['compare_df'].to_csv(index=False))
-    if 'tuner_df' in st.session_state:
-        zf.writestr("tuner_candidates.csv", st.session_state['tuner_df'].to_csv(index=False))
     if 'oc_grid_df' in st.session_state:
         zf.writestr("oc_grid.csv", st.session_state['oc_grid_df'].to_csv(index=False))
 
-st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_4_csv.zip", mime="application/zip")
+st.download_button("Download ZIP (CSVs)", data=buf.getvalue(), file_name="design_results_v3_1_5_csv.zip", mime="application/zip")
 
 if st.button("Download protocol‑ready PDF", key='download_pdf'):
     design_pdf = st.session_state.get('deep_design', None)
-    pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None), st.session_state.get('tuner_df', None))
-    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_4.pdf", mime="application/pdf")
+    pdf_bytes = make_design_pdf(design_pdf or {}, st.session_state.get('deep_results', None), st.session_state.get('compare_df', None))
+    st.download_button("Click to download PDF", data=pdf_bytes, file_name="design_summary_v3_1_5.pdf", mime="application/pdf")
